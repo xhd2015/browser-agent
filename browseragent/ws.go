@@ -254,18 +254,22 @@ func (s *controlServer) pushJob(sess *session, j Job) bool {
 		return false
 	}
 	sess.queue.MarkRunning(j.ID)
+	payload := map[string]any{
+		"id":         j.ID,
+		"job_id":     j.ID,
+		"type":       j.Type,
+		"params":     j.Params,
+		"timeout_ms": j.TimeoutMS,
+		"session_id": sess.id,
+	}
+	if j.TabID > 0 {
+		payload["tab_id"] = j.TabID
+	}
 	env := wsEnvelope{
 		V:    1,
 		Type: "job",
 		ID:   j.ID,
-		Payload: map[string]any{
-			"id":         j.ID,
-			"job_id":     j.ID,
-			"type":       j.Type,
-			"params":     j.Params,
-			"timeout_ms": j.TimeoutMS,
-			"session_id": sess.id,
-		},
+		Payload: payload,
 	}
 	if err := wc.writeJSON(env); err != nil {
 		return false

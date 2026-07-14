@@ -14,6 +14,7 @@ type Job struct {
 	ID        string         `json:"id"`
 	SessionID string         `json:"session_id,omitempty"`
 	Type      string         `json:"type"`
+	TabID     int64          `json:"tab_id,omitempty"`
 	Params    map[string]any `json:"params,omitempty"`
 	TimeoutMS int64          `json:"timeout_ms,omitempty"`
 	Status    string         `json:"status"`

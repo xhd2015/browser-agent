@@ -102,6 +102,8 @@ session delete / eval / run / logs / screenshot / cdp flags:
   --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
   --host <host>              Control server host (default: from server.json or 127.0.0.1)
   --server-port <port>       Control server port (default: from server.json or 43761)
+  --tab-id <id>              Chrome tab id for job target (strongly recommended for agents)
+  --tab-index <n>            1-based index of capturable tab in session window (unstable; prefer --tab-id)
 
 screenshot flags:
   -o, --output <file.png>    Write decoded PNG (from result base64) to path
@@ -425,10 +427,14 @@ func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) err
 	if snap.Extension.Connected {
 		browser, _ = fetchInfoJobBrowser(base, sessionID, 15000)
 	}
-	if err := FormatSessionInfo(stdout, snap, browser, FormatSessionInfoOptions{Color: colors}); err != nil {
+	var buf bytes.Buffer
+	if err := FormatSessionInfo(&buf, snap, browser, FormatSessionInfoOptions{Color: colors}); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(stdout)
+	out := buf.String()
+	// Human session info assert.Output template has no trailing newline on the pattern.
+	out = strings.TrimSuffix(out, "\n")
+	_, err = io.WriteString(stdout, out)
 	return err
 }
 
@@ -451,6 +457,7 @@ func writeSessionInfoJSON(stdout io.Writer, base, sessionID string, snap session
 		} else {
 			outObj["browser"] = browser
 			delete(outObj, "browser_error")
+			mergeSessionInfoEnrichment(outObj, browser)
 		}
 	} else {
 		outObj["browser"] = nil
@@ -571,7 +578,7 @@ func cliEval(args []string, env map[string]string, stdout, stderr io.Writer) err
 	return postJobAndPrint(args, sessionID, JobTypeEval, map[string]any{
 		"expression": expr,
 		"expr":       expr,
-	}, 15000, stdout, nil)
+	}, 15000, stdout, stderr, nil)
 }
 
 func cliRun(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -606,7 +613,7 @@ func cliRun(args []string, env map[string]string, stdout, stderr io.Writer) erro
 		"source":     source,
 		"expression": source,
 		"path":       path,
-	}, 30000, stdout, nil)
+	}, 30000, stdout, stderr, nil)
 }
 
 func cliLogs(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -629,7 +636,7 @@ func cliLogs(args []string, env map[string]string, stdout, stderr io.Writer) err
 	if level := flagString(args, "--level"); level != "" {
 		params["level"] = level
 	}
-	return postJobAndPrint(args, sessionID, JobTypeLogs, params, 15000, stdout, nil)
+	return postJobAndPrint(args, sessionID, JobTypeLogs, params, 15000, stdout, stderr, nil)
 }
 
 func cliScreenshot(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -649,7 +656,7 @@ func cliScreenshot(args []string, env map[string]string, stdout, stderr io.Write
 	if outPath == "" {
 		outPath = flagString(args, "--output")
 	}
-	return postJobAndPrint(args, sessionID, JobTypeScreenshot, params, 20000, stdout, func(result map[string]any) error {
+	return postJobAndPrint(args, sessionID, JobTypeScreenshot, params, 20000, stdout, stderr, func(result map[string]any) error {
 		if outPath == "" {
 			return nil
 		}
@@ -700,13 +707,82 @@ func cliCDP(args []string, env map[string]string, stdout, stderr io.Writer) erro
 		}
 		params["params"] = nested
 	}
-	return postJobAndPrint(args, sessionID, JobTypeCDP, params, 30000, stdout, nil)
+	return postJobAndPrint(args, sessionID, JobTypeCDP, params, 30000, stdout, stderr, nil)
+}
+
+// resolveCLITabTarget parses --tab-id / --tab-index (mutually exclusive).
+// When --tab-index is set, resolves to tab_id via info job and emits a stderr warning.
+func resolveCLITabTarget(args []string, stderr io.Writer, base, sessionID string) (int64, error) {
+	tabIDStr, tabIDSet := flagStringSet(args, "--tab-id")
+	tabIndexStr, tabIndexSet := flagStringSet(args, "--tab-index")
+	if tabIDSet && tabIndexSet {
+		return 0, fmt.Errorf("cannot use both --tab-id and --tab-index")
+	}
+	if tabIndexSet {
+		if stderr != nil {
+			_, _ = fmt.Fprintln(stderr, "warning: --tab-index is unstable; prefer --tab-id for job targeting")
+		}
+		idx, err := strconv.Atoi(strings.TrimSpace(tabIndexStr))
+		if err != nil || idx < 1 {
+			return 0, fmt.Errorf("invalid --tab-index %q (must be 1-based positive integer)", tabIndexStr)
+		}
+		browser, err := fetchInfoJobBrowser(base, sessionID, 15000)
+		if err != nil {
+			return 0, fmt.Errorf("resolve --tab-index: %w", err)
+		}
+		tabs, _ := browser["tabs"].([]any)
+		for _, item := range tabs {
+			tab, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			tabIndex := jsonNumberToInt64(tab["index"])
+			if tabIndex == int64(idx) {
+				id := jsonNumberToInt64(tab["id"])
+				if id == 0 {
+					id = jsonNumberToInt64(tab["tab_id"])
+				}
+				if id > 0 {
+					return id, nil
+				}
+			}
+		}
+		return 0, fmt.Errorf("tab_index %d not found in session window tab list", idx)
+	}
+	if tabIDSet {
+		id, err := strconv.ParseInt(strings.TrimSpace(tabIDStr), 10, 64)
+		if err != nil || id <= 0 {
+			return 0, fmt.Errorf("invalid --tab-id %q", tabIDStr)
+		}
+		return id, nil
+	}
+	return 0, nil
+}
+
+func jsonNumberToInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		return 0
+	}
 }
 
 // postJobAndPrint POSTs /v1/jobs and writes the JSON result to stdout with trailing \n.
 // afterOK is optional post-processing of a successful JSON result (e.g. write screenshot file).
-func postJobAndPrint(args []string, sessionID, jobType string, params map[string]any, timeoutMS int64, stdout io.Writer, afterOK func(map[string]any) error) error {
+func postJobAndPrint(args []string, sessionID, jobType string, params map[string]any, timeoutMS int64, stdout, stderr io.Writer, afterOK func(map[string]any) error) error {
 	base, err := resolveCLIControlBase(args)
+	if err != nil {
+		return err
+	}
+	tabID, err := resolveCLITabTarget(args, stderr, base, sessionID)
 	if err != nil {
 		return err
 	}
@@ -720,6 +796,9 @@ func postJobAndPrint(args []string, sessionID, jobType string, params map[string
 		"type":       jobType,
 		"params":     params,
 		"timeout_ms": timeoutMS,
+	}
+	if tabID > 0 {
+		payload["tab_id"] = tabID
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -898,6 +977,7 @@ func takePositional(args []string, n int) string {
 		a := args[i]
 		if a == "--session-id" || a == "--addr" || a == "--host" || a == "--server-port" ||
 			a == "--base-dir" || a == "--root" ||
+			a == "--tab-id" || a == "--tab-index" ||
 			a == "--limit" || a == "--level" || a == "--output" || a == "-o" {
 			skipNext = true
 			continue

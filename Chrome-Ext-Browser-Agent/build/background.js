@@ -30,6 +30,9 @@ const RECONNECT_BASE_MS = 100;
 const KEEPALIVE_MS = 15000;
 /** @type {Map<number, true>} */
 const attachedTabs = new Map();
+/** Per-session debugger attach state (serialize attach; detach on tab switch). */
+/** @type {Map<string, { attachedTabId: number|null, attachLock: Promise<void> }>} */
+const sessionAttachState = new Map();
 /** In-memory console log buffer for logs jobs. */
 const consoleLogBuffer = [];
 const MAX_LOG_ENTRIES = 500;
@@ -452,26 +455,31 @@ async function handleJob(msg, sessionId, entry) {
   const jobType = payload.type || payload.job_type || "eval";
   const params = payload.params || {};
 
+  const targetOpts = {
+    tabId: payload.tab_id != null ? payload.tab_id : params.tab_id,
+    tabIndex: payload.tab_index != null ? payload.tab_index : params.tab_index,
+  };
+
   try {
     let data;
     switch (jobType) {
       case "info":
-        data = await handleInfoJob(params);
+        data = await handleInfoJob(params, jobSessionId);
         break;
       case "eval":
-        data = await handleEvalJob(params, payload, jobSessionId);
+        data = await handleEvalJob(params, payload, jobSessionId, targetOpts);
         break;
       case "run":
-        data = await handleRunJob(params, payload, jobSessionId);
+        data = await handleRunJob(params, payload, jobSessionId, targetOpts);
         break;
       case "logs":
-        data = await handleLogsJob(params, jobSessionId);
+        data = await handleLogsJob(params, jobSessionId, targetOpts);
         break;
       case "screenshot":
-        data = await handleScreenshotJob(params, jobSessionId);
+        data = await handleScreenshotJob(params, jobSessionId, targetOpts);
         break;
       case "cdp":
-        data = await handleCdpJob(params, jobSessionId);
+        data = await handleCdpJob(params, jobSessionId, targetOpts);
         break;
       default:
         sendJobResult(entry, jobId, false, { type: jobType }, "unknown job type: " + jobType);
@@ -484,29 +492,53 @@ async function handleJob(msg, sessionId, entry) {
   }
 }
 
-async function handleInfoJob(_params) {
-  let tabs = [];
+async function handleInfoJob(_params, sessionId) {
+  const entry = sessions.get(sessionId);
+  const windowId = entry && entry.windowId != null ? entry.windowId : null;
+  const capturableTabs = await listCapturableTabsInSessionWindow(sessionId, entry);
+  const tabsOut = capturableTabs.map((t, i) => ({
+    index: i + 1,
+    id: t.id,
+    url: t.url || "",
+    title: t.title || "",
+    active: !!t.active,
+    role: isSessionGoPageURL(t.url || "", sessionId) ? "session_page" : "user",
+  }));
+
+  let jobTarget = { tab_id: null, tab_index: null, reason: "session_page_fallback" };
+  let recommendedCLI = "";
   try {
-    const all = await chrome.tabs.query({});
-    tabs = (all || []).map((t) => ({
-      id: t.id,
-      url: t.url || "",
-      title: t.title || "",
-      active: !!t.active,
-      windowId: t.windowId,
-    }));
+    const tabId = await pickTargetTabIdForSession(sessionId, {});
+    const idx = tabsOut.findIndex((t) => t.id === tabId);
+    let reason = "active_in_session_window";
+    const activeTab = tabsOut.find((t) => t.active);
+    if (activeTab && activeTab.id === tabId) {
+      reason = "active_in_session_window";
+    } else if (idx >= 0 && tabsOut[idx].role === "session_page") {
+      reason = "session_page_fallback";
+    }
+    jobTarget = {
+      tab_id: tabId,
+      tab_index: idx >= 0 ? idx + 1 : null,
+      reason: reason,
+    };
+    recommendedCLI = "browser-agent session eval --tab-id " + tabId + " '...'";
   } catch (e) {
-    /* tabs permission optional */
+    /* no capturable tab yet */
   }
+
   return {
     version: EXT_VERSION,
     features: FEATURES,
-    controlPort: CONTROL_PORT,
-    tabs: tabs,
+    controlPort: entry && entry.controlPort != null ? entry.controlPort : CONTROL_PORT,
+    window_id: windowId,
+    tabs: tabsOut,
+    job_target: jobTarget,
+    recommended_cli: recommendedCLI,
   };
 }
 
-async function handleEvalJob(params, payload, sessionId) {
+async function handleEvalJob(params, payload, sessionId, targetOpts) {
   const expression =
     (params && (params.expression || params.expr || params.code)) ||
     payload.expression ||
@@ -518,7 +550,7 @@ async function handleEvalJob(params, payload, sessionId) {
       returnByValue: true,
       awaitPromise: true,
     });
-  });
+  }, targetOpts);
   const value =
     result && result.result && "value" in result.result
       ? result.result.value
@@ -534,7 +566,7 @@ async function handleEvalJob(params, payload, sessionId) {
   };
 }
 
-async function handleRunJob(params, payload, sessionId) {
+async function handleRunJob(params, payload, sessionId, targetOpts) {
   const source =
     (params && (params.source || params.expression || params.expr || params.code || params.script)) ||
     payload.source ||
@@ -546,7 +578,7 @@ async function handleRunJob(params, payload, sessionId) {
       returnByValue: true,
       awaitPromise: true,
     });
-  });
+  }, targetOpts);
   const value =
     result && result.result && "value" in result.result ? result.result.value : null;
   return {
@@ -558,7 +590,7 @@ async function handleRunJob(params, payload, sessionId) {
   };
 }
 
-async function handleLogsJob(params, sessionId) {
+async function handleLogsJob(params, sessionId, targetOpts) {
   const limit = (params && params.limit) || 100;
   const level = params && params.level;
   let entries = consoleLogBuffer.slice();
@@ -573,14 +605,14 @@ async function handleLogsJob(params, sessionId) {
       await sendDebuggerCommand(tabId, "Log.enable", {});
       await sendDebuggerCommand(tabId, "Runtime.enable", {});
       return { enabled: true };
-    });
+    }, targetOpts);
   } catch (e) {
     /* ignore attach failures for logs */
   }
   return { entries: entries, type: "logs" };
 }
 
-async function handleScreenshotJob(params, sessionId) {
+async function handleScreenshotJob(params, sessionId, targetOpts) {
   const format = (params && params.format) || "png";
   const fullPage = !!(params && params.full_page);
   const result = await withDebuggerForSession(sessionId, async (tabId) => {
@@ -589,7 +621,7 @@ async function handleScreenshotJob(params, sessionId) {
       cdpParams.captureBeyondViewport = true;
     }
     return await sendDebuggerCommand(tabId, "Page.captureScreenshot", cdpParams);
-  });
+  }, targetOpts);
   return {
     base64: (result && result.data) || "",
     format: format,
@@ -598,7 +630,7 @@ async function handleScreenshotJob(params, sessionId) {
   };
 }
 
-async function handleCdpJob(params, sessionId) {
+async function handleCdpJob(params, sessionId, targetOpts) {
   const method = (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
   if (!method) {
     throw new Error("cdp job requires params.method");
@@ -606,7 +638,7 @@ async function handleCdpJob(params, sessionId) {
   const cdpParams = (params && params.params) || {};
   const result = await withDebuggerForSession(sessionId, async (tabId) => {
     return await sendDebuggerCommand(tabId, method, cdpParams || {});
-  });
+  }, targetOpts);
   return {
     result: result,
     method: method,
@@ -630,10 +662,61 @@ function isCapturableTabURL(url) {
   return true;
 }
 
-async function pickTargetTabIdForSession(sessionId) {
-  const entry = sessions.get(sessionId);
+async function listCapturableTabsInSessionWindow(sessionId, entry) {
+  if (entry && entry.windowId != null) {
+    try {
+      const tabs = await chrome.tabs.query({ windowId: entry.windowId });
+      return (tabs || []).filter((t) => t.id != null && isCapturableTabURL(t.url || ""));
+    } catch (e) {
+      /* window query optional */
+    }
+  }
+  try {
+    const tabs = await chrome.tabs.query({});
+    return (tabs || []).filter((t) => t.id != null && isCapturableTabURL(t.url || ""));
+  } catch (e) {
+    return [];
+  }
+}
 
-  // Prefer the active capturable tab in the session window (multi-session safe).
+/**
+ * Resolve job target tab for a session.
+ * Priority: payload.tab_id -> tab_index (1-based capturable) -> active tab -> session page.
+ */
+async function pickTargetTabIdForSession(sessionId, opts) {
+  opts = opts || {};
+  const entry = sessions.get(sessionId);
+  const explicitTabId =
+    opts.tabId != null ? opts.tabId : opts.tab_id != null ? opts.tab_id : null;
+  const explicitTabIndex =
+    opts.tabIndex != null ? opts.tabIndex : opts.tab_index != null ? opts.tab_index : null;
+
+  // 1. Explicit tab_id from job payload (--tab-id flag).
+  if (explicitTabId != null) {
+    const tabId = parseInt(explicitTabId, 10);
+    const tab = await chrome.tabs.get(tabId);
+    if (entry && entry.windowId != null && tab.windowId !== entry.windowId) {
+      throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
+    }
+    if (!isCapturableTabURL(tab.url || "")) {
+      throw new Error("tab_id " + tabId + " is not capturable");
+    }
+    return tab.id;
+  }
+
+  // 2. tab_index: 1-based index over capturable tabs in session window (left-to-right).
+  if (explicitTabIndex != null) {
+    const capturable = await listCapturableTabsInSessionWindow(sessionId, entry);
+    const idx = parseInt(explicitTabIndex, 10);
+    if (Number.isNaN(idx) || idx < 1 || idx > capturable.length) {
+      throw new Error(
+        "tab_index " + explicitTabIndex + " out of range (1-" + capturable.length + ")",
+      );
+    }
+    return capturable[idx - 1].id;
+  }
+
+  // 3. Active capturable tab in the session window (multi-session safe).
   if (entry && entry.windowId != null) {
     try {
       const activeTabs = await chrome.tabs.query({ active: true, windowId: entry.windowId });
@@ -646,7 +729,7 @@ async function pickTargetTabIdForSession(sessionId) {
     }
   }
 
-  // Fallback: registered session control page tab.
+  // 4. Fallback: registered session control page tab.
   if (entry && entry.tabId != null) {
     try {
       const tab = await chrome.tabs.get(entry.tabId);
@@ -682,6 +765,19 @@ async function pickTargetTabIdForSession(sessionId) {
   throw new Error("no capturable tab for session " + sessionId);
 }
 
+function detachDebugger(tabId) {
+  return new Promise((resolve) => {
+    if (!attachedTabs.has(tabId)) {
+      resolve();
+      return;
+    }
+    chrome.debugger.detach({ tabId: tabId }, () => {
+      attachedTabs.delete(tabId);
+      resolve();
+    });
+  });
+}
+
 function attachDebugger(tabId) {
   return new Promise((resolve, reject) => {
     if (attachedTabs.has(tabId)) {
@@ -701,6 +797,24 @@ function attachDebugger(tabId) {
   });
 }
 
+async function attachDebuggerForSession(sessionId, tabId) {
+  let state = sessionAttachState.get(sessionId);
+  if (!state) {
+    state = { attachedTabId: null, attachLock: Promise.resolve() };
+    sessionAttachState.set(sessionId, state);
+  }
+  const run = async () => {
+    if (state.attachedTabId != null && state.attachedTabId !== tabId) {
+      await detachDebugger(state.attachedTabId);
+      state.attachedTabId = null;
+    }
+    await attachDebugger(tabId);
+    state.attachedTabId = tabId;
+  };
+  state.attachLock = state.attachLock.then(run, run);
+  return state.attachLock;
+}
+
 function sendDebuggerCommand(tabId, method, params) {
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId: tabId }, method, params || {}, (result) => {
@@ -713,9 +827,9 @@ function sendDebuggerCommand(tabId, method, params) {
   });
 }
 
-async function withDebuggerForSession(sessionId, fn) {
-  const tabId = await pickTargetTabIdForSession(sessionId);
-  await attachDebugger(tabId);
+async function withDebuggerForSession(sessionId, fn, opts) {
+  const tabId = await pickTargetTabIdForSession(sessionId, opts || {});
+  await attachDebuggerForSession(sessionId, tabId);
   return await fn(tabId);
 }
 

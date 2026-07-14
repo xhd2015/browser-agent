@@ -331,6 +331,7 @@ func (c *controlServer) handleSessionDelete(w http.ResponseWriter, r *http.Reque
 type jobsRequest struct {
 	SessionID string         `json:"session_id"`
 	Type      string         `json:"type"`
+	TabID     int64          `json:"tab_id"`
 	Params    map[string]any `json:"params"`
 	TimeoutMS int64          `json:"timeout_ms"`
 }
@@ -395,6 +396,7 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	enqueued, err := sess.queue.Enqueue(Job{
 		SessionID: sid,
 		Type:      jobType,
+		TabID:     req.TabID,
 		Params:    req.Params,
 		TimeoutMS: timeoutMS,
 	})

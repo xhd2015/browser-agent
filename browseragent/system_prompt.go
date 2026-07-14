@@ -30,16 +30,17 @@ Optional escape hatch:
 
 - browser-agent session cdp <method> [json]
 
-## Active tab (critical)
+## Tab targeting (critical)
 
-- **eval / run / logs / screenshot / cdp run on the active tab in the session window**
-  (the Chrome window where the session page /go?session= is open). There is no CLI
-  flag to pick another tabId yet.
-- Use **session info** first: it lists all open tabs (id, title, url, active).
-- If the user's content is in a **background** tab in that window:
-  Ask the user to **focus that tab**, then re-run info/eval.
-  Do **not** navigate the session control page away from /go?session= — that
-  disconnects the extension.
+- **Default:** eval / run / logs / screenshot / cdp target the **active capturable tab**
+  in the session window (the Chrome window where /go?session= is open).
+- **Prefer --tab-id:** pass an explicit Chrome tab id for stable targeting:
+  browser-agent session eval --tab-id <id> '...'
+- **--tab-index** (1-based capturable tab list) is available but unstable; prefer --tab-id.
+- Run **session info** first: human table or --json lists tabs (Idx, ID, Role, active)
+  plus job_target and recommended_cli.
+- If the user's content is in a **background** tab, use --tab-id from session info —
+  do **not** navigate the session control page away from /go?session= (disconnects extension).
 - Do **not** try to switch tabs via CDP Target.* (see below).
 
 ## session cdp limits (Chrome extension debugger)

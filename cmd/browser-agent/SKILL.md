@@ -84,14 +84,18 @@ browser-agent session info --session-id "$BROWSER_AGENT_SESSION_ID"
 
 Default control base: `http://127.0.0.1:43761`.
 
-### Active tab (critical)
+### Tab targeting (critical)
 
-- **eval / run / logs / screenshot / cdp target the active tab in the session window**
-  (the Chrome window where `/go?session=<id>` is open). There is no `--tab-id` flag yet.
-- If the page the user cares about is a **background** tab in that window:
-  Ask the user to focus that tab, then re-run `session info` + eval.
-  Do **not** navigate the session control page away from `/go?session=` — that
-  disconnects the extension.
+- **Default:** eval / run / logs / screenshot / cdp target the **active capturable tab**
+  in the session window (where `/go?session=<id>` is open).
+- **Prefer `--tab-id`:** `browser-agent session eval --tab-id <chromeTabId> '...'` for stable
+  targeting on background tabs without focusing them.
+- **`--tab-index <n>`** (1-based capturable tabs in session window) is available but unstable;
+  stderr warns to prefer `--tab-id`. Mutually exclusive with `--tab-id`.
+- Run **`session info`** first (human table or `--json`): tabs with Idx/ID/Role/active,
+  `job_target`, and `recommended_cli`.
+- Do **not** navigate the session control page away from `/go?session=` — that disconnects
+  the extension.
 - List tabs with **session info** only — do **not** use CDP `Target.getTargets`.
 
 ### session cdp limits (Chrome extension debugger)

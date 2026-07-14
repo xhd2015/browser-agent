@@ -1,0 +1,11 @@
+.vscode
+.idea
+.codex
+.cursor
+
+.config
+
+*.har
+node_modules
+dist
+/external

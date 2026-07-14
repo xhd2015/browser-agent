@@ -1,0 +1,272 @@
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #e0e0e0;
+}
+
+body {
+  width: 330px;
+  min-height: 160px;
+  background: #1a1a2e;
+}
+
+.app {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-start;
+  flex-direction: column;
+  text-align: center;
+  padding: 16px;
+  gap: 10px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot.idle {
+  background: #9e9e9e;
+}
+
+.status-dot.recording {
+  background: #e53935;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(229, 57, 53, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(229, 57, 53, 0); }
+}
+
+.status-text {
+  font-size: 13px;
+  color: #aaa;
+}
+
+/* --- Recording stats chips --- */
+
+.stats-chips {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.chip {
+  flex: 1;
+  background: #16213e;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chip-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #888;
+}
+
+.chip-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: #f0f0f0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- By-tab list --- */
+
+.tabs-section {
+  width: 100%;
+  text-align: left;
+}
+
+.tabs-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+.tabs-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tab-row {
+  background: #16213e;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tab-row.detached {
+  opacity: 0.75;
+}
+
+.tab-row-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tab-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e8e8e8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+}
+
+.tab-counts {
+  font-size: 11px;
+  color: #9aa;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.tab-domains {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.domain-pill {
+  font-size: 10px;
+  background: #0f3460;
+  color: #b8d4ff;
+  border-radius: 999px;
+  padding: 2px 7px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.domain-pill .dom-count {
+  color: #7eb6ff;
+  margin-left: 3px;
+  font-weight: 600;
+}
+
+.domain-more {
+  font-size: 10px;
+  color: #777;
+  padding: 2px 4px;
+}
+
+.tab-badge {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #888;
+  margin-left: 4px;
+}
+
+.btn {
+  width: 100%;
+  padding: 10px 0;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-top: 4px;
+}
+
+.btn:active {
+  transform: scale(0.97);
+}
+
+.btn-preview {
+  background: #1f6feb;
+  color: #fff;
+  margin-top: 0;
+}
+
+.btn-preview:hover {
+  background: #1a5cc7;
+}
+
+.btn-clear {
+  background: #f3f4f6;
+  color: #333;
+  border: 1px solid #d0d7de;
+  margin-top: 0;
+}
+
+.btn-clear:hover {
+  background: #e5e7eb;
+}
+
+.btn-start {
+  background: #e53935;
+  color: #fff;
+}
+
+.btn-start:hover {
+  background: #c62828;
+}
+
+.btn-stop {
+  background: #43a047;
+  color: #fff;
+}
+
+.btn-stop:hover {
+  background: #2e7d32;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.request-count {
+  font-size: 11px;
+  color: #666;
+  min-height: 0;
+}
+
+.hidden {
+  display: none !important;
+}

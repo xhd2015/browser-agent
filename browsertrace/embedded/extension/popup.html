@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>API Capture - HAR Recorder</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <div class="status-dot" id="statusDot"></div>
+      <h1 class="title">API Capture</h1>
+    </div>
+    <div class="status-text" id="statusText">Idle</div>
+
+    <!-- Summary chips: visible only while recording -->
+    <div class="stats-chips hidden" id="statsChips" aria-label="Recording summary">
+      <div class="chip">
+        <span class="chip-label">Tabs</span>
+        <span class="chip-value" id="chipTabs">0</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Domains</span>
+        <span class="chip-value" id="chipDomains">0</span>
+      </div>
+      <div class="chip">
+        <span class="chip-label">Requests</span>
+        <span class="chip-value" id="chipRequests">0</span>
+      </div>
+    </div>
+
+    <!-- Per-tab breakdown: visible only while recording -->
+    <div class="tabs-section hidden" id="tabsSection">
+      <div class="tabs-section-title">By tab</div>
+      <div class="tabs-list" id="tabsList"></div>
+    </div>
+
+    <button class="btn btn-start" id="actionBtn">Start Recording</button>
+    <button class="btn btn-clear hidden" id="clearBtn" type="button">Clear captured</button>
+    <button class="btn btn-preview hidden" id="previewBtn">Preview Last Recording</button>
+    <div class="request-count" id="requestCount"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

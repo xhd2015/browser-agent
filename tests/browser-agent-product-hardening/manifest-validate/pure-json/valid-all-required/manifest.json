@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Agent Fixture Valid",
+  "version": "1.0.0",
+  "description": "Valid fixture: all required permissions and hosts",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "alarms",
+    "debugger",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:43761/*",
+    "http://localhost:43761/*",
+    "<all_urls>"
+  ]
+}

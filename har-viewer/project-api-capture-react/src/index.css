@@ -1,0 +1,109 @@
+:root {
+  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Theme variables - dark by default */
+  --bg-primary: #1e1e2e;
+  --bg-secondary: #181825;
+  --bg-tertiary: #313244;
+  --bg-hover: #45475a;
+  --text-primary: #cdd6f4;
+  --text-secondary: #a6adc8;
+  --text-muted: #6c7086;
+  --border-primary: #313244;
+  --border-secondary: #45475a;
+  --accent: #89b4fa;
+  --accent-hover: #74c7ec;
+  --status-ok: #a6e3a1;
+  --status-warn: #f9e2af;
+  --status-error: #f38ba8;
+  --status-info: #89b4fa;
+  --method-get: #89b4fa;
+  --method-post: #a6e3a1;
+  --method-put: #f9e2af;
+  --method-delete: #f38ba8;
+  --method-patch: #cba6f7;
+  --method-options: #94e2d5;
+  --success-bg: #1e3a2f;
+  --error-bg: #3a1e1e;
+  --code-bg: #181825;
+  --link-color: #89b4fa;
+  --link-hover: #74c7ec;
+}
+
+[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #e8e8e8;
+  --bg-hover: #dcdcdc;
+  --text-primary: #1e1e2e;
+  --text-secondary: #555;
+  --text-muted: #888;
+  --border-primary: #ddd;
+  --border-secondary: #ccc;
+  --accent: #4a6cf7;
+  --accent-hover: #3b5de7;
+  --status-ok: #2e7d32;
+  --status-warn: #ed6c02;
+  --status-error: #d32f2f;
+  --status-info: #4a6cf7;
+  --method-get: #1976d2;
+  --method-post: #2e7d32;
+  --method-put: #ed6c02;
+  --method-delete: #d32f2f;
+  --method-patch: #7b1fa2;
+  --method-options: #00796b;
+  --success-bg: #e8f5e9;
+  --error-bg: #fce4ec;
+  --code-bg: #f5f5f5;
+  --link-color: #4a6cf7;
+  --link-hover: #3b5de7;
+}
+
+a {
+  font-weight: 500;
+  color: var(--link-color);
+  text-decoration: inherit;
+}
+a:hover {
+  color: var(--link-hover);
+}
+
+body {
+  margin: 0;
+  display: flex;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: var(--accent);
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}

@@ -1,0 +1,218 @@
+package browseragent
+
+import (
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// embeddedExtension is the staged MV3 tree (mini fixture in CI).
+//
+//go:embed embedded/extension/**
+var embeddedExtension embed.FS
+
+const embeddedExtensionRoot = "embedded/extension"
+
+// embeddedSessionPage is the committed Vite session-page production fixture
+// (mini HTML/JS in CI; operators may replace via script/browser-agent/bundle).
+//
+//go:embed embedded/session-page/**
+var embeddedSessionPage embed.FS
+
+const embeddedSessionPageRoot = "embedded/session-page"
+
+// SessionPageFS returns the embedded session-page asset tree.
+// Paths are rooted under "embedded/session-page/" (index.html, assets/…).
+func SessionPageFS() fs.FS {
+	return embeddedSessionPage
+}
+
+// FormatSessionBootJSON returns boot config JSON for the session SPA:
+// session_id, product=browser-agent, control_port=43761.
+func FormatSessionBootJSON(sessionID string) string {
+	raw, err := json.Marshal(map[string]any{
+		"session_id":   sessionID,
+		"product":      ProductName,
+		"control_port": 43761,
+	})
+	if err != nil {
+		// Unreachable for string/int map values; keep a stable fallback.
+		return fmt.Sprintf(`{"session_id":%q,"product":%q,"control_port":43761}`, sessionID, ProductName)
+	}
+	return string(raw)
+}
+
+// readEmbeddedSessionIndex loads index.html (or session-page.html) from the embed.
+func readEmbeddedSessionIndex() (string, error) {
+	candidates := []string{
+		embeddedSessionPageRoot + "/index.html",
+		embeddedSessionPageRoot + "/session-page.html",
+		"index.html",
+		"session-page.html",
+	}
+	var last error
+	for _, c := range candidates {
+		data, err := embeddedSessionPage.ReadFile(c)
+		if err != nil {
+			last = err
+			continue
+		}
+		return string(data), nil
+	}
+	if last == nil {
+		last = fmt.Errorf("no session-page index in embed")
+	}
+	return "", last
+}
+
+// ExtractEmbeddedExtension writes the embedded MV3 package under
+// {baseDir}/extension/{version}/ and returns the absolute install path and
+// version string from manifest.json. Idempotent for the same version.
+func ExtractEmbeddedExtension(baseDir string) (installPath, version string, err error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return "", "", fmt.Errorf("baseDir is required")
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve baseDir: %w", err)
+	}
+
+	maniBytes, err := embeddedExtension.ReadFile(embeddedExtensionRoot + "/manifest.json")
+	if err != nil {
+		return "", "", fmt.Errorf("read embedded manifest.json: %w", err)
+	}
+	var mani struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(maniBytes, &mani); err != nil {
+		return "", "", fmt.Errorf("parse embedded manifest.json: %w", err)
+	}
+	version = strings.TrimSpace(mani.Version)
+	if version == "" {
+		return "", "", fmt.Errorf("embedded manifest.json has empty version")
+	}
+
+	dest := filepath.Join(absBase, "extension", version)
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", "", fmt.Errorf("create extract dir: %w", err)
+	}
+
+	err = fs.WalkDir(embeddedExtension, embeddedExtensionRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(embeddedExtensionRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.FromSlash(rel)
+		target := filepath.Join(dest, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := embeddedExtension.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read embedded %s: %w", path, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("extract embedded extension: %w", err)
+	}
+
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		return "", "", err
+	}
+	// Ensure SW-loadable identity file exists after extract (hash excludes itself).
+	if _, err := EnsureExtensionBundleSum(absDest, version); err != nil {
+		return "", "", fmt.Errorf("ensure bundle-sum.js: %w", err)
+	}
+	return absDest, version, nil
+}
+
+// InstallChromeExtension extracts the embedded extension and writes user-facing
+// Load unpacked instructions to w. Output ends with a trailing newline.
+// Includes package version and content md5 from bundle-sum.js (written on extract).
+func InstallChromeExtension(w io.Writer, baseDir string) error {
+	if w == nil {
+		w = io.Discard
+	}
+	if strings.TrimSpace(baseDir) == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = os.TempDir()
+		}
+		baseDir = filepath.Join(home, ".tmp", "browser-agent")
+	}
+	path, version, err := ExtractEmbeddedExtension(baseDir)
+	if err != nil {
+		return err
+	}
+	// Prefer identity from bundle-sum.js (canonical after EnsureExtensionBundleSum).
+	sum, sumErr := ReadBundleSumFromDir(path)
+	if sumErr == nil && strings.TrimSpace(sum.Version) != "" {
+		version = sum.Version
+	}
+	md5hex := ""
+	if sumErr == nil {
+		md5hex = sum.MD5
+	}
+	if md5hex == "" {
+		// Fallback: recompute if sum missing (should be rare after extract).
+		if s, e := EnsureExtensionBundleSum(path, version); e == nil {
+			version = s.Version
+			md5hex = s.MD5
+		}
+	}
+
+	_, err = fmt.Fprintf(w, `Chrome extension extracted for browser-agent.
+
+  path     %s
+  version  %s
+  md5      %s
+
+Install / load the unpacked extension:
+
+  1. Open chrome://extensions
+  2. Enable Developer mode (top-right toggle)
+  3. Click Load unpacked
+  4. Select this folder:
+
+     %s
+
+After loading, keep the session page open so the extension can connect.
+Compare version/md5 with browser-agent serve "embedded" lines if connection warns of mismatch.
+`, path, version, md5hex, path)
+	return err
+}
+
+// BuildChromeArgs returns Chrome argv (without the binary name) for a
+// best-effort launch: new window, load-extension, session URL.
+// Does not include --user-data-dir (uses the default profile).
+func BuildChromeArgs(sessionURL, extensionPath string) []string {
+	args := []string{"--new-window"}
+	if strings.TrimSpace(extensionPath) != "" {
+		args = append(args, "--load-extension="+extensionPath)
+	}
+	if strings.TrimSpace(sessionURL) != "" {
+		args = append(args, sessionURL)
+	}
+	return args
+}
+
+// BuildChromeLaunchArgs is an alias of BuildChromeArgs (browser-trace naming).
+func BuildChromeLaunchArgs(sessionURL, extensionPath string) []string {
+	return BuildChromeArgs(sessionURL, extensionPath)
+}

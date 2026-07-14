@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "browser-trace fixture extension",
+  "version": "1.2.0",
+  "description": "Minimal MV3 fixture for doctest extract/install — not a real capture agent",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ]
+}

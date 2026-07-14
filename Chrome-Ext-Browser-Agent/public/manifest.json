@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Agent",
+  "version": "1.0.1",
+  "description": "Browser Agent extension — connects to browser-agent control server on port 43761; CDP jobs on open tabs",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Browser Agent",
+    "default_popup": "popup.html"
+  },
+  "permissions": [
+    "alarms",
+    "debugger",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://127.0.0.1/*",
+    "ws://localhost/*",
+    "http://127.0.0.1:43761/*",
+    "http://localhost:43761/*",
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": ["contentScript.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "externally_connectable": {
+    "matches": [
+      "http://127.0.0.1/*",
+      "http://localhost/*"
+    ]
+  }
+}

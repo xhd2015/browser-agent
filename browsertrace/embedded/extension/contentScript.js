@@ -1,0 +1,1 @@
+!function(){const e=["browser-trace","multi-tab-window"];try{window.__BROWSER_TRACE_EXT__={version:"1.2.0",features:e.slice()}}catch(e){}try{chrome.runtime.sendMessage({action:"wakeAgent"},()=>{chrome.runtime.lastError})}catch(e){}}();

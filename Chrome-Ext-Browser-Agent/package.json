@@ -1,0 +1,9 @@
+{
+  "name": "chrome-ext-browser-agent",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Chrome-Ext-Browser-Agent — MV3 shell for browser-agent (port 43761)",
+  "scripts": {
+    "build": "node ./scripts/copy-public-to-build.mjs"
+  }
+}

@@ -132,15 +132,46 @@ export function SessionPageApp({
             {match}
           </span>
         </div>
-        {installPath ? (
-          <p className="muted" style={{ fontSize: "0.85rem" }}>
-            Load unpacked: <code style={{ wordBreak: "break-all" }}>{installPath}</code>
-          </p>
-        ) : null}
+        <p
+          className="muted"
+          style={{ fontSize: "0.85rem" }}
+          data-browser-agent-ext-install-path
+        >
+          Load unpacked:{" "}
+          <code style={{ wordBreak: "break-all" }}>
+            {installPath || "…"}
+          </code>
+        </p>
       </section>
 
       {!connected ? (
-        <InstallGuideline product={product} defaultOpen />
+        <>
+          <InstallGuideline
+            product={product}
+            installPath={installPath}
+            defaultOpen
+          />
+          <details
+            className="troubleshoot-panel"
+            data-browser-agent-troubleshoot
+            style={{
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              padding: "0.75rem 1rem",
+              margin: "1rem 0",
+            }}
+          >
+            <summary>Troubleshoot extension connection</summary>
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
+              Chrome 137+ ignores <code>--load-extension</code>. Load unpacked
+              once from the path above (chrome://extensions → Developer mode →
+              Load unpacked).
+            </p>
+            <p className="muted" style={{ fontSize: "0.85rem" }}>
+              Or run: <code>browser-agent install-chrome-extension</code>
+            </p>
+          </details>
+        </>
       ) : null}
     </div>
   );

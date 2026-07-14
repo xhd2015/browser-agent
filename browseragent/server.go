@@ -3,8 +3,10 @@ package browseragent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
 	"net/http"
 	"path"
@@ -13,16 +15,60 @@ import (
 )
 
 type controlServer struct {
-	sess *session
+	registry            *SessionRegistry
+	requireSessionParam bool
+	fastFailNoExtension bool
+	onShutdown          func()
+	baseDir             string
+	daemonVersion       string
 }
 
-func newControlServer(sess *session) *controlServer {
-	return &controlServer{sess: sess}
+// RegistryHandlerConfig configures extended health metadata on registry handlers.
+type RegistryHandlerConfig struct {
+	OnShutdown    func()
+	BaseDir       string
+	DaemonVersion string
+}
+
+// NewRegistryControlHandler returns an HTTP handler backed by a multi-session registry.
+func NewRegistryControlHandler(registry *SessionRegistry) http.Handler {
+	return NewRegistryControlHandlerConfig(registry, RegistryHandlerConfig{})
+}
+
+// NewRegistryControlHandlerWithShutdown returns a registry handler that invokes
+// onShutdown when POST /v1/shutdown is accepted.
+func NewRegistryControlHandlerWithShutdown(registry *SessionRegistry, onShutdown func()) http.Handler {
+	return NewRegistryControlHandlerConfig(registry, RegistryHandlerConfig{OnShutdown: onShutdown})
+}
+
+// NewRegistryControlHandlerConfig returns a registry handler with optional shutdown
+// callback and extended /v1/health fields.
+func NewRegistryControlHandlerConfig(registry *SessionRegistry, cfg RegistryHandlerConfig) http.Handler {
+	cs := &controlServer{
+		registry:            registry,
+		requireSessionParam: true,
+		fastFailNoExtension: true,
+		onShutdown:          cfg.OnShutdown,
+		baseDir:             cfg.BaseDir,
+		daemonVersion:       cfg.DaemonVersion,
+	}
+	return cs.handler()
+}
+
+func newRunControlHandler(registry *SessionRegistry) http.Handler {
+	cs := &controlServer{
+		registry:            registry,
+		requireSessionParam: false,
+		fastFailNoExtension: false,
+	}
+	return cs.handler()
 }
 
 func (c *controlServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", c.handleHealth)
+	mux.HandleFunc("/v1/shutdown", c.handleShutdown)
+	mux.HandleFunc("/v1/sessions", c.handleSessions)
 	mux.HandleFunc("/v1/session", c.handleSession)
 	mux.HandleFunc("/v1/jobs", c.handleJobs)
 	mux.HandleFunc("/v1/ws", c.handleWS)
@@ -32,6 +78,49 @@ func (c *controlServer) handler() http.Handler {
 	return mux
 }
 
+func (c *controlServer) writeSessionNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":   "session not found",
+		"message": "unknown session id",
+	})
+}
+
+func (c *controlServer) writeMissingSession(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":   "missing session",
+		"message": "session query parameter is required",
+	})
+}
+
+func (c *controlServer) resolveSessionQuery(r *http.Request) (string, *session, bool) {
+	id := strings.TrimSpace(r.URL.Query().Get("session"))
+	if id == "" && !c.requireSessionParam {
+		if only, ok := c.registry.onlySessionID(); ok {
+			id = only
+		}
+	}
+	if id == "" {
+		return "", nil, false
+	}
+	sess, ok := c.registry.Get(id)
+	if !ok {
+		return id, nil, false
+	}
+	return id, sess, true
+}
+
+func (c *controlServer) jobFailureData(sessionID string) map[string]any {
+	baseURL := c.registry.BaseURL()
+	return map[string]any{
+		"hint":        buildDisconnectedHint(sessionID, baseURL),
+		"session_url": baseURL + "/go?session=" + sessionID,
+	}
+}
+
 func (c *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -39,28 +128,204 @@ func (c *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"ok":true}`))
+	dv := c.daemonVersion
+	if dv == "" {
+		dv = ClientVersion()
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":             true,
+		"product":        ProductName,
+		"daemon_version": dv,
+		"base_dir":       c.baseDir,
+	})
 }
 
-func (c *controlServer) handleSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (c *controlServer) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := r.URL.Query().Get("session")
-	// Single-session serve: empty session query uses live session.
-	if id != "" && id != c.sess.id {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write(shutdownAcceptedBody)
+	if c.onShutdown != nil {
+		go c.onShutdown()
+	}
+}
+
+func (c *controlServer) handleSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		c.handleSessionsPost(w, r)
+	case http.MethodGet:
+		c.handleSessionsList(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+type createSessionRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+func (c *controlServer) handleSessionsPost(w http.ResponseWriter, r *http.Request) {
+	var req createSessionRequest
+	if r.Body != nil {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+	}
+	id := strings.TrimSpace(req.SessionID)
+	if id == "" {
+		id = GenerateSessionID()
+	}
+	if existing, ok := c.registry.Get(id); ok {
+		if existing.wasCreatedViaPOST() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "session already exists",
+				"message": fmt.Sprintf("%s: %s", ErrSessionExists, id),
+			})
+			return
+		}
+		result, ok := c.registry.CreateSessionResultFor(id)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "session lookup failed"})
+			return
+		}
+		existing.markCreatedViaPOST()
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
+		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "session not found",
-			"message": "unknown session id",
+			"session_id":  result.SessionID,
+			"session_url": result.SessionURL,
+			"session_dir": result.SessionDir,
+			"meta_path":   result.MetaPath,
+			"system_path": result.SystemPath,
 		})
 		return
 	}
-	snap := c.sess.snapshot()
+	result, err := c.registry.Create(id)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(err, ErrSessionExists) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "session already exists",
+				"message": err.Error(),
+			})
+			return
+		}
+		if ValidateSessionID(id) != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if sess, ok := c.registry.Get(id); ok {
+		sess.markCreatedViaPOST()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"session_id":  result.SessionID,
+		"session_url": result.SessionURL,
+		"session_dir": result.SessionDir,
+		"meta_path":   result.MetaPath,
+		"system_path": result.SystemPath,
+	})
+}
+
+func (c *controlServer) handleSessionsList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	list := c.registry.List()
+	if list == nil {
+		list = []sessionSnapshot{}
+	}
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+func (c *controlServer) handleSession(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		c.handleSessionGet(w, r)
+	case http.MethodDelete:
+		c.handleSessionDelete(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (c *controlServer) handleSessionGet(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("session"))
+	if id == "" && !c.requireSessionParam {
+		if only, ok := c.registry.onlySessionID(); ok {
+			id = only
+		}
+	}
+	if id == "" {
+		c.writeMissingSession(w)
+		return
+	}
+	sess, ok := c.registry.Get(id)
+	if !ok {
+		c.writeSessionNotFound(w)
+		return
+	}
+	snap := c.registry.snapshot(sess)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(snap)
+}
+
+func (c *controlServer) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("session"))
+	if id == "" && !c.requireSessionParam {
+		if only, ok := c.registry.onlySessionID(); ok {
+			id = only
+		}
+	}
+	if id == "" {
+		c.writeMissingSession(w)
+		return
+	}
+
+	err := c.registry.Delete(id)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(err, ErrSessionNotFound) {
+			c.writeSessionNotFound(w)
+			return
+		}
+		if errors.Is(err, ErrSessionExtensionConnected) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "extension connected",
+				"message": err.Error(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":      true,
+		"deleted": id,
+	})
 }
 
 type jobsRequest struct {
@@ -82,17 +347,27 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
 		return
 	}
-	sid := req.SessionID
+	sid := strings.TrimSpace(req.SessionID)
 	if sid == "" {
-		sid = r.URL.Query().Get("session")
+		sid = strings.TrimSpace(r.URL.Query().Get("session"))
 	}
-	if sid != "" && sid != c.sess.id {
+	if sid == "" && !c.requireSessionParam {
+		if only, ok := c.registry.onlySessionID(); ok {
+			sid = only
+		}
+	}
+	if sid == "" {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "session not found",
-			"message": "unknown session id",
+			"error":   "missing session_id",
+			"message": "session_id is required",
 		})
+		return
+	}
+	sess, ok := c.registry.Get(sid)
+	if !ok {
+		c.writeSessionNotFound(w)
 		return
 	}
 
@@ -105,8 +380,20 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		jobType = "eval"
 	}
 
-	enqueued, err := c.sess.queue.Enqueue(Job{
-		SessionID: c.sess.id,
+	if c.fastFailNoExtension && !sess.isExtensionConnected() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(JobResult{
+			JobID: "",
+			OK:    false,
+			Error: "extension not connected",
+			Data:  c.jobFailureData(sid),
+		})
+		return
+	}
+
+	enqueued, err := sess.queue.Enqueue(Job{
+		SessionID: sid,
 		Type:      jobType,
 		Params:    req.Params,
 		TimeoutMS: timeoutMS,
@@ -119,12 +406,12 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Push to extension if connected.
-	_ = c.pushJob(enqueued)
+	_ = c.pushJob(sess, enqueued)
 
 	// Hold until result / timeout / disconnect-fail.
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutMS)*time.Millisecond)
 	defer cancel()
-	res, waitErr := c.sess.queue.Wait(ctx, enqueued.ID)
+	res, waitErr := sess.queue.Wait(ctx, enqueued.ID)
 	if waitErr != nil && res.Error == "" {
 		// Ensure timeout wording.
 		if ctx.Err() != nil {
@@ -143,6 +430,15 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	if res.JobID == "" {
 		res.JobID = enqueued.ID
+	}
+	if !res.OK && res.Data == nil {
+		res.Data = c.jobFailureData(sid)
+	} else if !res.OK && res.Data != nil {
+		if _, ok := res.Data["hint"]; !ok {
+			for k, v := range c.jobFailureData(sid) {
+				res.Data[k] = v
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -219,11 +515,16 @@ func (c *controlServer) handleGo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	sessionID := r.URL.Query().Get("session")
-	if sessionID == "" {
-		sessionID = c.sess.id
+	sessionID, sess, ok := c.resolveSessionQuery(r)
+	if !ok {
+		if strings.TrimSpace(r.URL.Query().Get("session")) == "" && c.requireSessionParam {
+			c.writeMissingSession(w)
+			return
+		}
+		c.writeSessionNotFound(w)
+		return
 	}
-	snap := c.sess.snapshot()
+	snap := c.registry.snapshot(sess)
 	// Prefer embedded session-page fixture when present.
 	if htmlBody, err := readEmbeddedSessionIndex(); err == nil && strings.TrimSpace(htmlBody) != "" {
 		out := injectSessionBoot(htmlBody, sessionID, snap)
@@ -318,6 +619,16 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 			out = out[:idx] + marker + out[idx:]
 		} else {
 			out += marker
+		}
+	}
+
+	// Session warning banner (phase 3): keep page open / do not navigate away.
+	if !strings.Contains(out, "data-browser-agent-session-warning") {
+		warning := sessionWarningBannerHTML(sessionID)
+		if idx := strings.Index(strings.ToLower(out), "</body>"); idx >= 0 {
+			out = out[:idx] + warning + out[idx:]
+		} else {
+			out += warning
 		}
 	}
 
@@ -468,6 +779,16 @@ func extensionIdentityPanelHTML(sessionID string, snap sessionSnapshot) string {
 `, bundledVer, bundledMD5, loadedVer, loadedMD5, matchClass(match), match, path, sessionID)
 }
 
+func sessionWarningBannerHTML(sessionID string) string {
+	esc := html.EscapeString(sessionID)
+	return fmt.Sprintf(
+		`<div data-browser-agent-session-warning data-session-id="%s" role="note" style="border:1px solid #c9a227;background:#fffbeb;border-radius:8px;padding:0.75rem 1rem;margin:1rem 0;font-family:system-ui,sans-serif;">
+  <strong>Keep this session page open</strong> (<code>%s</code>).
+  Do not close this tab or navigate to a different session in the same window.
+</div>
+`, esc, esc)
+}
+
 func matchClass(match string) string {
 	switch match {
 	case ExtensionMatchOK:
@@ -505,6 +826,7 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 </script>
 </head>
 <body data-browser-agent-session data-session-id="%s" data-product="browser-agent" data-control-port="43761">
+  %s
   <div id="root" data-browser-agent-root class="browser-agent-root">
   <h1>browser-agent</h1>
   <p>Session <code id="session-id">%s</code> is active.</p>
@@ -557,5 +879,5 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 })();
   </script>
   </div>
-</body></html>`, FormatSessionBootJSON(sessionID), sessionID, esc, esc, identity, sessionID)
+</body></html>`, FormatSessionBootJSON(sessionID), sessionID, esc, sessionWarningBannerHTML(sessionID), esc, identity, sessionID)
 }

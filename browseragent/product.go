@@ -3,10 +3,6 @@
 package browseragent
 
 const (
-	// DefaultAddr is the product control listen address.
-	DefaultAddr = "127.0.0.1:43761"
-	// DefaultControlPort is the product control port (string for HTML/CLI markers).
-	DefaultControlPort = "43761"
 	// ProductName is the CLI / product display name.
 	ProductName = "browser-agent"
 	// FeatureBrowserAgent is the capability advertised by the extension hello.

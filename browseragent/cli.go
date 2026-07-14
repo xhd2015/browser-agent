@@ -14,13 +14,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	inj "github.com/xhd2015/browser-agent/browseragent/inject"
 )
 
 const briefUsage = `Usage: browser-agent <command> [flags]
 
 Commands:
-  serve       Start the browser-agent control server
-  session     Session side-commands: info|eval|run|logs|screenshot|cdp
+  serve       Blocking multi-session daemon host (default 127.0.0.1:43761)
+  session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|list
+  open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
   install-chrome-extension   Extract embedded Chrome extension
 
@@ -32,9 +35,12 @@ const fullHelp = `Usage: browser-agent <command> [flags]
 browser-agent is the operator CLI for the browser-agent control plane.
 
 Commands:
-  serve [flags]              Start control server (default addr 127.0.0.1:43761)
-  session <cmd> [flags]      Nested session side-commands (require session id)
-    session info [flags]               Print session snapshot JSON
+  serve [flags]              Blocking multi-session daemon host (default addr 127.0.0.1:43761)
+  session <cmd> [flags]      Nested session side-commands
+    session new [flags]                Ensure daemon, create session, open Chrome (no agent-run)
+    session info [flags]               Print session snapshot (human default; --json for machine output)
+    session delete [flags]             Remove session from registry and disk
+    session list [flags]               List live sessions from daemon registry
     session eval [flags] <expr>        POST an eval job and print the result
     session run [flags] <path.js>      Read a JS file and POST a run job
     session logs [flags]               POST a logs job (optional --limit N)
@@ -42,6 +48,7 @@ Commands:
     session cdp [flags] <Method> [json]
                                        POST a raw CDP job (method + optional params JSON)
   install-chrome-extension   Extract embedded extension and print Load unpacked help
+  open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
                              Embedded agent skill (see: browser-agent skill --help)
 
@@ -49,15 +56,52 @@ Global flags:
   -h, --help                 Show this help
 
 serve flags:
-  --addr <host:port>         Listen address (default: 127.0.0.1:43761)
+  --host <host>              Listen host (default: 127.0.0.1)
+  --port <port>              Listen port (default: 43761)
   --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
-  --session-id <id>          Fixed session id
-  --no-open-chrome           Do not launch Chrome
+  --stop                     Stop any running daemon in --base-dir and exit
+  --status                   Read-only daemon status probe (prints JSON and exits)
+  --kill-existing            Shutdown any existing daemon in --base-dir before starting
+  --color                    Force ANSI color on operator stderr
+  --no-color                 Disable ANSI color on operator stderr
+  --session-id <id>          (deprecated) Fixed session id; prefer plain serve or session new
   --no-agent-run             Do not launch agent-run
 
-session info / eval / run / logs / screenshot / cdp flags:
+serve --session-id is deprecated; start a blocking daemon host with plain serve, then
+create sessions via session new or POST /v1/sessions.
+
+session new flags:
+  --session-id <id>          Session id (auto-generate sess-xxxxxx when omitted)
+  --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
+  --host <host>              Control server host (default: 127.0.0.1)
+  --server-port <port>       Control server port (default: 43761; reads server.json when omitted)
+  --no-open-chrome           Do not launch Chrome
+
+open-managed-chrome flags:
+  --root <dir>               Managed Chrome root (default: ~/.browser-agent/managed-chrome)
+                             Layout: <root>/data (profile), <root>/extensions/browser-agent/{version}/
+  [url]                      Optional navigation URL; omit for a blank new window
+
+session list flags:
+  --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
+  --host <host>              Control server host (default: from server.json or 127.0.0.1)
+  --server-port <port>       Control server port (default: from server.json or 43761)
+  --json                     Emit raw JSON array of session snapshots (no ANSI)
+  --color                    Force ANSI color on table output
+  --no-color                 Disable ANSI color on table output
+
+session info flags:
   --session-id <id>          Session id (or env BROWSER_AGENT_SESSION_ID)
-  --addr <url|host:port>     Control server base (default: http://127.0.0.1:43761)
+  --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
+  --host <host>              Control server host (default: from server.json or 127.0.0.1)
+  --server-port <port>       Control server port (default: from server.json or 43761)
+  --json                     Emit enriched session snapshot JSON (includes browser tabs when connected)
+
+session delete / eval / run / logs / screenshot / cdp flags:
+  --session-id <id>          Session id (or env BROWSER_AGENT_SESSION_ID)
+  --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
+  --host <host>              Control server host (default: from server.json or 127.0.0.1)
+  --server-port <port>       Control server port (default: from server.json or 43761)
 
 screenshot flags:
   -o, --output <file.png>    Write decoded PNG (from result base64) to path
@@ -68,6 +112,23 @@ logs flags:
 
 Session resolution: --session-id flag, else BROWSER_AGENT_SESSION_ID env.
 `
+
+var cliStdin io.Reader
+
+func cliStdinReader() io.Reader {
+	if cliStdin != nil {
+		return cliStdin
+	}
+	return strings.NewReader("")
+}
+
+// HandleCLIWithStdin dispatches CLI args with an explicit stdin (serve --stop confirm).
+func HandleCLIWithStdin(args []string, env map[string]string, stdin io.Reader, stdout, stderr io.Writer) error {
+	prev := cliStdin
+	cliStdin = stdin
+	defer func() { cliStdin = prev }()
+	return HandleCLI(args, env, stdout, stderr)
+}
 
 // HandleCLI dispatches browser-agent CLI args (after the binary name).
 // When env != nil, session id is resolved only from that map (no process env
@@ -111,6 +172,8 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliSession(rest, env, stdout, stderr)
 	case "install-chrome-extension":
 		return cliInstallExt(rest, env, stdout, stderr)
+	case "open-managed-chrome":
+		return cliOpenManagedChrome(rest, env, stdout, stderr)
 	case "skill":
 		return cliSkill(rest, env, stdout, stderr)
 	case "-h", "--help":
@@ -119,22 +182,28 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, install-chrome-extension, or skill", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, or skill", cmd)
 	}
 }
 
 // cliSession dispatches nested session side-commands:
-// session info|eval|run|logs|screenshot|cdp …
+// session new|info|delete|eval|run|logs|screenshot|cdp …
 func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("session requires a subcommand: info|eval|run|logs|screenshot|cdp")
+		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|list")
 	}
 	sub := args[0]
 	rest := args[1:]
 	switch sub {
+	case "new":
+		return cliSessionNew(rest, env, stdout, stderr)
 	case "info":
 		return cliInfo(rest, env, stdout, stderr)
+	case "delete":
+		return cliSessionDelete(rest, env, stdout, stderr)
+	case "list":
+		return cliSessionList(rest, env, stdout, stderr)
 	case "eval":
 		return cliEval(rest, env, stdout, stderr)
 	case "run":
@@ -153,8 +222,87 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return nil
 	default:
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown session subcommand %q; try info, eval, run, logs, screenshot, or cdp", sub)
+		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, or cdp", sub)
 	}
+}
+
+func cliSessionDelete(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if hasHelpFlag(args) {
+		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
+		return nil
+	}
+	sessionID, err := resolveCLISession(args, env)
+	if err != nil {
+		return err
+	}
+	base, err := resolveCLIControlBase(args)
+	if err != nil {
+		return err
+	}
+	u := strings.TrimRight(base, "/") + "/v1/session?session=" + url.QueryEscape(sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete request failed: %w", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+	switch res.StatusCode {
+	case http.StatusOK, http.StatusNoContent:
+		_, err = fmt.Fprintf(stdout, "deleted session %s\n", sessionID)
+		return err
+	case http.StatusNotFound:
+		return fmt.Errorf("session not found: %s", sessionID)
+	case http.StatusConflict:
+		return fmt.Errorf("cannot delete session: extension connected")
+	default:
+		return fmt.Errorf("delete failed: status %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+}
+
+func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if hasHelpFlag(args) {
+		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
+		return nil
+	}
+
+	baseDir := flagString(args, "--base-dir")
+	sessionID := flagString(args, "--session-id")
+	noOpenChrome := flagBool(args, "--no-open-chrome")
+	addr := sessionNewAddrFromFlags(args)
+
+	if baseDir == "" {
+		baseDir = defaultCLIBaseDir()
+	}
+
+	cfg := SessionNewConfig{
+		BaseDir:      baseDir,
+		Addr:         addr,
+		SessionID:    sessionID,
+		NoOpenChrome: noOpenChrome,
+		Stdout:       stdout,
+		Stderr:       stderr,
+	}
+	if inj.SessionNewTestHooks != nil {
+		if cfg.OpenChromeFn == nil && inj.SessionNewTestHooks.OpenChromeFn != nil {
+			cfg.OpenChromeFn = inj.SessionNewTestHooks.OpenChromeFn
+		}
+	}
+	return SessionNew(cfg)
 }
 
 func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -162,46 +310,56 @@ func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Write
 	return InstallChromeExtension(stdout, baseDir)
 }
 
-func cliServe(args []string, env map[string]string, stdout, stderr io.Writer) error {
-	// Manual flag parse (no os.Exit).
-	addr := flagString(args, "--addr")
-	baseDir := flagString(args, "--base-dir")
-	sessionID := flagString(args, "--session-id")
-	noOpenChrome := flagBool(args, "--no-open-chrome")
-	noAgentRun := flagBool(args, "--no-agent-run")
-
+func cliOpenManagedChrome(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if hasHelpFlag(args) {
 		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
 		return nil
 	}
 
-	if sessionID == "" {
-		// serve can generate, but Run requires SessionID — pick one.
-		sessionID = fmt.Sprintf("sess-%d", time.Now().UnixNano()%1e12)
+	root := flagString(args, "--root")
+	url := takeOpenManagedChromeURL(args)
+	cfg := OpenManagedChromeConfig{
+		Root:   root,
+		URL:    url,
+		Stdout: stdout,
+		Stderr: stderr,
 	}
-	if baseDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = os.TempDir()
-		}
-		baseDir = home + "/.tmp/browser-agent"
+	if inj.ManagedChromeTestHooks != nil && inj.ManagedChromeTestHooks.LaunchFn != nil {
+		cfg.LaunchFn = inj.ManagedChromeTestHooks.LaunchFn
 	}
-
-	cfg := Config{
-		Addr:         addr,
-		BaseDir:      baseDir,
-		SessionID:    sessionID,
-		NoOpenChrome: noOpenChrome,
-		NoAgentRun:   noAgentRun,
-		Stdout:       stdout,
-		Stderr:       stderr,
-	}
-	ctx := context.Background()
-	// Note: real CLI would use signal.NotifyContext; package API blocks until cancel.
-	// For binary main, main wraps with signal context via Run directly or cancel.
-	// Here we use a context that never cancels unless process ends — binary uses Run.
-	_, err := Run(ctx, cfg)
+	_, err := OpenManagedChrome(cfg)
 	return err
+}
+
+func takeOpenManagedChromeURL(args []string) string {
+	skipNext := false
+	for i := 0; i < len(args); i++ {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		a := args[i]
+		if a == "--root" {
+			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(a, "--root=") {
+			continue
+		}
+		if strings.HasPrefix(a, "--") {
+			continue
+		}
+		return a
+	}
+	return ""
+}
+
+func cliServe(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	ctx := context.Background()
+	return serveWithContextStdin(ctx, args, env, cliStdinReader(), stdout, stderr)
 }
 
 func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -209,11 +367,15 @@ func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) err
 		_, _ = io.WriteString(stdout, fullHelp)
 		return nil
 	}
+	jsonMode := flagBool(args, "--json")
 	sessionID, err := resolveCLISession(args, env)
 	if err != nil {
 		return err
 	}
-	base := normalizeAddr(flagString(args, "--addr"))
+	base, err := resolveCLIControlBase(args)
+	if err != nil {
+		return err
+	}
 	u := strings.TrimRight(base, "/") + "/v1/session?session=" + url.QueryEscape(sessionID)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -234,38 +396,19 @@ func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) err
 		return fmt.Errorf("info failed: status %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	// Build control + optional browser inventory view.
-	outObj := map[string]any{}
-	if json.Valid(body) {
-		if err := json.Unmarshal(body, &outObj); err != nil {
-			// Fall back to raw pretty body below.
-			outObj = nil
-		}
-	} else {
-		outObj = nil
-	}
-
-	if outObj != nil {
-		connected := extensionConnectedFromSnapshot(outObj)
-		if connected {
-			browser, berr := fetchInfoJobBrowser(base, sessionID, 15000)
-			if berr != nil {
-				outObj["browser"] = nil
-				outObj["browser_error"] = berr.Error()
-			} else {
-				outObj["browser"] = browser
-				delete(outObj, "browser_error")
+	var snap sessionSnapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		// Non-JSON control response: pass through pretty if possible.
+		var buf bytes.Buffer
+		if json.Valid(body) {
+			_ = json.Indent(&buf, body, "", "  ")
+			if buf.Len() == 0 {
+				buf.Write(body)
 			}
 		} else {
-			// Never fabricate tabs when extension is disconnected.
-			outObj["browser"] = nil
-			outObj["browser_error"] = "extension not connected"
+			buf.Write(body)
 		}
-		pretty, err := json.MarshalIndent(outObj, "", "  ")
-		if err != nil {
-			return err
-		}
-		out := string(pretty)
+		out := buf.String()
 		if !strings.HasSuffix(out, "\n") {
 			out += "\n"
 		}
@@ -273,17 +416,52 @@ func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) err
 		return err
 	}
 
-	// Non-JSON control response: pass through pretty if possible.
-	var buf bytes.Buffer
-	if json.Valid(body) {
-		_ = json.Indent(&buf, body, "", "  ")
-		if buf.Len() == 0 {
-			buf.Write(body)
+	if jsonMode {
+		return writeSessionInfoJSON(stdout, base, sessionID, snap)
+	}
+
+	colors := newServeColor(stdout, env, false, false)
+	var browser map[string]any
+	if snap.Extension.Connected {
+		browser, _ = fetchInfoJobBrowser(base, sessionID, 15000)
+	}
+	if err := FormatSessionInfo(stdout, snap, browser, FormatSessionInfoOptions{Color: colors}); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout)
+	return err
+}
+
+func writeSessionInfoJSON(stdout io.Writer, base, sessionID string, snap sessionSnapshot) error {
+	outObj := map[string]any{}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, &outObj); err != nil {
+		return err
+	}
+
+	connected := snap.Extension.Connected
+	if connected {
+		browser, berr := fetchInfoJobBrowser(base, sessionID, 15000)
+		if berr != nil {
+			outObj["browser"] = nil
+			outObj["browser_error"] = berr.Error()
+		} else {
+			outObj["browser"] = browser
+			delete(outObj, "browser_error")
 		}
 	} else {
-		buf.Write(body)
+		outObj["browser"] = nil
+		outObj["browser_error"] = "extension not connected"
 	}
-	out := buf.String()
+
+	pretty, err := json.MarshalIndent(outObj, "", "  ")
+	if err != nil {
+		return err
+	}
+	out := string(pretty)
 	if !strings.HasSuffix(out, "\n") {
 		out += "\n"
 	}
@@ -528,7 +706,10 @@ func cliCDP(args []string, env map[string]string, stdout, stderr io.Writer) erro
 // postJobAndPrint POSTs /v1/jobs and writes the JSON result to stdout with trailing \n.
 // afterOK is optional post-processing of a successful JSON result (e.g. write screenshot file).
 func postJobAndPrint(args []string, sessionID, jobType string, params map[string]any, timeoutMS int64, stdout io.Writer, afterOK func(map[string]any) error) error {
-	base := normalizeAddr(flagString(args, "--addr"))
+	base, err := resolveCLIControlBase(args)
+	if err != nil {
+		return err
+	}
 	u := strings.TrimRight(base, "/") + "/v1/jobs"
 
 	if params == nil {
@@ -634,6 +815,22 @@ func resolveCLISession(args []string, env map[string]string) (string, error) {
 	return ResolveSessionID(flagVal, flagSet, envVal, envSet)
 }
 
+func sessionNewAddrFromFlags(args []string) string {
+	if addr := flagString(args, "--addr"); strings.TrimSpace(addr) != "" {
+		addr = strings.TrimSpace(addr)
+		if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
+			addr = strings.TrimPrefix(strings.TrimPrefix(addr, "https://"), "http://")
+		}
+		return addr
+	}
+	host := flagString(args, "--host")
+	port := flagInt(args, "--server-port")
+	if strings.TrimSpace(host) == "" && port == 0 {
+		return ""
+	}
+	return ComposeControlAddr(host, port)
+}
+
 func normalizeAddr(addr string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -699,7 +896,8 @@ func takePositional(args []string, n int) string {
 			continue
 		}
 		a := args[i]
-		if a == "--session-id" || a == "--addr" || a == "--base-dir" ||
+		if a == "--session-id" || a == "--addr" || a == "--host" || a == "--server-port" ||
+			a == "--base-dir" || a == "--root" ||
 			a == "--limit" || a == "--level" || a == "--output" || a == "-o" {
 			skipNext = true
 			continue

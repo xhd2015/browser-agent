@@ -74,6 +74,16 @@ func readEmbeddedSessionIndex() (string, error) {
 // {baseDir}/extension/{version}/ and returns the absolute install path and
 // version string from manifest.json. Idempotent for the same version.
 func ExtractEmbeddedExtension(baseDir string) (installPath, version string, err error) {
+	return extractEmbeddedExtensionUnder(baseDir, "extension")
+}
+
+// extractEmbeddedExtensionDirect writes the embedded MV3 package under
+// {parentDir}/{version}/ (no intermediate subdir). Used by managed Chrome sync.
+func extractEmbeddedExtensionDirect(parentDir string) (installPath, version string, err error) {
+	return extractEmbeddedExtensionUnder(parentDir, "")
+}
+
+func extractEmbeddedExtensionUnder(baseDir, intermediateDir string) (installPath, version string, err error) {
 	if strings.TrimSpace(baseDir) == "" {
 		return "", "", fmt.Errorf("baseDir is required")
 	}
@@ -97,7 +107,10 @@ func ExtractEmbeddedExtension(baseDir string) (installPath, version string, err 
 		return "", "", fmt.Errorf("embedded manifest.json has empty version")
 	}
 
-	dest := filepath.Join(absBase, "extension", version)
+	dest := filepath.Join(absBase, version)
+	if strings.TrimSpace(intermediateDir) != "" {
+		dest = filepath.Join(absBase, intermediateDir, version)
+	}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return "", "", fmt.Errorf("create extract dir: %w", err)
 	}
@@ -142,21 +155,15 @@ func ExtractEmbeddedExtension(baseDir string) (installPath, version string, err 
 	return absDest, version, nil
 }
 
-// InstallChromeExtension extracts the embedded extension and writes user-facing
-// Load unpacked instructions to w. Output ends with a trailing newline.
-// Includes package version and content md5 from bundle-sum.js (written on extract).
+// InstallChromeExtension extracts the embedded extension to the canonical install
+// path and writes user-facing Load unpacked instructions to w. baseDir is ignored
+// (canonical path is always under home). Output ends with a trailing newline.
 func InstallChromeExtension(w io.Writer, baseDir string) error {
 	if w == nil {
 		w = io.Discard
 	}
-	if strings.TrimSpace(baseDir) == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = os.TempDir()
-		}
-		baseDir = filepath.Join(home, ".tmp", "browser-agent")
-	}
-	path, version, err := ExtractEmbeddedExtension(baseDir)
+	_ = baseDir // canonical layout is independent of daemon --base-dir
+	path, version, err := EnsureCanonicalExtension()
 	if err != nil {
 		return err
 	}

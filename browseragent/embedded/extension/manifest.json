@@ -28,8 +28,13 @@
   "content_scripts": [
     {
       "matches": [
+        "<all_urls>",
         "http://127.0.0.1/*",
-        "http://localhost/*"
+        "http://127.0.0.1:43761/go*",
+        "http://127.0.0.1/*/go*",
+        "http://localhost/*",
+        "http://localhost:43761/go*",
+        "http://localhost/*/go*"
       ],
       "js": ["contentScript.js"],
       "run_at": "document_start"

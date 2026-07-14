@@ -1,10 +1,10 @@
 # Scenario
 
-**Feature**: NoOpenChrome=false → OpenChromeFn called once with session URL + ext path (B2)
+**Feature**: serve never launches Chrome even when hook is set (B2 updated)
 
 ```
 Config{NoOpenChrome:false, OpenChromeFn:record}
-  -> once(sessionURL containing /go + session id, non-empty extensionInstallPath)
+  -> OpenChromeFn not called (serve / Run paths do not open Chrome)
 ```
 
 ## Preconditions

@@ -964,7 +964,7 @@ func runSystemPrompt(t *testing.T, req *Request) (*Response, error) {
 			resp.DefaultPort = p
 		}
 		if resp.DefaultPort == "" {
-			resp.DefaultPort = browseragent.DefaultControlPort
+			resp.DefaultPort = browseragent.DefaultControlPortString()
 		}
 		resp.ProductName = "browser-agent"
 	default:

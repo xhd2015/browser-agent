@@ -32,13 +32,14 @@ Optional escape hatch:
 
 ## Active tab (critical)
 
-- **eval / run / logs / screenshot / cdp always run on the browser's active tab**
-  (last-focused window). There is no CLI flag to pick another tabId yet.
+- **eval / run / logs / screenshot / cdp run on the active tab in the session window**
+  (the Chrome window where the session page /go?session= is open). There is no CLI
+  flag to pick another tabId yet.
 - Use **session info** first: it lists all open tabs (id, title, url, active).
-- If the user's content is in a **background** tab:
-  1. Prefer asking the user to **focus that tab**, then re-run info/eval; or
-  2. Use **session cdp Page.navigate** with the target URL on the active tab
-     (this navigates the active tab; it does not "switch" Chrome tabs).
+- If the user's content is in a **background** tab in that window:
+  Ask the user to **focus that tab**, then re-run info/eval.
+  Do **not** navigate the session control page away from /go?session= — that
+  disconnects the extension.
 - Do **not** try to switch tabs via CDP Target.* (see below).
 
 ## session cdp limits (Chrome extension debugger)
@@ -68,5 +69,5 @@ To list tabs, use **session info** only (chrome.tabs), not Target.getTargets.
 - Jobs are enqueue-and-wait over HTTP POST /v1/jobs
 - The Chrome extension executes jobs over WebSocket /v1/ws
 - Prefer session info → eval/screenshot on the correct active tab before inventing raw CDP
-`, DefaultAddr, DefaultControlPort)
+`, DefaultAddr, DefaultControlPortString())
 }

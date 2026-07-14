@@ -1,0 +1,35 @@
+## Expected
+
+- TTY + empty stdin (default Y) → daemon stops; meta gone
+
+## Side Effects
+
+- See leaf scenario (may mutate daemon meta, session dirs, or stderr).
+
+## Errors
+
+- Wrong version/port/upgrade/stop behavior fails the assertion.
+
+## Exit Code
+
+- Not asserted unless noted in Expected.
+
+```go
+import (
+	"strings"
+	"testing"
+)
+
+func Assert(t *testing.T, req *Request, resp *Response, err error) {
+	assertNoRunErr(t, err)
+	if !resp.TTYConfirmSeen {
+		t.Fatalf("missing TTY confirm prompt; stderr=%q", resp.Stderr)
+	}
+	if !resp.DaemonStopped {
+		t.Fatal("daemon should stop on default Y")
+	}
+	if resp.MetaExists {
+		t.Fatal("server.json should be removed after stop")
+	}
+}
+```

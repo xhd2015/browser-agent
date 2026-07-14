@@ -256,6 +256,23 @@ func (q *JobQueue) Get(id string) (Job, bool) {
 	return *j, true
 }
 
+// InflightCount returns queued plus running jobs.
+func (q *JobQueue) InflightCount() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := 0
+	for _, id := range q.order {
+		j, ok := q.jobs[id]
+		if !ok {
+			continue
+		}
+		if j.Status == JobStatusQueued || j.Status == JobStatusRunning {
+			n++
+		}
+	}
+	return n
+}
+
 // SnapshotQueued returns a copy of currently queued (not yet dequeued/running) jobs in FIFO order.
 func (q *JobQueue) SnapshotQueued() []Job {
 	q.mu.Lock()

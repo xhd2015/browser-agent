@@ -532,6 +532,7 @@ func runCLISidecmd(t *testing.T, req *Request) (*Response, error) {
 				"session", "info",
 				"--session-id", srv.SessionID,
 				"--addr", srv.BaseURL,
+				"--json",
 			}
 		default:
 			return nil, fmt.Errorf("unknown Sidecmd %q", req.Sidecmd)

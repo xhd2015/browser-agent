@@ -1,0 +1,13 @@
+browser-agent daemon status
+
+Status:   running
+PID:      73950
+Addr:     127.0.0.1:49976
+Base URL: http://127.0.0.1:49976
+Base dir: /Users/xhd2015/.tmp/browser-agent
+Started:  2026-07-14T11:52:49+08:00
+Uptime:   1h54m33s
+
+Sessions (1)
+Session ID	Phase
+sess-rthgpj	waiting_extension

@@ -1,0 +1,2 @@
+{"assert":"extension_connected","ok":true,"session_id":"sess-loop-active-tab"}
+{"assert":"active_tab_routing","ok":true,"session_id":"sess-loop-active-tab","user_tab_active":true,"active_tab_url":"https://example.com/?LOOP_MARKER=active-tab-routing","eval_url":"https://example.com/?LOOP_MARKER=active-tab-routing","eval_on_session_page":false,"bug_present":false}

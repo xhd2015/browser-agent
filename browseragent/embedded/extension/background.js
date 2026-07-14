@@ -1,4 +1,4 @@
-// Browser Agent MV3 service worker — connects to control plane /v1/ws.
+// Browser Agent MV3 service worker — per-session WS to control plane /v1/ws?session=<id>.
 // Executes jobs via chrome.debugger CDP (Runtime.evaluate, Page.captureScreenshot, etc.).
 // Load generated identity (version + content md5) for hello match.
 try {
@@ -8,7 +8,7 @@ try {
   console.warn("browser-agent: bundle-sum.js not loaded", e);
 }
 const CONTROL_PORT = 43761;
-const WS_URL = "ws://127.0.0.1:" + CONTROL_PORT + "/v1/ws";
+const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
@@ -18,9 +18,9 @@ const EXT_BUNDLE_MD5 =
 const FEATURES = ["browser-agent"];
 const CDP_PROTOCOL_VERSION = "1.3";
 
-let socket = null;
-let reconnectTimer = null;
-let reconnectAttempt = 0;
+/** @type {Map<string, {ws: WebSocket|null, tabId: number|null, windowId: number|null, controlPort: number, reconnectTimer: ReturnType<typeof setTimeout>|null, reconnectAttempt: number, connectTimeoutTimer: ReturnType<typeof setTimeout>|null, keepaliveTimer: ReturnType<typeof setInterval>|null}>} */
+const sessions = new Map();
+
 /** Abort hung CONNECTING sockets (ms). */
 const CONNECT_TIMEOUT_MS = 2500;
 /** Cap reconnect backoff so we rejoin the control plane quickly after serve restart. */
@@ -28,113 +28,212 @@ const RECONNECT_MAX_MS = 2000;
 const RECONNECT_BASE_MS = 100;
 /** Keepalive ping while connected (keeps MV3 SW + WS alive). */
 const KEEPALIVE_MS = 15000;
-let connectTimeoutTimer = null;
-let keepaliveTimer = null;
 /** @type {Map<number, true>} */
 const attachedTabs = new Map();
 /** In-memory console log buffer for logs jobs. */
 const consoleLogBuffer = [];
 const MAX_LOG_ENTRIES = 500;
 
-function isSocketLive() {
+function wsURLForSession(sessionId, controlPort) {
+  const port =
+    controlPort != null && !Number.isNaN(controlPort) && controlPort > 0
+      ? controlPort
+      : CONTROL_PORT;
+  return (
+    "ws://127.0.0.1:" +
+    port +
+    WS_PATH +
+    "?session=" +
+    encodeURIComponent(sessionId)
+  );
+}
+
+function getOrCreateSessionEntry(sessionId) {
+  let entry = sessions.get(sessionId);
+  if (!entry) {
+    entry = {
+      ws: null,
+      tabId: null,
+      windowId: null,
+      controlPort: CONTROL_PORT,
+      reconnectTimer: null,
+      reconnectAttempt: 0,
+      connectTimeoutTimer: null,
+      keepaliveTimer: null,
+    };
+    sessions.set(sessionId, entry);
+  }
+  return entry;
+}
+
+function isSocketLive(entry) {
+  const socket = entry && entry.ws;
   return socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING);
 }
 
-function clearConnectTimeout() {
-  if (connectTimeoutTimer) {
-    clearTimeout(connectTimeoutTimer);
-    connectTimeoutTimer = null;
+function clearConnectTimeout(entry) {
+  if (entry.connectTimeoutTimer) {
+    clearTimeout(entry.connectTimeoutTimer);
+    entry.connectTimeoutTimer = null;
   }
 }
 
-function stopKeepalive() {
-  if (keepaliveTimer) {
-    clearInterval(keepaliveTimer);
-    keepaliveTimer = null;
+function stopKeepalive(entry) {
+  if (entry.keepaliveTimer) {
+    clearInterval(entry.keepaliveTimer);
+    entry.keepaliveTimer = null;
   }
 }
 
-function startKeepalive() {
-  stopKeepalive();
-  keepaliveTimer = setInterval(() => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      sendJSON({ v: 1, type: "ping", id: "ka-" + Date.now() });
+function startKeepalive(sessionId, entry) {
+  stopKeepalive(entry);
+  entry.keepaliveTimer = setInterval(() => {
+    if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+      sendJSON(entry, { v: 1, type: "ping", id: "ka-" + sessionId + "-" + Date.now() });
     } else {
-      connect("keepalive");
+      connectSession(sessionId, "keepalive");
     }
   }, KEEPALIVE_MS);
 }
 
-chrome.runtime.onInstalled.addListener(() => {
-  console.log("Browser Agent installed; control port", CONTROL_PORT);
-  connect("onInstalled");
-});
+function sendJSON(entry, obj) {
+  if (!entry.ws || entry.ws.readyState !== WebSocket.OPEN) return;
+  try {
+    entry.ws.send(JSON.stringify(obj));
+  } catch (e) {
+    /* ignore */
+  }
+}
 
-chrome.runtime.onStartup.addListener(() => {
-  connect("onStartup");
-});
-
-// Alarm-based reconnect backup when service worker restarts (Chrome min period ~1 min).
-try {
-  chrome.alarms.create("browser-agent-reconnect", { periodInMinutes: 1 });
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm && alarm.name === "browser-agent-reconnect") {
-      if (!isSocketLive() || (socket && socket.readyState !== WebSocket.OPEN)) {
-        connect("alarm");
-      }
+async function collectSessionPageTelemetry(sessionId) {
+  const pages = [];
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs || []) {
+      const url = t.url || "";
+      if (!isSessionGoPageURL(url, sessionId)) continue;
+      pages.push({
+        tab_id: t.id,
+        url: url,
+        title: t.title || "",
+      });
     }
+  } catch (e) {
+    /* tabs permission optional */
+  }
+  return pages;
+}
+
+async function buildSessionTelemetry(sessionId) {
+  const pages = await collectSessionPageTelemetry(sessionId);
+  return {
+    browser_product: "Chrome",
+    session_page_count: pages.length,
+    session_pages: pages,
+  };
+}
+
+async function sendHello(sessionId, entry) {
+  const telemetry = await buildSessionTelemetry(sessionId);
+  const payload = {
+    version: EXT_VERSION,
+    features: FEATURES,
+    browser_product: telemetry.browser_product,
+    session_page_count: telemetry.session_page_count,
+    session_pages: telemetry.session_pages,
+  };
+  if (EXT_BUNDLE_MD5) {
+    payload.bundle_md5 = EXT_BUNDLE_MD5;
+  }
+  sendJSON(entry, {
+    v: 1,
+    type: "hello",
+    payload: payload,
   });
-} catch (e) {
-  // alarms permission optional in mini fixtures
+}
+
+async function sendSessionStatus(sessionId, entry) {
+  if (!entry || !entry.ws || entry.ws.readyState !== WebSocket.OPEN) return;
+  const telemetry = await buildSessionTelemetry(sessionId);
+  sendJSON(entry, {
+    v: 1,
+    type: "status",
+    id: "status-" + sessionId + "-" + Date.now(),
+    payload: {
+      browser_product: telemetry.browser_product,
+      session_page_count: telemetry.session_page_count,
+      session_pages: telemetry.session_pages,
+    },
+  });
+}
+
+function pushStatusForConnectedSessions() {
+  for (const [sessionId, entry] of sessions.entries()) {
+    if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+      sendSessionStatus(sessionId, entry).catch(() => {});
+    }
+  }
+}
+
+function scheduleReconnect(sessionId) {
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.reconnectTimer) return;
+  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, entry.reconnectAttempt));
+  entry.reconnectAttempt += 1;
+  entry.reconnectTimer = setTimeout(() => {
+    entry.reconnectTimer = null;
+    connectSession(sessionId, "reconnect");
+  }, delay);
 }
 
 /**
- * Open WS to control plane. reason is for service-worker console diagnostics.
- * Aborts hung CONNECTING after CONNECT_TIMEOUT_MS and uses short reconnect backoff.
+ * Open per-session WS to control plane. reason is for service-worker console diagnostics.
  */
-function connect(reason) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
+function connectSession(sessionId, reason) {
+  if (!sessionId) return;
+  const entry = getOrCreateSessionEntry(sessionId);
+
+  if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
     return;
   }
-  // Drop a hung CONNECTING socket so we can retry immediately.
-  if (socket && socket.readyState === WebSocket.CONNECTING) {
-    // leave existing timeout to abort; avoid parallel sockets
+  if (entry.ws && entry.ws.readyState === WebSocket.CONNECTING) {
     return;
   }
-  if (socket) {
+  if (entry.ws) {
     try {
-      socket.close();
+      entry.ws.close();
     } catch (e) {
       /* ignore */
     }
-    socket = null;
+    entry.ws = null;
   }
 
+  let socket;
   try {
-    socket = new WebSocket(WS_URL);
+    socket = new WebSocket(wsURLForSession(sessionId, entry.controlPort));
   } catch (e) {
-    scheduleReconnect();
+    scheduleReconnect(sessionId);
     return;
   }
+  entry.ws = socket;
 
-  clearConnectTimeout();
-  connectTimeoutTimer = setTimeout(() => {
-    connectTimeoutTimer = null;
-    if (socket && socket.readyState === WebSocket.CONNECTING) {
+  clearConnectTimeout(entry);
+  entry.connectTimeoutTimer = setTimeout(() => {
+    entry.connectTimeoutTimer = null;
+    if (entry.ws && entry.ws.readyState === WebSocket.CONNECTING) {
       try {
-        socket.close();
+        entry.ws.close();
       } catch (e) {
         /* ignore */
       }
-      // onclose will schedule reconnect
     }
   }, CONNECT_TIMEOUT_MS);
 
   socket.onopen = () => {
-    clearConnectTimeout();
-    reconnectAttempt = 0;
-    sendHello();
-    startKeepalive();
+    clearConnectTimeout(entry);
+    entry.reconnectAttempt = 0;
+    sendHello(sessionId, entry).catch(() => {});
+    startKeepalive(sessionId, entry);
   };
 
   socket.onmessage = (ev) => {
@@ -144,70 +243,195 @@ function connect(reason) {
     } catch (e) {
       return;
     }
-    handleMessage(msg);
+    handleMessage(msg, sessionId, entry);
   };
 
   socket.onclose = () => {
-    clearConnectTimeout();
-    stopKeepalive();
-    socket = null;
-    scheduleReconnect();
+    clearConnectTimeout(entry);
+    stopKeepalive(entry);
+    entry.ws = null;
+    if (sessions.has(sessionId)) {
+      scheduleReconnect(sessionId);
+    }
   };
 
   socket.onerror = () => {
     try {
-      if (socket) socket.close();
+      if (entry.ws) entry.ws.close();
     } catch (e) {
       /* ignore */
     }
   };
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  // Fast, bounded backoff: 100, 200, 400, … cap 2s (was up to 30s).
-  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, reconnectAttempt));
-  reconnectAttempt += 1;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect("reconnect");
-  }, delay);
+function unregisterSession(sessionId) {
+  const entry = sessions.get(sessionId);
+  if (!entry) return;
+  if (entry.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer);
+    entry.reconnectTimer = null;
+  }
+  clearConnectTimeout(entry);
+  stopKeepalive(entry);
+  if (entry.ws) {
+    try {
+      entry.ws.close();
+    } catch (e) {
+      /* ignore */
+    }
+    entry.ws = null;
+  }
+  sessions.delete(sessionId);
 }
 
-function sendJSON(obj) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+function isSessionGoPageURL(url, sessionId) {
+  if (!url || typeof url !== "string") return false;
+  const u = url.trim();
+  if (!u.includes("/go")) return false;
+  if (!sessionId) return u.includes("/go");
+  return (
+    u.includes("/go?session=" + sessionId) ||
+    u.includes("/go?session=" + encodeURIComponent(sessionId))
+  );
+}
+
+function parseGoSessionFromURL(url) {
+  if (!url || typeof url !== "string") return null;
   try {
-    socket.send(JSON.stringify(obj));
+    const parsed = new URL(url);
+    const host = (parsed.hostname || "").toLowerCase();
+    if (host !== "127.0.0.1" && host !== "localhost") return null;
+    const path = (parsed.pathname || "").toLowerCase();
+    if (!path.includes("/go")) return null;
+    const sessionId = parsed.searchParams.get("session");
+    if (!sessionId) return null;
+    let controlPort = CONTROL_PORT;
+    if (parsed.port) {
+      const p = parseInt(parsed.port, 10);
+      if (!Number.isNaN(p) && p > 0) controlPort = p;
+    } else if (parsed.protocol === "https:") {
+      controlPort = 443;
+    } else if (parsed.protocol === "http:") {
+      controlPort = 80;
+    }
+    return { sessionId: sessionId, controlPort: controlPort };
   } catch (e) {
-    /* ignore */
+    return null;
   }
 }
 
-function sendHello() {
-  const payload = {
-    version: EXT_VERSION,
-    features: FEATURES,
-  };
-  if (EXT_BUNDLE_MD5) {
-    payload.bundle_md5 = EXT_BUNDLE_MD5;
+function maybeRegisterGoTab(tabId, url, tab) {
+  const parsed = parseGoSessionFromURL(url);
+  if (!parsed) return;
+  handleRegisterMessage(
+    {
+      type: "register",
+      session_id: parsed.sessionId,
+      control_port: parsed.controlPort,
+      tabId: tabId,
+      windowId: tab && tab.windowId,
+    },
+    { tab: { id: tabId, windowId: tab && tab.windowId } },
+  );
+}
+
+function handleRegisterMessage(msg, sender) {
+  const sessionId = msg.session_id || msg.sessionId || "";
+  if (!sessionId) return;
+  const entry = getOrCreateSessionEntry(sessionId);
+  const tabId = msg.tabId != null ? msg.tabId : sender && sender.tab && sender.tab.id;
+  const windowId =
+    msg.windowId != null ? msg.windowId : sender && sender.tab && sender.tab.windowId;
+  const controlPort =
+    msg.control_port != null
+      ? msg.control_port
+      : msg.controlPort != null
+        ? msg.controlPort
+        : entry.controlPort;
+  if (tabId != null) entry.tabId = tabId;
+  if (windowId != null) entry.windowId = windowId;
+  if (controlPort != null && !Number.isNaN(controlPort) && controlPort > 0) {
+    entry.controlPort = controlPort;
   }
-  sendJSON({
-    v: 1,
-    type: "hello",
-    payload: payload,
+  connectSession(sessionId, "register");
+}
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || typeof msg !== "object") return;
+  if (msg.type === "register") {
+    handleRegisterMessage(msg, sender);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  let shouldPush = false;
+  for (const [sessionId, entry] of sessions.entries()) {
+    if (entry.tabId === tabId) {
+      unregisterSession(sessionId);
+      shouldPush = true;
+    }
+  }
+  if (shouldPush) {
+    pushStatusForConnectedSessions();
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = (changeInfo && changeInfo.url) || (tab && tab.url) || "";
+  if (url) {
+    if (changeInfo.status === "loading" || changeInfo.status === "complete") {
+      maybeRegisterGoTab(tabId, url, tab);
+    }
+    for (const [sessionId, entry] of sessions.entries()) {
+      if (entry.tabId !== tabId) continue;
+      if (!isSessionGoPageURL(url, sessionId)) {
+        unregisterSession(sessionId);
+      }
+    }
+    if (url.includes("/go")) {
+      pushStatusForConnectedSessions();
+    }
+  }
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  console.log("Browser Agent installed; control port", CONTROL_PORT);
+  for (const sessionId of sessions.keys()) {
+    connectSession(sessionId, "onInstalled");
+  }
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  for (const sessionId of sessions.keys()) {
+    connectSession(sessionId, "onStartup");
+  }
+});
+
+try {
+  chrome.alarms.create("browser-agent-reconnect", { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === "browser-agent-reconnect") {
+      for (const [sessionId, entry] of sessions.entries()) {
+        if (!isSocketLive(entry) || (entry.ws && entry.ws.readyState !== WebSocket.OPEN)) {
+          connectSession(sessionId, "alarm");
+        }
+      }
+    }
   });
+} catch (e) {
+  // alarms permission optional in mini fixtures
 }
 
-function handleMessage(msg) {
+function handleMessage(msg, sessionId, entry) {
   if (!msg || typeof msg !== "object") return;
   const type = msg.type;
   if (type === "job") {
-    handleJob(msg);
+    handleJob(msg, sessionId, entry);
   }
 }
 
-function sendJobResult(jobId, ok, data, error) {
-  sendJSON({
+function sendJobResult(entry, jobId, ok, data, error) {
+  sendJSON(entry, {
     v: 1,
     type: "result",
     id: jobId,
@@ -221,8 +445,9 @@ function sendJobResult(jobId, ok, data, error) {
   });
 }
 
-async function handleJob(msg) {
+async function handleJob(msg, sessionId, entry) {
   const payload = msg.payload || {};
+  const jobSessionId = payload.session_id || payload.sessionId || sessionId || "";
   const jobId = payload.job_id || payload.id || msg.id || "";
   const jobType = payload.type || payload.job_type || "eval";
   const params = payload.params || {};
@@ -234,28 +459,28 @@ async function handleJob(msg) {
         data = await handleInfoJob(params);
         break;
       case "eval":
-        data = await handleEvalJob(params, payload);
+        data = await handleEvalJob(params, payload, jobSessionId);
         break;
       case "run":
-        data = await handleRunJob(params, payload);
+        data = await handleRunJob(params, payload, jobSessionId);
         break;
       case "logs":
-        data = await handleLogsJob(params);
+        data = await handleLogsJob(params, jobSessionId);
         break;
       case "screenshot":
-        data = await handleScreenshotJob(params);
+        data = await handleScreenshotJob(params, jobSessionId);
         break;
       case "cdp":
-        data = await handleCdpJob(params);
+        data = await handleCdpJob(params, jobSessionId);
         break;
       default:
-        sendJobResult(jobId, false, { type: jobType }, "unknown job type: " + jobType);
+        sendJobResult(entry, jobId, false, { type: jobType }, "unknown job type: " + jobType);
         return;
     }
-    sendJobResult(jobId, true, data, "");
+    sendJobResult(entry, jobId, true, data, "");
   } catch (e) {
-    const errMsg = (e && e.message) ? e.message : String(e);
-    sendJobResult(jobId, false, { type: jobType, stub: false }, errMsg);
+    const errMsg = e && e.message ? e.message : String(e);
+    sendJobResult(entry, jobId, false, { type: jobType, stub: false }, errMsg);
   }
 }
 
@@ -281,13 +506,13 @@ async function handleInfoJob(_params) {
   };
 }
 
-async function handleEvalJob(params, payload) {
+async function handleEvalJob(params, payload, sessionId) {
   const expression =
     (params && (params.expression || params.expr || params.code)) ||
     payload.expression ||
     payload.expr ||
     "";
-  const result = await withDebugger(async (tabId) => {
+  const result = await withDebuggerForSession(sessionId, async (tabId) => {
     return await sendDebuggerCommand(tabId, "Runtime.evaluate", {
       expression: String(expression),
       returnByValue: true,
@@ -309,13 +534,13 @@ async function handleEvalJob(params, payload) {
   };
 }
 
-async function handleRunJob(params, payload) {
+async function handleRunJob(params, payload, sessionId) {
   const source =
     (params && (params.source || params.expression || params.expr || params.code || params.script)) ||
     payload.source ||
     payload.expression ||
     "";
-  const result = await withDebugger(async (tabId) => {
+  const result = await withDebuggerForSession(sessionId, async (tabId) => {
     return await sendDebuggerCommand(tabId, "Runtime.evaluate", {
       expression: String(source),
       returnByValue: true,
@@ -323,9 +548,7 @@ async function handleRunJob(params, payload) {
     });
   });
   const value =
-    result && result.result && "value" in result.result
-      ? result.result.value
-      : null;
+    result && result.result && "value" in result.result ? result.result.value : null;
   return {
     value: value,
     type: "run",
@@ -335,7 +558,7 @@ async function handleRunJob(params, payload) {
   };
 }
 
-async function handleLogsJob(params) {
+async function handleLogsJob(params, sessionId) {
   const limit = (params && params.limit) || 100;
   const level = params && params.level;
   let entries = consoleLogBuffer.slice();
@@ -345,9 +568,8 @@ async function handleLogsJob(params) {
   if (limit > 0 && entries.length > limit) {
     entries = entries.slice(entries.length - limit);
   }
-  // Best-effort: enable Log domain to capture future entries.
   try {
-    await withDebugger(async (tabId) => {
+    await withDebuggerForSession(sessionId, async (tabId) => {
       await sendDebuggerCommand(tabId, "Log.enable", {});
       await sendDebuggerCommand(tabId, "Runtime.enable", {});
       return { enabled: true };
@@ -358,13 +580,12 @@ async function handleLogsJob(params) {
   return { entries: entries, type: "logs" };
 }
 
-async function handleScreenshotJob(params) {
+async function handleScreenshotJob(params, sessionId) {
   const format = (params && params.format) || "png";
   const fullPage = !!(params && params.full_page);
-  const result = await withDebugger(async (tabId) => {
+  const result = await withDebuggerForSession(sessionId, async (tabId) => {
     const cdpParams = { format: format === "jpeg" ? "jpeg" : "png" };
     if (fullPage) {
-      // Capture beyond viewport when possible.
       cdpParams.captureBeyondViewport = true;
     }
     return await sendDebuggerCommand(tabId, "Page.captureScreenshot", cdpParams);
@@ -377,13 +598,13 @@ async function handleScreenshotJob(params) {
   };
 }
 
-async function handleCdpJob(params) {
+async function handleCdpJob(params, sessionId) {
   const method = (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
   if (!method) {
     throw new Error("cdp job requires params.method");
   }
   const cdpParams = (params && params.params) || {};
-  const result = await withDebugger(async (tabId) => {
+  const result = await withDebuggerForSession(sessionId, async (tabId) => {
     return await sendDebuggerCommand(tabId, method, cdpParams || {});
   });
   return {
@@ -392,8 +613,6 @@ async function handleCdpJob(params) {
     type: "cdp",
   };
 }
-
-// --- chrome.debugger attach / sendCommand / detach ---
 
 function isCapturableTabURL(url) {
   if (!url || typeof url !== "string") return false;
@@ -411,27 +630,56 @@ function isCapturableTabURL(url) {
   return true;
 }
 
-async function pickTargetTabId() {
-  // Prefer active tab in last focused window.
-  try {
-    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (active && active.id != null && isCapturableTabURL(active.url || "")) {
-      return active.id;
+async function pickTargetTabIdForSession(sessionId) {
+  const entry = sessions.get(sessionId);
+
+  // Prefer the active capturable tab in the session window (multi-session safe).
+  if (entry && entry.windowId != null) {
+    try {
+      const activeTabs = await chrome.tabs.query({ active: true, windowId: entry.windowId });
+      const active = activeTabs && activeTabs[0];
+      if (active && active.id != null && isCapturableTabURL(active.url || "")) {
+        return active.id;
+      }
+    } catch (e) {
+      /* window query optional */
     }
-  } catch (e) {
-    /* ignore */
   }
+
+  // Fallback: registered session control page tab.
+  if (entry && entry.tabId != null) {
+    try {
+      const tab = await chrome.tabs.get(entry.tabId);
+      if (tab && tab.id != null && isCapturableTabURL(tab.url || "")) {
+        return tab.id;
+      }
+    } catch (e) {
+      /* registered tab gone */
+    }
+  }
+
+  const needles = [
+    "/go?session=" + sessionId,
+    "/go?session=" + encodeURIComponent(sessionId),
+    "go?session=" + sessionId,
+    "go?session=" + encodeURIComponent(sessionId),
+  ];
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs || []) {
-      if (t.id != null && isCapturableTabURL(t.url || "")) {
-        return t.id;
+      if (t.id == null) continue;
+      const url = t.url || "";
+      if (!isCapturableTabURL(url)) continue;
+      for (const needle of needles) {
+        if (url.includes(needle)) {
+          return t.id;
+        }
       }
     }
   } catch (e) {
     /* ignore */
   }
-  throw new Error("no capturable tab for chrome.debugger attach");
+  throw new Error("no capturable tab for session " + sessionId);
 }
 
 function attachDebugger(tabId) {
@@ -446,29 +694,10 @@ function attachDebugger(tabId) {
         return;
       }
       attachedTabs.set(tabId, true);
-      // Enable Runtime for console / evaluate convenience.
       chrome.debugger.sendCommand({ tabId: tabId }, "Runtime.enable", {}, () => {
         resolve(true);
       });
     });
-  });
-}
-
-function detachDebugger(tabId) {
-  return new Promise((resolve) => {
-    if (!attachedTabs.has(tabId)) {
-      resolve();
-      return;
-    }
-    try {
-      chrome.debugger.detach({ tabId: tabId }, () => {
-        attachedTabs.delete(tabId);
-        resolve();
-      });
-    } catch (e) {
-      attachedTabs.delete(tabId);
-      resolve();
-    }
   });
 }
 
@@ -484,19 +713,12 @@ function sendDebuggerCommand(tabId, method, params) {
   });
 }
 
-async function withDebugger(fn) {
-  const tabId = await pickTargetTabId();
+async function withDebuggerForSession(sessionId, fn) {
+  const tabId = await pickTargetTabIdForSession(sessionId);
   await attachDebugger(tabId);
-  try {
-    return await fn(tabId);
-  } finally {
-    // Keep attach for subsequent jobs on the same tab (faster); detach on SW suspend is OK.
-    // Detach is available for cleanup if needed:
-    // await detachDebugger(tabId);
-  }
+  return await fn(tabId);
 }
 
-// Buffer Runtime.consoleAPICalled / Log.entryAdded when debugger is attached.
 try {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (method === "Runtime.consoleAPICalled" && params) {
@@ -532,6 +754,3 @@ try {
 } catch (e) {
   /* debugger events optional in test stubs */
 }
-
-// Kick off initial connect as soon as the service worker evaluates.
-connect("sw-load");

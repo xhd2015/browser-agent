@@ -508,6 +508,7 @@ func runSessionInfoLive(t *testing.T, req *Request, withFakeExt bool) (*Response
 			"session", "info",
 			"--session-id", srv.SessionID,
 			"--addr", srv.BaseURL,
+			"--json",
 		}
 	} else {
 		args = injectAddrAndSession(args, srv.BaseURL, srv.SessionID)

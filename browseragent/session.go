@@ -35,6 +35,21 @@ type session struct {
 
 	// Optional hello observer (mismatch warning); called unlocked after state update.
 	onHello func(match string, embedded, loaded BundleSum, installPath string)
+
+	// createdViaPOST distinguishes HTTP-created sessions from registry pre-provision.
+	createdViaPOST bool
+
+	sessionURL       string
+	sessionPageCount *int
+	browsers         []string
+	sessionPages     []sessionPageTab
+	lastSeenAt       time.Time
+}
+
+type sessionPageTab struct {
+	TabID int    `json:"tab_id,omitempty"`
+	URL   string `json:"url,omitempty"`
+	Title string `json:"title,omitempty"`
 }
 
 func newSession(id, baseDir string) *session {
@@ -117,6 +132,65 @@ func (s *session) getWS() *wsConn {
 	return s.ws
 }
 
+func (s *session) isExtensionConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.extConnected
+}
+
+func (s *session) markCreatedViaPOST() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.createdViaPOST = true
+}
+
+func (s *session) wasCreatedViaPOST() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createdViaPOST
+}
+
+func (s *session) setSessionURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionURL = strings.TrimSpace(url)
+}
+
+func (s *session) updateTelemetry(browserProduct string, pageCount *int, pages []sessionPageTab) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if browserProduct != "" {
+		found := false
+		for _, b := range s.browsers {
+			if strings.EqualFold(b, browserProduct) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.browsers = append(s.browsers, browserProduct)
+		}
+	}
+	if pageCount != nil {
+		v := *pageCount
+		s.sessionPageCount = &v
+	}
+	if pages != nil {
+		s.sessionPages = append([]sessionPageTab(nil), pages...)
+	}
+	s.lastSeenAt = time.Now()
+}
+
+func (s *session) inflightJobs() int {
+	s.mu.Lock()
+	q := s.queue
+	s.mu.Unlock()
+	if q == nil {
+		return 0
+	}
+	return q.InflightCount()
+}
+
 func (s *session) snapshot() sessionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,12 +215,35 @@ func (s *session) snapshot() sessionSnapshot {
 		// never-connected (extVersion stays "").
 	}
 
+	status, statusLabel := ComputeSessionStatus(s.sessionPageCount, connected, supports)
+
+	browsers := append([]string(nil), s.browsers...)
+	pages := append([]sessionPageTab(nil), s.sessionPages...)
+	inflight := 0
+	if s.queue != nil {
+		inflight = s.queue.InflightCount()
+	}
+
+	var lastSeen time.Time
+	if !s.lastSeenAt.IsZero() {
+		lastSeen = s.lastSeenAt
+	}
+
 	return sessionSnapshot{
 		SessionID:            s.id,
 		Phase:                s.phase,
 		Hint:                 hint,
 		ExtensionInstallPath: s.extensionInstallPath,
 		ExtensionMatch:       match,
+		CreatedAt:            s.createdAt,
+		SessionPageCount:     s.sessionPageCount,
+		Browsers:             browsers,
+		Status:               status,
+		StatusLabel:          statusLabel,
+		InflightJobs:         inflight,
+		SessionURL:           s.sessionURL,
+		SessionPages:         pages,
+		LastSeenAt:           lastSeen,
 		BundledExtension: bundledExtension{
 			Version: s.embeddedVersion,
 			MD5:     s.embeddedMD5,
@@ -170,6 +267,15 @@ type sessionSnapshot struct {
 	BundledExtension     bundledExtension `json:"bundled_extension"`
 	Extension            sessionExtension `json:"extension"`
 	ExtensionMatch       string           `json:"extension_match"`
+	CreatedAt            time.Time        `json:"created_at"`
+	SessionPageCount     *int             `json:"session_page_count,omitempty"`
+	Browsers             []string         `json:"browsers,omitempty"`
+	Status               string           `json:"status"`
+	StatusLabel          string           `json:"status_label"`
+	InflightJobs         int              `json:"inflight_jobs,omitempty"`
+	SessionURL           string           `json:"session_url,omitempty"`
+	SessionPages         []sessionPageTab `json:"session_pages,omitempty"`
+	LastSeenAt           time.Time        `json:"last_seen_at,omitempty"`
 }
 
 type bundledExtension struct {
@@ -186,9 +292,15 @@ type sessionExtension struct {
 	SupportsBrowserAgent bool     `json:"supports_browser_agent"`
 }
 
+// buildDisconnectedHint guides operators to keep the session page open at /go?session=.
+func buildDisconnectedHint(sessionID, baseURL string) string {
+	goPath := "/go?session=" + sessionID
+	return "Keep " + goPath + " open in this browser window. Do not close this tab or navigate to a different session in the same window. Open the session page at " + strings.TrimSuffix(baseURL, "/") + goPath + " and load the unpacked browser-agent extension."
+}
+
 func buildHint(connected, supports bool) string {
 	if !connected {
-		return "Waiting for browser-agent extension. Load unpacked extension and open this session page (control port " + DefaultControlPort + ")."
+		return "Waiting for browser-agent extension. Load unpacked extension and open this session page (control port " + DefaultControlPortString() + ")."
 	}
 	if !supports {
 		return "Extension connected but does not support browser-agent (need feature browser-agent and version ≥ " + MinBrowserAgentVersion + ")."

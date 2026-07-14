@@ -50,8 +50,8 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	if !filepath.IsAbs(p) {
 		t.Fatalf("extension_install_path should be absolute; got %q", p)
 	}
-	if !strings.Contains(p, "extension") {
-		t.Fatalf("extension_install_path should contain extension segment; got %q", p)
+	if !strings.Contains(p, "extensions/browser-agent/") {
+		t.Fatalf("extension_install_path should contain extensions/browser-agent/; got %q", p)
 	}
 }
 ```

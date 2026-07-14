@@ -133,9 +133,6 @@ browser-agent serve [flags]
 browser-agent serve --status
 browser-agent session new [--session-id]
 browser-agent session info|eval|run|logs|screenshot|cdp [flags]
-browser-agent skill --show
-browser-agent skill --list
-browser-agent skill --install …
 ```
 
 Control port **43761**. Session env: **BROWSER_AGENT_SESSION_ID**.

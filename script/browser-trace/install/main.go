@@ -5,6 +5,9 @@
 //
 //	go run ./script/browser-trace/install
 //	go run ./script/browser-trace/install --fixture   # mini embed (no npm)
+//
+// Git tracks only browsertrace/embedded/**/placeholder.txt. Generated payloads
+// are gitignored; this install auto-bundles when the on-disk embed is incomplete.
 package main
 
 import (
@@ -14,13 +17,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/xhd2015/browser-agent/browseragent"
 	"github.com/xhd2015/xgo/support/cmd"
 )
 
 const (
-	modulePath = "github.com/xhd2015/browser-agent"
-	pkgPath    = "./cmd/browser-trace"
-	binName    = "browser-trace"
+	pkgPath = "./cmd/browser-trace"
+	binName = "browser-trace"
 )
 
 func main() {
@@ -32,6 +35,7 @@ func main() {
 
 func handle(args []string) error {
 	var fixture bool
+	var forceBundle bool
 	var extra []string
 	for _, a := range args {
 		switch a {
@@ -40,6 +44,8 @@ func handle(args []string) error {
 			return nil
 		case "--fixture", "--mini":
 			fixture = true
+		case "--force-bundle":
+			forceBundle = true
 		default:
 			extra = append(extra, a)
 		}
@@ -53,17 +59,24 @@ func handle(args []string) error {
 		return err
 	}
 
-	// 1) Bundle extension into browsertrace/embedded/extension for //go:embed.
-	fmt.Println("==> Bundling Chrome extension into embed tree")
-	bundleArgs := []string{"run", "./script/browser-trace/bundle"}
-	if fixture {
-		bundleArgs = append(bundleArgs, "--fixture")
-	}
-	if err := cmd.Debug().Dir(root).Run("go", bundleArgs...); err != nil {
-		return fmt.Errorf("bundle failed: %w", err)
+	needBundle := forceBundle || fixture || diskEmbedIncomplete(root)
+	if needBundle {
+		if !forceBundle && !fixture {
+			fmt.Println("==> Embed incomplete (placeholders / missing outstanding files); auto-bundling…")
+		} else {
+			fmt.Println("==> Bundling Chrome extension into embed tree")
+		}
+		bundleArgs := []string{"run", "./script/browser-trace/bundle"}
+		if fixture {
+			bundleArgs = append(bundleArgs, "--fixture")
+		}
+		if err := cmd.Debug().Dir(root).Run("go", bundleArgs...); err != nil {
+			return fmt.Errorf("bundle failed: %w\n  hint: use --fixture or see docs/assets-hydrate.md", err)
+		}
+	} else {
+		fmt.Println("==> On-disk embed already complete; skipping bundle (pass --force-bundle to refresh)")
 	}
 
-	// 2) go install into GOBIN / GOPATH/bin.
 	fmt.Println("==> Installing browser-trace (go install)")
 	if err := cmd.Debug().Dir(root).Run("go", "install", pkgPath); err != nil {
 		return fmt.Errorf("go install %s failed: %w", pkgPath, err)
@@ -71,7 +84,6 @@ func handle(args []string) error {
 
 	dest, err := installDest()
 	if err != nil {
-		// Install succeeded; still report success without path.
 		fmt.Printf("\nInstalled %s via go install %s\n", binName, pkgPath)
 		return nil
 	}
@@ -84,18 +96,27 @@ func handle(args []string) error {
 	return nil
 }
 
+func diskEmbedIncomplete(root string) bool {
+	ext := os.DirFS(filepath.Join(root, "browsertrace", "embedded", "extension"))
+	return !browseragent.EmbedCompleteFS(ext, browseragent.AssetKindExtension)
+}
+
 func printHelp() {
 	fmt.Print(`Usage: go run ./script/browser-trace/install [options]
 
-Bundle the Chrome extension into browsertrace/embedded/extension (for go:embed),
+Stage the Chrome extension into browsertrace/embedded/extension (for go:embed),
 then install the browser-trace binary with:
 
   go install ./cmd/browser-trace
+
+Git tracks only embedded/**/placeholder.txt; generated files are gitignored.
+When the on-disk embed is incomplete, install auto-bundles before go install.
 
 The binary lands in $GOBIN if set, otherwise $GOPATH/bin (default ~/go/bin).
 
 Options:
   --fixture, --mini   Stage mini fixture instead of building Chrome-Ext-Capture-API
+  --force-bundle      Bundle even if the on-disk embed looks complete
   -h, --help          Show this help
 `)
 }
@@ -108,15 +129,14 @@ func findModuleRoot() (string, error) {
 	dir := wd
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			// Sanity: cmd/browser-trace exists.
 			if _, err := os.Stat(filepath.Join(dir, "cmd", "browser-trace")); err != nil {
-				return "", fmt.Errorf("%s: cmd/browser-trace not found (not project-api-capture root?)", dir)
+				return "", fmt.Errorf("%s: cmd/browser-trace not found", dir)
 			}
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("go.mod not found from %s; run from the project-api-capture module root", wd)
+			return "", fmt.Errorf("go.mod not found from %s; run from the module root", wd)
 		}
 		dir = parent
 	}
@@ -128,7 +148,6 @@ func installDest() (string, error) {
 	}
 	gopath := strings.TrimSpace(os.Getenv("GOPATH"))
 	if gopath == "" {
-		// Match go env GOPATH default.
 		out, err := exec.Command("go", "env", "GOPATH").Output()
 		if err != nil {
 			return "", err
@@ -138,7 +157,6 @@ func installDest() (string, error) {
 	if gopath == "" {
 		return "", fmt.Errorf("GOPATH empty")
 	}
-	// First GOPATH entry if colon-separated.
 	if i := strings.IndexByte(gopath, filepath.ListSeparator); i >= 0 {
 		gopath = gopath[:i]
 	}

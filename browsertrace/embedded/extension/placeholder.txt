@@ -1,0 +1,9 @@
+browser-trace embed placeholder
+
+This tree is incomplete in git. Stage a full extension via:
+
+  go run ./script/browser-trace/bundle
+  # or
+  go run ./script/browser-trace/install
+
+Or at runtime hydrate from GitHub Releases (see docs/assets-hydrate.md).

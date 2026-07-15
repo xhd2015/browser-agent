@@ -26,6 +26,7 @@ Commands:
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
   install-chrome-extension   Extract embedded Chrome extension
+  assets      Ensure/status hydrated session-page + extension assets
 
 Run 'browser-agent --help' for full help.
 `
@@ -52,6 +53,7 @@ Commands:
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
                              Embedded agent skill (see: browser-agent skill --help)
+  assets ensure|status       Hydrate / report session-page + extension assets
 
 Global flags:
   -h, --help                 Show this help
@@ -182,13 +184,15 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliOpenManagedChrome(rest, env, stdout, stderr)
 	case "skill":
 		return cliSkill(rest, env, stdout, stderr)
+	case "assets":
+		return cliAssets(rest, env, stdout, stderr)
 	case "-h", "--help":
 		_, _ = io.WriteString(stdout, fullHelp)
 		return nil
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, or skill", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, skill, or assets", cmd)
 	}
 }
 

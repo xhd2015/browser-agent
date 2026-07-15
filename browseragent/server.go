@@ -555,12 +555,15 @@ func (c *controlServer) handleGo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := c.registry.snapshot(sess)
-	// Prefer embedded session-page fixture when present.
-	if htmlBody, err := readEmbeddedSessionIndex(); err == nil && strings.TrimSpace(htmlBody) != "" {
-		out := injectSessionBoot(htmlBody, sessionID, snap)
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(out))
-		return
+	// Prefer complete embed; otherwise EnsureAsset into cache when BaseURL is configured.
+	if sub, err := fs.Sub(embeddedSessionPage, embeddedSessionPageRoot); err == nil {
+		htmlBody, _, rerr := ResolveSessionPage(sub, ClientVersion(), AssetDownloadConfig{})
+		if rerr == nil && strings.TrimSpace(htmlBody) != "" {
+			out := injectSessionBoot(htmlBody, sessionID, snap)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(out))
+			return
+		}
 	}
 	// Fallback: pure Go HTML shell (keeps prior SPA markers).
 	c.writeFallbackSessionHTML(w, sessionID, snap)

@@ -1,0 +1,9 @@
+browser-agent embed placeholder
+
+This tree is incomplete in git. Stage a full extension via:
+
+  go run ./script/browser-agent/bundle
+  # or
+  go run ./script/browser-agent/install
+
+Or at runtime hydrate from GitHub Releases (see docs/assets-hydrate.md).

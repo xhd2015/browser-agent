@@ -11,8 +11,10 @@ import (
 	"strings"
 )
 
-// embeddedExtension is the staged MV3 tree (mini fixture in CI; production via
-// ./script/browser-trace/bundle).
+// embeddedExtension is the staged MV3 tree under embedded/extension/.
+// Git tracks only placeholder.txt; full trees come from script/browser-trace/bundle
+// (or install) and are gitignored. Incomplete embeds hydrate at runtime
+// (docs/assets-hydrate.md).
 //
 //go:embed embedded/extension/**
 var embeddedExtension embed.FS

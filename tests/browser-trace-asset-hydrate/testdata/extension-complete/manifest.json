@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Trace Fixture",
+  "version": "0.0.1",
+  "description": "fixture extension for browser-trace embed completeness tests",
+  "background": {
+    "service_worker": "background.js"
+  }
+}

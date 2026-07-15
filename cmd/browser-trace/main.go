@@ -36,6 +36,7 @@ Commands:
   skill --list               Print skill name
   skill --help               Skill subcommand help
   (see: browser-trace skill --install --help)
+  assets ensure|status       Hydrate / report extension assets (see: browser-trace assets --help)
 
 Options:
   --addr <host:port>         Listen address (default: 127.0.0.1:43759)
@@ -72,6 +73,10 @@ func handle(args []string) error {
 	// Optional short alias (skill-cli Shape 1): top-level install → skill --install
 	if len(args) > 0 && args[0] == "install" {
 		return singleSkill().Handle(append([]string{"--install"}, args[1:]...))
+	}
+	// Asset hydrate: browser-trace assets ensure|status|--help
+	if len(args) > 0 && args[0] == "assets" {
+		return browsertrace.HandleCLI(args, nil, os.Stdout, os.Stderr)
 	}
 	return runCapture(args)
 }

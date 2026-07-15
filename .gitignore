@@ -10,3 +10,13 @@ node_modules
 dist
 /external
 **/.xgo/gen
+
+# Generated //go:embed payloads (stage via script/*/bundle or install).
+# Only placeholder.txt is tracked so go install / module zip stay incomplete
+# and runtime hydrate can download release assets (docs/assets-hydrate.md).
+browseragent/embedded/extension/**
+!browseragent/embedded/extension/placeholder.txt
+browseragent/embedded/session-page/**
+!browseragent/embedded/session-page/placeholder.txt
+browsertrace/embedded/extension/**
+!browsertrace/embedded/extension/placeholder.txt

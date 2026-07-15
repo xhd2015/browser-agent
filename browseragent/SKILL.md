@@ -3,8 +3,8 @@ name: browser-agent
 description: >-
   Drive a live Chrome session via the browser-agent control plane: start serve
   or session new, open the session page, then use nested session side commands
-  (session info, eval, run, logs, screenshot, cdp) against BROWSER_AGENT_SESSION_ID
-  on control port 43761.
+  (session info, create-tab, eval, run, logs, screenshot, cdp) against
+  BROWSER_AGENT_SESSION_ID on control port 43761.
 ---
 
 # Browser Agent Skill
@@ -15,7 +15,8 @@ on product **browser-agent** (control port **43761**).
 ## When to use
 
 - User wants browser automation / inspection through browser-agent
-- Need `session eval`, `session run`, `session logs`, `session screenshot`, or raw `session cdp` against a live tab
+- Need `session eval`, `session run`, `session logs`, `session screenshot`,
+  `session create-tab`, or raw `session cdp` against a live tab
 - Session is already running and `BROWSER_AGENT_SESSION_ID` is known
 
 ## Prerequisites
@@ -74,6 +75,8 @@ browser-agent session info --session-id "$BROWSER_AGENT_SESSION_ID"
 ### 3. Side commands (nested under `session`; require session)
 
 ```bash
+browser-agent session create-tab --session-id "$BROWSER_AGENT_SESSION_ID"
+browser-agent session create-tab --session-id "$BROWSER_AGENT_SESSION_ID" https://example.com
 browser-agent session eval --session-id "$BROWSER_AGENT_SESSION_ID" '1+1'
 browser-agent session run --session-id "$BROWSER_AGENT_SESSION_ID" script.js
 browser-agent session logs --session-id "$BROWSER_AGENT_SESSION_ID"
@@ -83,6 +86,10 @@ browser-agent session info --session-id "$BROWSER_AGENT_SESSION_ID"
 ```
 
 Default control base: `http://127.0.0.1:43761`.
+
+**create-tab** opens a tab in the session window (job type `create_tab`). Result
+identity is **`tab_id` only** (optional url/window_id). Use that `tab_id` with
+`--tab-id` on subsequent jobs.
 
 ### Tab targeting (critical)
 
@@ -96,27 +103,28 @@ Default control base: `http://127.0.0.1:43761`.
   `job_target`, and `recommended_cli`.
 - Do **not** navigate the session control page away from `/go?session=` — that disconnects
   the extension.
-- List tabs with **session info** only — do **not** use CDP `Target.getTargets`.
+- Prefer **session create-tab** / **session info** for tab lifecycle over inventing a
+  raw CDP target graph.
 
-### session cdp limits (Chrome extension debugger)
+### session cdp + Target.* polyfill
 
 Transport is `chrome.debugger` on **one tab**, not full browser CDP.
 
-| Use | Do not use |
-|-----|------------|
-| `Runtime.evaluate`, `Page.navigate`, `Page.captureScreenshot`, DOM/CSS/Network as needed | **`Target.*`** (`getTargets`, `activateTarget`, `createTarget`, …) |
+| Use | Notes |
+|-----|--------|
+| `Runtime.evaluate`, `Page.navigate`, `Page.captureScreenshot`, DOM/CSS/Network as needed | Page-scoped CDP via debugger |
+| **`Target.*` (polyfilled)** | Tab lifecycle via **chrome.tabs** in the session window; results use **`tab_id`** only |
 
-Forbidden Target methods return:
+**Target.* is polyfilled** for create/close/activate/list/info. Soft methods
+(setDiscoverTargets, setAutoAttach, attach/detach) are no-op or map to debugger
+attach. Other Target methods return a product **polyfill unsupported** error
+(not Chrome `-32000 Not allowed`).
 
-```text
-cdp job failed: {"code":-32000,"message":"Not allowed"}
-```
-
-Never:
+Do not expect a real multi-target CDP graph or worker targets. Prefer:
 
 ```bash
-browser-agent session cdp Target.getTargets '{}'
-browser-agent session cdp Target.activateTarget '{"targetId":"…"}'
+browser-agent session create-tab --session-id "$BROWSER_AGENT_SESSION_ID" [url]
+browser-agent session info --session-id "$BROWSER_AGENT_SESSION_ID"
 ```
 
 ### 4. Extension install
@@ -132,7 +140,7 @@ browser-agent install-chrome-extension
 browser-agent serve [flags]
 browser-agent serve --status
 browser-agent session new [--session-id]
-browser-agent session info|eval|run|logs|screenshot|cdp [flags]
+browser-agent session info|create-tab|eval|run|logs|screenshot|cdp [flags]
 ```
 
 Control port **43761**. Session env: **BROWSER_AGENT_SESSION_ID**.

@@ -28,13 +28,14 @@ const (
 	JobTypeLogs       = "logs"
 	JobTypeScreenshot = "screenshot"
 	JobTypeCDP        = "cdp"
+	JobTypeCreateTab  = "create_tab"
 )
 
-// IsKnownJobType reports whether s is one of the six canonical job type strings
-// (exact lowercase match).
+// IsKnownJobType reports whether s is a canonical job type string
+// (exact lowercase match). Additive set includes prior six plus create_tab.
 func IsKnownJobType(s string) bool {
 	switch s {
-	case JobTypeInfo, JobTypeEval, JobTypeRun, JobTypeLogs, JobTypeScreenshot, JobTypeCDP:
+	case JobTypeInfo, JobTypeEval, JobTypeRun, JobTypeLogs, JobTypeScreenshot, JobTypeCDP, JobTypeCreateTab:
 		return true
 	default:
 		return false

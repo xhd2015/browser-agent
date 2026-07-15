@@ -22,7 +22,7 @@ const briefUsage = `Usage: browser-agent <command> [flags]
 
 Commands:
   serve       Blocking multi-session daemon host (default 127.0.0.1:43761)
-  session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|list
+  session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|list
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
   install-chrome-extension   Extract embedded Chrome extension
@@ -47,6 +47,7 @@ Commands:
     session screenshot [flags]         POST a screenshot job; optional -o file.png
     session cdp [flags] <Method> [json]
                                        POST a raw CDP job (method + optional params JSON)
+    session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
   install-chrome-extension   Extract embedded extension and print Load unpacked help
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
@@ -97,7 +98,7 @@ session info flags:
   --server-port <port>       Control server port (default: from server.json or 43761)
   --json                     Emit enriched session snapshot JSON (includes browser tabs when connected)
 
-session delete / eval / run / logs / screenshot / cdp flags:
+session delete / eval / run / logs / screenshot / cdp / create-tab flags:
   --session-id <id>          Session id (or env BROWSER_AGENT_SESSION_ID)
   --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
   --host <host>              Control server host (default: from server.json or 127.0.0.1)
@@ -111,6 +112,9 @@ screenshot flags:
 logs flags:
   --limit <N>                Optional max log entries
   --level <level>            Optional log level filter
+
+create-tab flags:
+  --url <url>                Optional URL (positional [url] also accepted); omit for blank tab
 
 Session resolution: --session-id flag, else BROWSER_AGENT_SESSION_ID env.
 `
@@ -189,11 +193,11 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 }
 
 // cliSession dispatches nested session side-commands:
-// session new|info|delete|eval|run|logs|screenshot|cdp …
+// session new|info|delete|eval|run|logs|screenshot|cdp|create-tab …
 func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|list")
+		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|create-tab|list")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -216,6 +220,8 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return cliScreenshot(rest, env, stdout, stderr)
 	case "cdp":
 		return cliCDP(rest, env, stdout, stderr)
+	case "create-tab", "create_tab":
+		return cliCreateTab(rest, env, stdout, stderr)
 	case "-h", "--help":
 		_, _ = io.WriteString(stdout, fullHelp)
 		if !strings.HasSuffix(fullHelp, "\n") {
@@ -224,7 +230,7 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return nil
 	default:
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, or cdp", sub)
+		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, cdp, or create-tab", sub)
 	}
 }
 
@@ -710,6 +716,27 @@ func cliCDP(args []string, env map[string]string, stdout, stderr io.Writer) erro
 	return postJobAndPrint(args, sessionID, JobTypeCDP, params, 30000, stdout, stderr, nil)
 }
 
+func cliCreateTab(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if hasHelpFlag(args) {
+		_, _ = io.WriteString(stdout, fullHelp)
+		return nil
+	}
+	sessionID, err := resolveCLISession(args, env)
+	if err != nil {
+		return err
+	}
+	params := map[string]any{}
+	url := flagString(args, "--url")
+	if strings.TrimSpace(url) == "" {
+		url = takePositional(args, 0)
+	}
+	if strings.TrimSpace(url) != "" {
+		params["url"] = strings.TrimSpace(url)
+	}
+	// Extension defaults active:true when unspecified.
+	return postJobAndPrint(args, sessionID, JobTypeCreateTab, params, 15000, stdout, stderr, nil)
+}
+
 // resolveCLITabTarget parses --tab-id / --tab-index (mutually exclusive).
 // When --tab-index is set, resolves to tab_id via info job and emits a stderr warning.
 func resolveCLITabTarget(args []string, stderr io.Writer, base, sessionID string) (int64, error) {
@@ -978,7 +1005,8 @@ func takePositional(args []string, n int) string {
 		if a == "--session-id" || a == "--addr" || a == "--host" || a == "--server-port" ||
 			a == "--base-dir" || a == "--root" ||
 			a == "--tab-id" || a == "--tab-index" ||
-			a == "--limit" || a == "--level" || a == "--output" || a == "-o" {
+			a == "--limit" || a == "--level" || a == "--output" || a == "-o" ||
+			a == "--url" {
 			skipNext = true
 			continue
 		}

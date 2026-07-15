@@ -481,6 +481,9 @@ async function handleJob(msg, sessionId, entry) {
       case "cdp":
         data = await handleCdpJob(params, jobSessionId, targetOpts);
         break;
+      case "create_tab":
+        data = await handleCreateTabJob(params, jobSessionId);
+        break;
       default:
         sendJobResult(entry, jobId, false, { type: jobType }, "unknown job type: " + jobType);
         return;
@@ -636,6 +639,16 @@ async function handleCdpJob(params, sessionId, targetOpts) {
     throw new Error("cdp job requires params.method");
   }
   const cdpParams = (params && params.params) || {};
+  // Intercept all Target.* — polyfill via chrome.tabs; never raw debugger sendCommand.
+  if (typeof method === "string" && method.startsWith("Target.")) {
+    const polyfilled = await polyfillTargetMethod(method, cdpParams || {}, sessionId, targetOpts);
+    return {
+      result: polyfilled,
+      method: method,
+      type: "cdp",
+      polyfilled: true,
+    };
+  }
   const result = await withDebuggerForSession(sessionId, async (tabId) => {
     return await sendDebuggerCommand(tabId, method, cdpParams || {});
   }, targetOpts);
@@ -643,6 +656,235 @@ async function handleCdpJob(params, sessionId, targetOpts) {
     result: result,
     method: method,
     type: "cdp",
+  };
+}
+
+/**
+ * Shared create path for job create_tab and Target.createTarget.
+ * Always scopes to the session window (entry.windowId). Default active: true.
+ * Public identity: tab_id only (no targetId).
+ */
+async function createTabInSession(sessionId, opts) {
+  opts = opts || {};
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.windowId == null) {
+    throw new Error(
+      "session page not bound (windowId missing); open /go?session=" + (sessionId || ""),
+    );
+  }
+  const createProps = {
+    windowId: entry.windowId,
+  };
+  // Default active:true when unspecified.
+  if (opts.active === false || opts.active === "false" || opts.active === 0) {
+    createProps.active = false;
+  } else {
+    createProps.active = true;
+  }
+  const url = opts.url != null ? String(opts.url).trim() : "";
+  if (url) {
+    createProps.url = url;
+  }
+  const tab = await new Promise((resolve, reject) => {
+    chrome.tabs.create(createProps, (created) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.tabs.create failed"));
+        return;
+      }
+      resolve(created);
+    });
+  });
+  return {
+    type: "create_tab",
+    tab_id: tab && tab.id != null ? tab.id : null,
+    url: (tab && tab.url) || url || "",
+    window_id: entry.windowId,
+  };
+}
+
+async function handleCreateTabJob(params, sessionId) {
+  return await createTabInSession(sessionId, {
+    url: params && (params.url || params.URL || params.href),
+    active: params && params.active,
+  });
+}
+
+/** Resolve tab_id from extension-shaped params or decimal CDP targetId. */
+function resolveTabIdFromParams(params) {
+  params = params || {};
+  if (params.tab_id != null && params.tab_id !== "") {
+    const n = parseInt(params.tab_id, 10);
+    if (!Number.isNaN(n) && n > 0) return n;
+  }
+  if (params.tabId != null && params.tabId !== "") {
+    const n = parseInt(params.tabId, 10);
+    if (!Number.isNaN(n) && n > 0) return n;
+  }
+  // Inbound CDP may send targetId as decimal string of a chrome tab id.
+  if (params.targetId != null && params.targetId !== "") {
+    const n = parseInt(String(params.targetId), 10);
+    if (!Number.isNaN(n) && n > 0 && String(n) === String(params.targetId).trim()) {
+      return n;
+    }
+  }
+  throw new Error(
+    "unable to resolve tab_id from params (need tab_id or decimal targetId string)",
+  );
+}
+
+function requireSessionWindowId(sessionId) {
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.windowId == null) {
+    throw new Error(
+      "session page not bound (windowId missing); open /go?session=" + (sessionId || ""),
+    );
+  }
+  return entry;
+}
+
+/**
+ * Polyfill dispatch for all Target.* CDP methods.
+ * Tier A: full chrome.tabs implementation.
+ * Tier B: soft no-op / debugger attach map.
+ * Tier C: explicit polyfill-unsupported product error (never Chrome -32000 fallthrough).
+ */
+async function polyfillTargetMethod(method, params, sessionId, targetOpts) {
+  params = params || {};
+  switch (method) {
+    case "Target.createTarget": {
+      const data = await createTabInSession(sessionId, {
+        url: params.url || params.URL,
+        active: params.active != null ? params.active : params.background === true ? false : undefined,
+      });
+      return data;
+    }
+    case "Target.closeTarget": {
+      return await polyfillCloseTarget(params, sessionId);
+    }
+    case "Target.activateTarget": {
+      const tabId = resolveTabIdFromParams(params);
+      await new Promise((resolve, reject) => {
+        chrome.tabs.update(tabId, { active: true }, (tab) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message || "chrome.tabs.update failed"));
+            return;
+          }
+          resolve(tab);
+        });
+      });
+      return { tab_id: tabId, active: true };
+    }
+    case "Target.getTargets": {
+      return await polyfillGetTargets(sessionId);
+    }
+    case "Target.getTargetInfo": {
+      return await polyfillGetTargetInfo(params, sessionId);
+    }
+    case "Target.setDiscoverTargets":
+    case "Target.setAutoAttach":
+      return { polyfilled: true, method: method };
+    case "Target.attachToTarget": {
+      const entry = requireSessionWindowId(sessionId);
+      const tabId = resolveTabIdFromParams(params);
+      const tab = await chrome.tabs.get(tabId);
+      if (entry.windowId != null && tab.windowId !== entry.windowId) {
+        throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
+      }
+      await attachDebuggerForSession(sessionId, tabId);
+      return { tab_id: tabId, polyfilled: true };
+    }
+    case "Target.detachFromTarget": {
+      let tabId = null;
+      try {
+        tabId = resolveTabIdFromParams(params);
+      } catch (e) {
+        // If no tab id, detach current session attach if any.
+        const state = sessionAttachState.get(sessionId);
+        if (state && state.attachedTabId != null) {
+          tabId = state.attachedTabId;
+        }
+      }
+      if (tabId != null) {
+        await detachDebugger(tabId);
+        const state = sessionAttachState.get(sessionId);
+        if (state && state.attachedTabId === tabId) {
+          state.attachedTabId = null;
+        }
+      }
+      return { tab_id: tabId, polyfilled: true };
+    }
+    default:
+      throw new Error(
+        "Target method polyfill unsupported: " + method + " (not implemented via chrome.tabs)",
+      );
+  }
+}
+
+async function polyfillCloseTarget(params, sessionId) {
+  const tabId = resolveTabIdFromParams(params);
+  const entry = sessions.get(sessionId);
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (e) {
+    throw new Error("closeTarget: tab_id " + tabId + " not found");
+  }
+  // Never close the session control page (/go?session=<id>).
+  if (isSessionGoPageURL(tab.url || "", sessionId)) {
+    throw new Error("refusing to close session control page (/go?session=)");
+  }
+  if (entry && entry.tabId != null && entry.tabId === tabId) {
+    throw new Error("refusing to close session-page tab_id " + tabId);
+  }
+  if (entry && entry.windowId != null && tab.windowId !== entry.windowId) {
+    throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
+  }
+  await new Promise((resolve, reject) => {
+    chrome.tabs.remove(tabId, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.tabs.remove failed"));
+        return;
+      }
+      resolve();
+    });
+  });
+  return { tab_id: tabId, success: true };
+}
+
+async function polyfillGetTargets(sessionId) {
+  const entry = requireSessionWindowId(sessionId);
+  const tabs = await new Promise((resolve, reject) => {
+    chrome.tabs.query({ windowId: entry.windowId }, (list) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.tabs.query failed"));
+        return;
+      }
+      resolve(list || []);
+    });
+  });
+  const targetInfos = (tabs || []).map((t) => ({
+    tab_id: t.id,
+    url: t.url || "",
+    title: t.title || "",
+    active: !!t.active,
+    role: isSessionGoPageURL(t.url || "", sessionId) ? "session_page" : "user",
+  }));
+  return { targetInfos: targetInfos, tab_id: null };
+}
+
+async function polyfillGetTargetInfo(params, sessionId) {
+  const tabId = resolveTabIdFromParams(params);
+  const entry = sessions.get(sessionId);
+  const tab = await chrome.tabs.get(tabId);
+  if (entry && entry.windowId != null && tab.windowId !== entry.windowId) {
+    throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
+  }
+  return {
+    tab_id: tab.id,
+    url: tab.url || "",
+    title: tab.title || "",
+    active: !!tab.active,
+    role: isSessionGoPageURL(tab.url || "", sessionId) ? "session_page" : "user",
   };
 }
 

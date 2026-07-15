@@ -21,6 +21,7 @@ Session id is resolved from flag or env:
 Use these nested CLI recipes (session id resolved from flag or env):
 
 - browser-agent session info
+- browser-agent session create-tab [url]
 - browser-agent session eval '/* JS expression */'
 - browser-agent session run path/to/script.js
 - browser-agent session logs
@@ -39,11 +40,11 @@ Optional escape hatch:
 - **--tab-index** (1-based capturable tab list) is available but unstable; prefer --tab-id.
 - Run **session info** first: human table or --json lists tabs (Idx, ID, Role, active)
   plus job_target and recommended_cli.
+- To open a new tab in the session window, prefer **session create-tab** (returns **tab_id**).
 - If the user's content is in a **background** tab, use --tab-id from session info —
   do **not** navigate the session control page away from /go?session= (disconnects extension).
-- Do **not** try to switch tabs via CDP Target.* (see below).
 
-## session cdp limits (Chrome extension debugger)
+## session cdp + Target.* polyfill
 
 Jobs use chrome.debugger attached to **one tab**. That is a restricted CDP
 transport — **not** full remote debugging.
@@ -53,22 +54,22 @@ transport — **not** full remote debugging.
 - Page.* (e.g. Page.navigate, Page.captureScreenshot)
 - DOM.*, CSS.*, Network.* (when needed)
 
-**Forbidden / will fail with code -32000 message "Not allowed":**
-- **Target.*** — especially Target.getTargets, Target.activateTarget,
-  Target.createTarget, Target.closeTarget, Target.attachToTarget
-- Browser-level / multi-target control over sendCommand
+**Target.* is polyfilled** (tab lifecycle via chrome.tabs in the session window):
+- Target.createTarget / Target.closeTarget / Target.activateTarget /
+  Target.getTargets / Target.getTargetInfo — implemented with chrome.tabs
+- Results use **tab_id** only (no CDP targetId identity in responses)
+- Soft methods (setDiscoverTargets, setAutoAttach, attach/detach) are no-op or
+  map to debugger attach; other Target.* methods return polyfill-unsupported errors
+- Prefer **session create-tab** and **session info** for tab lifecycle over inventing
+  a real CDP target graph / worker targets
 
-Never call:
-- browser-agent session cdp Target.getTargets …
-- browser-agent session cdp Target.activateTarget …
-
-To list tabs, use **session info** only (chrome.tabs), not Target.getTargets.
+Do **not** expect full browser-level multi-target CDP or worker targets.
 
 ## Notes
 
 - Control server default: %s (port %s)
 - Jobs are enqueue-and-wait over HTTP POST /v1/jobs
 - The Chrome extension executes jobs over WebSocket /v1/ws
-- Prefer session info → eval/screenshot on the correct active tab before inventing raw CDP
+- Prefer session info → create-tab → eval/screenshot on the correct tab_id before inventing raw CDP
 `, DefaultAddr, DefaultControlPortString())
 }

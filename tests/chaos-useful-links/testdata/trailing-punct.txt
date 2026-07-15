@@ -1,0 +1,5 @@
+See https://example.com/trail). for details
+Also https://example.com/comma,
+And https://example.com/semi;
+Closing paren https://example.com/paren)
+Bracket https://example.com/brack]

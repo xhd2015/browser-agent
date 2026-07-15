@@ -1,15 +1,15 @@
 ---
 name: browser-agent
 description: >-
-  Drive a live Chrome session via the browser-agent control plane: start serve
-  or session new, open the session page, then use nested session side commands
-  (session info, create-tab, eval, run, logs, screenshot, cdp) against
-  BROWSER_AGENT_SESSION_ID on control port 43761.
+  Drive a live Chrome session via the browser-agent control plane: start with
+  session new (auto-ensures daemon), open the session page, then use nested
+  session side commands (session info, create-tab, eval, run, logs, screenshot,
+  cdp) against BROWSER_AGENT_SESSION_ID on control port 43761.
 ---
 
 # Browser Agent Skill
 
-Agent playbook for **serve or session new → session page → nested session side commands**
+Agent playbook for **`session new` → session page → nested session side commands**
 on product **browser-agent** (control port **43761**).
 
 ## When to use
@@ -22,24 +22,17 @@ on product **browser-agent** (control port **43761**).
 ## Prerequisites
 
 1. **`browser-agent` on PATH**
-2. Control server listening on **127.0.0.1:43761** (default)
-3. Session id via `--session-id` or env **`BROWSER_AGENT_SESSION_ID`**
-4. Chrome extension loaded (Load unpacked) and connected to the session page
+2. Session id via `--session-id` or env **`BROWSER_AGENT_SESSION_ID`**
+3. Chrome extension loaded (Load unpacked) and connected to the session page
+
+Control server on **127.0.0.1:43761** is started automatically by `session new`
+when needed — **agents must not run `browser-agent serve` as the bootstrap step.**
 
 ## Agent workflow
 
-### 1. Bootstrap control server + session
+### 1. Bootstrap session (agents: this only)
 
-**Option A — dedicated daemon terminal (recommended for long sessions):**
-
-```bash
-# terminal 1 — blocking multi-session daemon host
-browser-agent serve
-# optional:
-# browser-agent serve --addr 127.0.0.1:43761 --kill-existing
-```
-
-**Option B — one-shot session bootstrap (auto-spawns daemon if needed):**
+**Do this:**
 
 ```bash
 browser-agent session new
@@ -47,22 +40,37 @@ browser-agent session new
 # browser-agent session new --session-id <id>
 ```
 
-**Status probe (read-only, any terminal):**
+`session new` **ensures the daemon**, creates the session, and opens Chrome
+(unless `--no-open-chrome`). No separate `serve` process in another terminal.
+
+```bash
+export BROWSER_AGENT_SESSION_ID=<id-from-session-new>
+```
+
+**Do not** (agent anti-patterns):
+
+```bash
+# WRONG for agents — blocks the terminal; session new already starts the daemon
+browser-agent serve
+browser-agent serve --kill-existing
+```
+
+`serve` is only for **humans** who want a long-lived daemon terminal. Agents
+should never start it as step 1.
+
+**Optional status probe (read-only; does not start a session):**
 
 ```bash
 browser-agent serve --status
 ```
 
-**Deprecated:** `browser-agent serve --session-id <id>` still works but is deprecated;
-prefer plain `browser-agent serve` (daemon host) or `browser-agent session new`.
+**Deprecated:** `browser-agent serve --session-id <id>` — use `session new` instead.
 
-Open the session page (`/go?session=<id>`) so the extension can attach.
-**Keep the session page open** so the extension stays connected — do not close the tab
-or navigate to a different session in the same window.
+Open / keep the session page (`/go?session=<id>`) so the extension can attach.
+**Keep the session page open** — do not close the tab or navigate that tab away
+from `/go?session=`.
 
 ### 2. Resolve session and tabs
-
-Prefer flag, else env:
 
 ```bash
 export BROWSER_AGENT_SESSION_ID=<id>
@@ -137,10 +145,12 @@ browser-agent install-chrome-extension
 ## CLI reference
 
 ```bash
-browser-agent serve [flags]
-browser-agent serve --status
+# Agents start here:
 browser-agent session new [--session-id]
+
 browser-agent session info|create-tab|eval|run|logs|screenshot|cdp [flags]
+browser-agent serve --status          # read-only probe only
+browser-agent serve [flags]           # human long-lived daemon — not agent bootstrap
 ```
 
 Control port **43761**. Session env: **BROWSER_AGENT_SESSION_ID**.

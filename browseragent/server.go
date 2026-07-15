@@ -382,6 +382,10 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if c.fastFailNoExtension && !sess.isExtensionConnected() {
+		if shouldAlwaysLogJob(jobType, req.Params) {
+			debugJobLog("job reject session=%s type=%s tab_id=%d reason=extension_not_connected %s",
+				sid, jobType, req.TabID, jobParamsSummary(jobType, req.Params))
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(JobResult{
@@ -407,8 +411,22 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	started := time.Now()
+	if shouldAlwaysLogJob(jobType, req.Params) {
+		debugJobLog("job enqueue id=%s session=%s type=%s tab_id=%d timeout_ms=%d %s",
+			enqueued.ID, sid, jobType, req.TabID, timeoutMS, jobParamsSummary(jobType, req.Params))
+	}
+
 	// Push to extension if connected.
-	_ = c.pushJob(sess, enqueued)
+	pushed := c.pushJob(sess, enqueued)
+	if shouldAlwaysLogJob(jobType, req.Params) {
+		if pushed {
+			debugJobLog("job push_ok id=%s session=%s type=%s", enqueued.ID, sid, jobType)
+		} else {
+			debugJobLog("job push_fail id=%s session=%s type=%s reason=no_ws_or_write_error",
+				enqueued.ID, sid, jobType)
+		}
+	}
 
 	// Hold until result / timeout / disconnect-fail.
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutMS)*time.Millisecond)
@@ -440,6 +458,16 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 			for k, v := range c.jobFailureData(sid) {
 				res.Data[k] = v
 			}
+		}
+	}
+
+	if shouldAlwaysLogJob(jobType, req.Params) {
+		if res.OK {
+			debugJobLog("job result id=%s session=%s type=%s ok=true elapsed_ms=%d %s",
+				enqueued.ID, sid, jobType, elapsedMS(started), resultDataSummary(res.Data))
+		} else {
+			debugJobLog("job result id=%s session=%s type=%s ok=false elapsed_ms=%d err=%q %s",
+				enqueued.ID, sid, jobType, elapsedMS(started), res.Error, resultDataSummary(res.Data))
 		}
 	}
 

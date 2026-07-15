@@ -238,6 +238,16 @@ func (s *controlServer) handleWSResult(sess *session, env wsEnvelope) {
 	if d, ok := payload["data"].(map[string]any); ok {
 		data = d
 	}
+	// Extension-side result; high-signal summary when debug or navigate-related data.
+	if debugEnabled() || (data != nil && (data["type"] == "create_tab" || data["method"] == "Page.navigate" || data["type"] == "cdp")) {
+		if ok {
+			debugJobLog("ws result session=%s job_id=%s ok=true %s",
+				sess.id, jobID, resultDataSummary(data))
+		} else {
+			debugJobLog("ws result session=%s job_id=%s ok=false err=%q %s",
+				sess.id, jobID, errMsg, resultDataSummary(data))
+		}
+	}
 	_ = sess.queue.Complete(jobID, JobResult{
 		JobID: jobID,
 		OK:    ok,
@@ -251,6 +261,9 @@ func (s *controlServer) handleWSResult(sess *session, env wsEnvelope) {
 func (s *controlServer) pushJob(sess *session, j Job) bool {
 	wc := sess.getWS()
 	if wc == nil {
+		if shouldAlwaysLogJob(j.Type, j.Params) {
+			debugJobLog("pushJob skip id=%s session=%s type=%s reason=no_ws", j.ID, sess.id, j.Type)
+		}
 		return false
 	}
 	sess.queue.MarkRunning(j.ID)
@@ -266,12 +279,15 @@ func (s *controlServer) pushJob(sess *session, j Job) bool {
 		payload["tab_id"] = j.TabID
 	}
 	env := wsEnvelope{
-		V:    1,
-		Type: "job",
-		ID:   j.ID,
+		V:       1,
+		Type:    "job",
+		ID:      j.ID,
 		Payload: payload,
 	}
 	if err := wc.writeJSON(env); err != nil {
+		if shouldAlwaysLogJob(j.Type, j.Params) {
+			debugJobLog("pushJob write_error id=%s session=%s type=%s err=%v", j.ID, sess.id, j.Type, err)
+		}
 		return false
 	}
 	return true

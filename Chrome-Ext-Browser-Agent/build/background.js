@@ -37,6 +37,82 @@ const sessionAttachState = new Map();
 const consoleLogBuffer = [];
 const MAX_LOG_ENTRIES = 500;
 
+/**
+ * Debug logger for extension-side job routing / navigation.
+ * - Always console.log (service worker DevTools)
+ * - Also buffers into consoleLogBuffer so `browser-agent session logs` can read it
+ * High-signal jobs (create_tab, Page.navigate) always log; set
+ * globalThis.BROWSER_AGENT_DEBUG = true for verbose.
+ */
+function baLog(level, msg, detail) {
+  const text =
+    "[browser-agent] " +
+    msg +
+    (detail != null && detail !== ""
+      ? " " + (typeof detail === "string" ? detail : JSON.stringify(detail))
+      : "");
+  const entry = {
+    level: level || "log",
+    text: text,
+    timestamp: Date.now(),
+    source: "browser-agent-ext",
+  };
+  consoleLogBuffer.push(entry);
+  if (consoleLogBuffer.length > MAX_LOG_ENTRIES) {
+    consoleLogBuffer.splice(0, consoleLogBuffer.length - MAX_LOG_ENTRIES);
+  }
+  try {
+    if (level === "error") console.error(text);
+    else if (level === "warn") console.warn(text);
+    else console.log(text);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function baDebugEnabled() {
+  try {
+    if (globalThis.BROWSER_AGENT_DEBUG === true) return true;
+    if (globalThis.BROWSER_AGENT_DEBUG === "1") return true;
+  } catch (e) {
+    /* ignore */
+  }
+  return false;
+}
+
+function baShouldLogJob(jobType, params) {
+  if (baDebugEnabled()) return true;
+  if (jobType === "create_tab") return true;
+  if (jobType === "cdp") {
+    const method =
+      (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
+    return method === "Page.navigate" || String(method).startsWith("Target.");
+  }
+  return false;
+}
+
+function baSummarizeParams(jobType, params) {
+  params = params || {};
+  if (jobType === "create_tab") {
+    return { url: params.url || params.URL || params.href || "", active: params.active };
+  }
+  if (jobType === "cdp") {
+    const method = params.method || params.cdp_method || params.cdpMethod || "";
+    const nested = params.params || {};
+    return {
+      method: method,
+      nav_url: nested.url || "",
+    };
+  }
+  if (jobType === "eval" || jobType === "run") {
+    const expr = String(
+      params.expression || params.expr || params.code || params.source || "",
+    );
+    return { expr: expr.slice(0, 80) };
+  }
+  return {};
+}
+
 function wsURLForSession(sessionId, controlPort) {
   const port =
     controlPort != null && !Number.isNaN(controlPort) && controlPort > 0
@@ -460,6 +536,19 @@ async function handleJob(msg, sessionId, entry) {
     tabIndex: payload.tab_index != null ? payload.tab_index : params.tab_index,
   };
 
+  const t0 = Date.now();
+  if (baShouldLogJob(jobType, params)) {
+    baLog("log", "job start", {
+      job_id: jobId,
+      session_id: jobSessionId,
+      type: jobType,
+      tab_id: targetOpts.tabId,
+      tab_index: targetOpts.tabIndex,
+      window_id: entry && entry.windowId,
+      params: baSummarizeParams(jobType, params),
+    });
+  }
+
   try {
     let data;
     switch (jobType) {
@@ -485,12 +574,33 @@ async function handleJob(msg, sessionId, entry) {
         data = await handleCreateTabJob(params, jobSessionId);
         break;
       default:
+        baLog("error", "job unknown type", { job_id: jobId, type: jobType });
         sendJobResult(entry, jobId, false, { type: jobType }, "unknown job type: " + jobType);
         return;
+    }
+    if (baShouldLogJob(jobType, params)) {
+      baLog("log", "job ok", {
+        job_id: jobId,
+        type: jobType,
+        elapsed_ms: Date.now() - t0,
+        data: {
+          type: data && data.type,
+          tab_id: data && data.tab_id,
+          url: data && data.url,
+          method: data && data.method,
+        },
+      });
     }
     sendJobResult(entry, jobId, true, data, "");
   } catch (e) {
     const errMsg = e && e.message ? e.message : String(e);
+    baLog("error", "job fail", {
+      job_id: jobId,
+      type: jobType,
+      elapsed_ms: Date.now() - t0,
+      error: errMsg,
+      params: baSummarizeParams(jobType, params),
+    });
     sendJobResult(entry, jobId, false, { type: jobType, stub: false }, errMsg);
   }
 }
@@ -639,6 +749,14 @@ async function handleCdpJob(params, sessionId, targetOpts) {
     throw new Error("cdp job requires params.method");
   }
   const cdpParams = (params && params.params) || {};
+  if (baShouldLogJob("cdp", params)) {
+    baLog("log", "cdp begin", {
+      session_id: sessionId,
+      method: method,
+      nav_url: cdpParams && cdpParams.url,
+      tab_id: targetOpts && (targetOpts.tabId != null ? targetOpts.tabId : targetOpts.tab_id),
+    });
+  }
   // Intercept all Target.* — polyfill via chrome.tabs; never raw debugger sendCommand.
   if (typeof method === "string" && method.startsWith("Target.")) {
     const polyfilled = await polyfillTargetMethod(method, cdpParams || {}, sessionId, targetOpts);
@@ -650,6 +768,14 @@ async function handleCdpJob(params, sessionId, targetOpts) {
     };
   }
   const result = await withDebuggerForSession(sessionId, async (tabId) => {
+    if (method === "Page.navigate") {
+      baLog("log", "cdp Page.navigate target", {
+        tab_id: tabId,
+        url: cdpParams && cdpParams.url,
+      });
+    } else if (baDebugEnabled()) {
+      baLog("log", "cdp sendCommand", { tab_id: tabId, method: method });
+    }
     return await sendDebuggerCommand(tabId, method, cdpParams || {});
   }, targetOpts);
   return {
@@ -668,6 +794,7 @@ async function createTabInSession(sessionId, opts) {
   opts = opts || {};
   const entry = sessions.get(sessionId);
   if (!entry || entry.windowId == null) {
+    baLog("error", "create_tab no windowId", { session_id: sessionId });
     throw new Error(
       "session page not bound (windowId missing); open /go?session=" + (sessionId || ""),
     );
@@ -685,6 +812,12 @@ async function createTabInSession(sessionId, opts) {
   if (url) {
     createProps.url = url;
   }
+  baLog("log", "create_tab chrome.tabs.create", {
+    session_id: sessionId,
+    window_id: entry.windowId,
+    url: url,
+    active: createProps.active,
+  });
   const tab = await new Promise((resolve, reject) => {
     chrome.tabs.create(createProps, (created) => {
       if (chrome.runtime.lastError) {
@@ -693,6 +826,12 @@ async function createTabInSession(sessionId, opts) {
       }
       resolve(created);
     });
+  });
+  baLog("log", "create_tab created", {
+    tab_id: tab && tab.id,
+    url: (tab && tab.url) || url || "",
+    pendingUrl: tab && tab.pendingUrl,
+    status: tab && tab.status,
   });
   return {
     type: "create_tab",
@@ -1071,6 +1210,24 @@ function sendDebuggerCommand(tabId, method, params) {
 
 async function withDebuggerForSession(sessionId, fn, opts) {
   const tabId = await pickTargetTabIdForSession(sessionId, opts || {});
+  if (baDebugEnabled() || (opts && (opts.tabId != null || opts.tab_id != null))) {
+    let tabUrl = "";
+    try {
+      const t = await chrome.tabs.get(tabId);
+      tabUrl = (t && t.url) || "";
+    } catch (e) {
+      /* ignore */
+    }
+    baLog("log", "debugger target", {
+      session_id: sessionId,
+      tab_id: tabId,
+      url: tabUrl,
+      opts: {
+        tabId: opts && (opts.tabId != null ? opts.tabId : opts.tab_id),
+        tabIndex: opts && (opts.tabIndex != null ? opts.tabIndex : opts.tab_index),
+      },
+    });
+  }
   await attachDebuggerForSession(sessionId, tabId);
   return await fn(tabId);
 }

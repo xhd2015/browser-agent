@@ -818,6 +818,10 @@ func postJobAndPrint(args []string, sessionID, jobType string, params map[string
 	if params == nil {
 		params = map[string]any{}
 	}
+	if shouldAlwaysLogJob(jobType, params) && stderr != nil {
+		_, _ = fmt.Fprintf(stderr, "browser-agent: cli submit session=%s type=%s tab_id=%d %s\n",
+			sessionID, jobType, tabID, jobParamsSummary(jobType, params))
+	}
 	payload := map[string]any{
 		"session_id": sessionID,
 		"type":       jobType,

@@ -1,10 +1,10 @@
 ---
 name: browser-agent
 description: >-
-  Drive a live Chrome session via the browser-agent control plane: start with
+  Use when research a browser or web page, or a non-api url mentioned. Drive a live Chrome session: start with
   session new (auto-ensures daemon), open the session page, then use nested
   session side commands (session info, create-tab, eval, run, logs, screenshot,
-  cdp) against BROWSER_AGENT_SESSION_ID on control port 43761.
+  cdp).
 ---
 
 # Browser Agent Skill
@@ -17,7 +17,6 @@ on product **browser-agent** (control port **43761**).
 - User wants browser automation / inspection through browser-agent
 - Need `session eval`, `session run`, `session logs`, `session screenshot`,
   `session create-tab`, or raw `session cdp` against a live tab
-- Session is already running and `BROWSER_AGENT_SESSION_ID` is known
 
 ## Prerequisites
 

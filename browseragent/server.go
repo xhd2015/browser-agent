@@ -603,8 +603,11 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 </script>
 `, bootJSONSafe, sessionID)
 
-	// Inject into <head> when present; otherwise prepend after <html>.
 	out := htmlBody
+	// Page title: {sessionId} - Browser Agent (rewrite existing <title> or insert).
+	out = ensureSessionPageTitle(out, esc)
+
+	// Inject into <head> when present; otherwise prepend after <html>.
 	if idx := strings.Index(strings.ToLower(out), "</head>"); idx >= 0 {
 		out = out[:idx] + bootBlock + out[idx:]
 	} else if idx := strings.Index(strings.ToLower(out), "<head>"); idx >= 0 {
@@ -715,6 +718,32 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 	}
 
 	return out
+}
+
+// ensureSessionPageTitle rewrites the first <title>…</title> to
+// "{escapedSessionID} - Browser Agent", or inserts one inside <head> (or prepends).
+func ensureSessionPageTitle(htmlBody, escapedSessionID string) string {
+	titleTag := fmt.Sprintf("<title>%s - Browser Agent</title>", escapedSessionID)
+	low := strings.ToLower(htmlBody)
+	if start := strings.Index(low, "<title"); start >= 0 {
+		gt := strings.Index(htmlBody[start:], ">")
+		if gt >= 0 {
+			openEnd := start + gt + 1
+			if closeRel := strings.Index(low[openEnd:], "</title>"); closeRel >= 0 {
+				closeEnd := openEnd + closeRel + len("</title>")
+				return htmlBody[:start] + titleTag + htmlBody[closeEnd:]
+			}
+			return htmlBody[:start] + titleTag + htmlBody[openEnd:]
+		}
+	}
+	// No <title>: insert after <head ...> when present.
+	if idx := strings.Index(low, "<head"); idx >= 0 {
+		if gt := strings.Index(htmlBody[idx:], ">"); gt >= 0 {
+			end := idx + gt + 1
+			return htmlBody[:end] + "\n" + titleTag + htmlBody[end:]
+		}
+	}
+	return titleTag + htmlBody
 }
 
 // extensionIdentityPanelHTML is SSR UI for bundled vs loaded extension package
@@ -835,7 +864,7 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	identity := extensionIdentityPanelHTML(sessionID, snap)
 	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>browser-agent session</title>
+<html><head><meta charset="utf-8"><title>%s - Browser Agent</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 42rem; }
   code, pre.path { background: #f4f4f4; padding: 0.1em 0.3em; }
@@ -909,5 +938,5 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 })();
   </script>
   </div>
-</body></html>`, FormatSessionBootJSON(sessionID), sessionID, esc, sessionWarningBannerHTML(sessionID), esc, identity, sessionID)
+</body></html>`, esc, FormatSessionBootJSON(sessionID), sessionID, esc, sessionWarningBannerHTML(sessionID), esc, identity, sessionID)
 }

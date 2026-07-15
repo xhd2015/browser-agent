@@ -44,6 +44,11 @@ export function SessionPageApp({
 
   useEffect(() => {
     if (!sid) return;
+    document.title = `${sid} - Browser Agent`;
+  }, [sid]);
+
+  useEffect(() => {
+    if (!sid) return;
     let cancelled = false;
     const poll = () => {
       fetch(`/v1/session?session=${encodeURIComponent(sid)}`)

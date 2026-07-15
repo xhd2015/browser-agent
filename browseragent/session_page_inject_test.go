@@ -42,12 +42,26 @@ func TestInjectSessionBoot_SPA_noDuplicateIdentityOrInstall(t *testing.T) {
 	if !strings.Contains(out, "data-session-id") {
 		t.Fatal("expected data-session-id on body")
 	}
+	if !strings.Contains(out, "<title>sess-x - Browser Agent</title>") {
+		t.Fatalf("expected session title rewrite, got: %s", out)
+	}
+	if strings.Contains(out, "Browser Agent Session") {
+		t.Fatal("static SPA title must be replaced")
+	}
 	// SPA must not get SSR identity/install panels (React owns them).
 	if n := strings.Count(out, "data-browser-agent-ext-identity"); n != 0 {
 		t.Fatalf("SPA inject must not add identity panel, got count=%d", n)
 	}
 	if strings.Contains(out, `id="browser-agent-install"`) {
 		t.Fatal("SPA inject must not add install details panel")
+	}
+}
+
+func TestEnsureSessionPageTitle_insertWhenMissing(t *testing.T) {
+	plain := `<!DOCTYPE html><html><head></head><body></body></html>`
+	out := ensureSessionPageTitle(plain, "sid-1")
+	if !strings.Contains(out, "<title>sid-1 - Browser Agent</title>") {
+		t.Fatalf("expected inserted title, got %s", out)
 	}
 }
 

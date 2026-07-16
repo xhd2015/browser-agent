@@ -5,7 +5,7 @@ newline (no banners). Stderr is free-form milestone lines (token-asserted below)
 
 ```
 ---
-version: 2
+version: 3
 __PATH__: type=string, example=/tmp/browser-trace-base/2026-07-11-12-00-00-abc, session directory path
 ---
 __PATH__

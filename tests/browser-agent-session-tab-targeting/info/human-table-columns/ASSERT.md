@@ -64,14 +64,14 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 
 	// Compact human path must render full enriched table + footer (not tabs[0] only).
 	assert.Output(t, resp.Stdout, `---
-version: 2
+version: 3
 ---
 ...2 lines omitted...
   Idx  ID        Active  Role          Title
   1    111               session-page  Browser Agent Session
-  2    222       *       user          Example Domain
-Job target  idx 2 / tab 222  (active in session window)
-Recommended: browser-agent session eval --tab-id 222 '...'
-Keep the session page (/go?session=…) open — navigating it away disconnects the extension.`)
+  2    222       \*       user          Example Domain
+Job target  idx 2 / tab 222  \(active in session window\)
+Recommended: browser-agent session eval --tab-id 222 '\.\.\.'
+Keep the session page \(/go\?session=…\) open — navigating it away disconnects the extension\.`)
 }
 ```

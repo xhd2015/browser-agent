@@ -19,9 +19,7 @@ jobs:
         run: go test -v ./...
 
       - name: Install doctest
-        run: |
-          if ! command -v doctest >/dev/null 2>&1; then
-            go install github.com/xhd2015/doctest/cmd/doctest@latest
-          fi
+        # Pin to the cross-device rename fix branch until it lands on @latest.
+        run: go install github.com/xhd2015/doctest/cmd/doctest@master-2026-07-16-fix-cross-device-rename-version
       - name: Doctest
         run: doctest test -v ./...

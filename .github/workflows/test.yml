@@ -9,10 +9,17 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: golang:1.25.0
+    env:
+      GOFLAGS: -buildvcs=false
     steps:
       - uses: actions/checkout@v4
-      - name: Placeholder har-viewer dist for go:embed
+      - name: Stage complete embeds from fixtures (go:embed)
         run: |
+          # tracked tree only has placeholder.txt; stage complete mini fixtures so
+          # control server / go:embed paths work in CI without npm or network hydrate.
+          mkdir -p browseragent/embedded/extension browseragent/embedded/session-page
+          cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
+          cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
           mkdir -p har-viewer/project-api-capture-react/dist
           printf '%s\n' '<!doctype html><title>placeholder</title>' > har-viewer/project-api-capture-react/dist/index.html
       - name: Go test
@@ -24,4 +31,4 @@ jobs:
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
       - name: Doctest
-        run: doctest test -v ./...
+        run: doctest test -v --label-all ./...

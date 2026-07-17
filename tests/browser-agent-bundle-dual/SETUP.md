@@ -98,6 +98,7 @@ func hasRootMount(body string) bool {
 
 func resolveFixtureExtensionDir(moduleRoot string) string {
 	candidates := []string{
+filepath.Join(moduleRoot, "browseragent", "fixtures", "extension"),
 		filepath.Join(moduleRoot, "browseragent", "embedded", "extension"),
 		filepath.Join(moduleRoot, "tests", "browser-agent-cli-react", "testdata", "mini-extension"),
 		filepath.Join(moduleRoot, "tests", "browser-agent-bundle-dual", "testdata", "mini-extension"),
@@ -112,6 +113,7 @@ func resolveFixtureExtensionDir(moduleRoot string) string {
 
 func resolveFixtureSessionPageDir(moduleRoot string) string {
 	candidates := []string{
+filepath.Join(moduleRoot, "browseragent", "fixtures", "session-page"),
 		filepath.Join(moduleRoot, "browseragent", "embedded", "session-page"),
 		filepath.Join(moduleRoot, "tests", "browser-agent-bundle-dual", "testdata", "mini-session-page"),
 		filepath.Join(moduleRoot, "tests", "browser-agent-vite-skill", "testdata", "session-page"),

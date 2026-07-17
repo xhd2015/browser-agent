@@ -11,13 +11,14 @@ jobs:
       image: golang:1.25.0
     env:
       GOFLAGS: -buildvcs=false
+      HOME: ${{ github.workspace }}/.ci-home
     steps:
       - uses: actions/checkout@v4
       - name: Stage complete embeds from fixtures (go:embed)
         run: |
           # tracked tree only has placeholder.txt; stage complete mini fixtures so
           # control server / go:embed paths work in CI without npm or network hydrate.
-          mkdir -p browseragent/embedded/extension browseragent/embedded/session-page
+          mkdir -p "${HOME}" browseragent/embedded/extension browseragent/embedded/session-page
           cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
           cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
           mkdir -p har-viewer/project-api-capture-react/dist

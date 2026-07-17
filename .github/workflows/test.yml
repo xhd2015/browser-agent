@@ -11,6 +11,10 @@ jobs:
       image: golang:1.25.0
     steps:
       - uses: actions/checkout@v4
+      - name: Placeholder har-viewer dist for go:embed
+        run: |
+          mkdir -p har-viewer/project-api-capture-react/dist
+          printf '%s\n' '<!doctype html><title>placeholder</title>' > har-viewer/project-api-capture-react/dist/index.html
       - name: Go test
         run: go test -v ./...
 

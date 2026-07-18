@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure git for container checkout
         run: |
+          # HOME is remapped to workspace/.ci-home; create it before git config.
+          mkdir -p "${HOME}"
           git config --global --add safe.directory '*'
       - name: Stage complete embeds from fixtures (go:embed)
         run: |

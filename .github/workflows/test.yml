@@ -7,10 +7,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: golang:1.25.0
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Stage complete embeds from fixtures (go:embed)
+        run: |
+          # tracked tree only has placeholder.txt; stage complete mini fixtures so
+          # control server / go:embed paths work in CI without npm or network hydrate.
+          mkdir -p browseragent/embedded/extension browseragent/embedded/session-page
+          cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
+          cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
+          # browser-trace has its own //go:embed tree (separate from browseragent).
+          mkdir -p browsertrace/embedded/extension
+          if [ -d tests/browser-trace-embed-extension/testdata/mini-extension ]; then
+            cp -a tests/browser-trace-embed-extension/testdata/mini-extension/. browsertrace/embedded/extension/
+          else
+            cp -a browseragent/fixtures/extension/. browsertrace/embedded/extension/
+          fi
+          mkdir -p har-viewer/project-api-capture-react/dist
+          printf '%s\n' '<!doctype html><title>placeholder</title>' > har-viewer/project-api-capture-react/dist/index.html
       - name: Go test
         run: go test -v ./...
 
@@ -19,5 +36,32 @@ jobs:
           if ! command -v doctest >/dev/null 2>&1; then
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
+      - name: Prefetch modules
+        run: |
+          go mod download
+          go mod tidy
       - name: Doctest
-        run: doctest test -v --label-all ./...
+        # mapping-gen shares one go.mod across suites; concurrent go mod tidy can
+        # race. Serialize go via flock and run each DOCTEST.md suite sequentially.
+        run: |
+          REAL_GO="$(command -v go)"
+          WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
+          mkdir -p "$WRAP_DIR"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            "exec flock \"${WRAP_DIR}/go.lock\" \"${REAL_GO}\" \"\$@\"" \
+            >"$WRAP_DIR/go"
+          chmod +x "$WRAP_DIR/go"
+          export PATH="$WRAP_DIR:$PATH"
+          failed=0
+          find tests -name DOCTEST.md -print | sort >"$WRAP_DIR/suites.list"
+          while IFS= read -r doc; do
+            [ -n "$doc" ] || continue
+            suite="$(dirname "$doc")"
+            echo "==> doctest $suite"
+            if ! doctest test -v --label-all "$suite"; then
+              echo "FAILED: $suite"
+              failed=1
+            fi
+          done <"$WRAP_DIR/suites.list"
+          exit "$failed"

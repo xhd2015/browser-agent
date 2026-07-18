@@ -4,7 +4,7 @@ Success-like stdout: session path and trailing newline.
 
 ```
 ---
-version: 2
+version: 3
 __PATH__: type=string, example=/tmp/browser-trace-base/2026-07-11-12-00-00-hb-session, session directory path
 ---
 __PATH__
@@ -55,7 +55,7 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	stdout := resp.Stdout
 	if lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n"); len(lines) == 1 {
 		assert.Output(t, stdout, `---
-version: 2
+version: 3
 __PATH__: type=string, example=/tmp/browser-trace-base/2026-07-11-12-00-00-hb-session, session directory path
 ---
 __PATH__

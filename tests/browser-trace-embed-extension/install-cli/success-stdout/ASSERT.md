@@ -6,10 +6,10 @@ it must appear in stdout.
 
 ```
 ---
-version: 2
+version: 3
 __PATH__: type=string, example=/tmp/browser-trace-base/extension/1.2.0, absolute extract path
 ---
-...N lines omitted...
+\.\.\.N lines omitted\.\.\.
 ```
 
 (Strict full-template match is not used here because help copy may include

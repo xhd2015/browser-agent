@@ -45,7 +45,7 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	trimmed := strings.TrimSuffix(resp.Stdout, "\n")
 	if trimmed == "browser-agent" {
 		assert.Output(t, resp.Stdout, `---
-version: 2
+version: 3
 ---
 browser-agent
 `)

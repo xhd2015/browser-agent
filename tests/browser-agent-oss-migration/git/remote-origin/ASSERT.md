@@ -25,17 +25,17 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	if resp.RunErr != "" {
 		t.Fatalf("git remote get-url origin: %s\noutput: %s", resp.RunErr, resp.Stdout)
 	}
+	// Run normalizes by stripping a trailing ".git"; accept common shapes.
 	allowed := map[string]bool{
-		"https://github.com/xhd2015/browser-agent":       true,
-		"ssh://git@github.com/xhd2015/browser-agent":     true,
-		"git@github.com:xhd2015/browser-agent.git":       true,
+		"https://github.com/xhd2015/browser-agent":     true,
+		"ssh://git@github.com/xhd2015/browser-agent":   true,
+		"git@github.com:xhd2015/browser-agent":         true,
+		"https://github.com/xhd2015/browser-agent.git": true,
+		"ssh://git@github.com/xhd2015/browser-agent.git": true,
+		"git@github.com:xhd2015/browser-agent.git":     true,
 	}
 	if !allowed[resp.RemoteURL] {
-		t.Fatalf("origin URL = %q, want one of %v", resp.RemoteURL, []string{
-			"https://github.com/xhd2015/browser-agent",
-			"ssh://git@github.com/xhd2015/browser-agent",
-			"git@github.com:xhd2015/browser-agent.git",
-		})
+		t.Fatalf("origin URL = %q, want github.com/xhd2015/browser-agent (https/ssh)", resp.RemoteURL)
 	}
 }
 ```

@@ -5,7 +5,7 @@ Exact banner lines may vary; path must appear and final byte must be `\n`.
 
 ```
 ---
-version: 2
+version: 3
 __PATH__: type=string, example=/tmp/browser-trace-base/2026-07-11-12-00-00-abc, session directory path
 ---
 __PATH__

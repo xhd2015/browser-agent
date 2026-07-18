@@ -60,14 +60,24 @@ jobs:
           REAL_GO="$(command -v go)"
           WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
           mkdir -p "$WRAP_DIR"
-          # Write wrapper without YAML indent so shebang is valid.
+          # Serialize ALL go invocations (not only tidy). Concurrent
+          # `go mod tidy` + mapping-gen still races if only tidy is locked.
           printf '%s\n' \
             '#!/bin/sh' \
-            "if [ \"\$1\" = \"mod\" ] && [ \"\$2\" = \"tidy\" ]; then" \
-            "  exec flock \"${WRAP_DIR}/tidy.lock\" \"${REAL_GO}\" \"\$@\"" \
-            'fi' \
-            "exec \"${REAL_GO}\" \"\$@\"" \
+            "exec flock \"${WRAP_DIR}/go.lock\" \"${REAL_GO}\" \"\$@\"" \
             >"$WRAP_DIR/go"
           chmod +x "$WRAP_DIR/go"
           export PATH="$WRAP_DIR:$PATH"
-          doctest test -v --label-all ./...
+          # Prefer sequential suite runs so mapping-gen go.mod is not rewritten
+          # by multiple tree generators at once.
+          set -e
+          failed=0
+          while IFS= read -r doc; do
+            suite="$(dirname "$doc")"
+            echo "==> doctest $suite"
+            if ! doctest test -v --label-all "$suite"; then
+              echo "FAILED: $suite"
+              failed=1
+            fi
+          done < <(find tests -name DOCTEST.md -print | sort)
+          exit "$failed"

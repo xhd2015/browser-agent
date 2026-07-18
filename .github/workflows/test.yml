@@ -70,14 +70,15 @@ jobs:
           export PATH="$WRAP_DIR:$PATH"
           # Prefer sequential suite runs so mapping-gen go.mod is not rewritten
           # by multiple tree generators at once.
-          set -e
           failed=0
+          find tests -name DOCTEST.md -print | sort >"$WRAP_DIR/suites.list"
           while IFS= read -r doc; do
+            [ -n "$doc" ] || continue
             suite="$(dirname "$doc")"
             echo "==> doctest $suite"
             if ! doctest test -v --label-all "$suite"; then
               echo "FAILED: $suite"
               failed=1
             fi
-          done < <(find tests -name DOCTEST.md -print | sort)
+          done <"$WRAP_DIR/suites.list"
           exit "$failed"

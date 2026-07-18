@@ -44,6 +44,22 @@ jobs:
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
       - name: Prefetch modules (reduce concurrent go mod tidy races)
-        run: go mod download
+        run: |
+          go mod download
+          # Warm the module graph once so concurrent suite tidies are less likely
+          # to rewrite go.mod mid-flight.
+          go mod tidy
       - name: Doctest
-        run: doctest test -v --label-all ./...
+        # Concurrent mapping-gen go mod tidy can race ("existing contents have changed").
+        # Retry once — second pass almost always passes when modules are already cached.
+        run: |
+          set +e
+          doctest test -v --label-all ./...
+          code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "doctest first pass exit=$code; retrying once after go mod tidy..."
+            go mod tidy
+            doctest test -v --label-all ./...
+            code=$?
+          fi
+          exit "$code"

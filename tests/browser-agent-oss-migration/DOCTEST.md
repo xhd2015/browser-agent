@@ -315,8 +315,11 @@ func runGit(t *testing.T, req *Request, resp *Response) (*Response, error) {
 	if req.Leaf != LeafRemoteOrigin {
 		return nil, fmt.Errorf("unknown git leaf %q", req.Leaf)
 	}
+	// Doctest mapping-gen copies the tree without .git; prefer a real git root
+	// (GITHUB_WORKSPACE on Actions, or walk up / rev-parse from RepoRoot).
+	dir := resolveGitWorkTree(req.RepoRoot)
 	cmd := exec.Command("git", "remote", "get-url", "origin")
-	cmd.Dir = req.RepoRoot
+	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	resp.Stdout = text
@@ -327,8 +330,36 @@ func runGit(t *testing.T, req *Request, resp *Response) (*Response, error) {
 		}
 		return resp, nil
 	}
-	resp.RemoteURL = text
+	// Normalize common URL shapes for exact assert map (strip trailing .git).
+	resp.RemoteURL = strings.TrimSuffix(text, ".git")
 	return resp, nil
+}
+
+func resolveGitWorkTree(start string) string {
+	if ws := strings.TrimSpace(os.Getenv("GITHUB_WORKSPACE")); ws != "" {
+		if _, err := os.Stat(filepath.Join(ws, ".git")); err == nil {
+			return ws
+		}
+	}
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = start
+	if out, err := cmd.Output(); err == nil {
+		if root := strings.TrimSpace(string(out)); root != "" {
+			return root
+		}
+	}
+	dir := start
+	for i := 0; i < 12; i++ {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return start
 }
 
 func runGoCommand(t *testing.T, dir string, args []string, resp *Response) (*Response, error) {

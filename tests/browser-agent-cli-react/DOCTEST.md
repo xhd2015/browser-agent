@@ -688,7 +688,9 @@ func runExtensionExtract(t *testing.T, req *Request) (*Response, error) {
 			return resp, err
 		}
 		resp.ExitCode = 0
-		if p, v, e := browseragent.ExtractEmbeddedExtension(req.BaseDir); e == nil {
+		// InstallChromeExtension uses the canonical managed-chrome layout under
+		// $HOME (baseDir is ignored); InstallPath must match that path for asserts.
+		if p, v, e := browseragent.EnsureCanonicalExtension(); e == nil {
 			resp.InstallPath = p
 			resp.Version = v
 			resp.ManifestPath = filepath.Join(p, "manifest.json")

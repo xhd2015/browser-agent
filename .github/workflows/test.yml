@@ -14,6 +14,9 @@ jobs:
       HOME: ${{ github.workspace }}/.ci-home
     steps:
       - uses: actions/checkout@v4
+      - name: Configure git for container checkout
+        run: |
+          git config --global --add safe.directory '*'
       - name: Stage complete embeds from fixtures (go:embed)
         run: |
           # tracked tree only has placeholder.txt; stage complete mini fixtures so
@@ -21,6 +24,13 @@ jobs:
           mkdir -p "${HOME}" browseragent/embedded/extension browseragent/embedded/session-page
           cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
           cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
+          # browser-trace has its own //go:embed tree (separate from browseragent).
+          mkdir -p browsertrace/embedded/extension
+          if [ -d tests/browser-trace-embed-extension/testdata/mini-extension ]; then
+            cp -a tests/browser-trace-embed-extension/testdata/mini-extension/. browsertrace/embedded/extension/
+          else
+            cp -a browseragent/fixtures/extension/. browsertrace/embedded/extension/
+          fi
           mkdir -p har-viewer/project-api-capture-react/dist
           printf '%s\n' '<!doctype html><title>placeholder</title>' > har-viewer/project-api-capture-react/dist/index.html
       - name: Go test
@@ -31,5 +41,7 @@ jobs:
           if ! command -v doctest >/dev/null 2>&1; then
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
+      - name: Prefetch modules (reduce concurrent go mod tidy races)
+        run: go mod download
       - name: Doctest
         run: doctest test -v --label-all ./...

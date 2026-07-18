@@ -442,8 +442,10 @@ func cliInfo(args []string, env map[string]string, stdout, stderr io.Writer) err
 		return err
 	}
 	out := buf.String()
-	// Human session info assert.Output template has no trailing newline on the pattern.
-	out = strings.TrimSuffix(out, "\n")
+	// CLI human output must end with a trailing newline (shell prompt safety).
+	if out != "" && !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
 	_, err = io.WriteString(stdout, out)
 	return err
 }

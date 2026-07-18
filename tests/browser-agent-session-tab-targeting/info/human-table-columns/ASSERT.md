@@ -63,6 +63,7 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	}
 
 	// Compact human path must render full enriched table + footer (not tabs[0] only).
+	// Pattern ends with \n to match CLI human output trailing-newline policy.
 	assert.Output(t, resp.Stdout, `---
 version: 3
 ---
@@ -72,6 +73,7 @@ version: 3
   2    222       \*       user          Example Domain
 Job target  idx 2 / tab 222  \(active in session window\)
 Recommended: browser-agent session eval --tab-id 222 '\.\.\.'
-Keep the session page \(/go\?session=…\) open — navigating it away disconnects the extension\.`)
+Keep the session page \(/go\?session=…\) open — navigating it away disconnects the extension\.
+`)
 }
 ```

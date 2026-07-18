@@ -60,13 +60,14 @@ jobs:
           REAL_GO="$(command -v go)"
           WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
           mkdir -p "$WRAP_DIR"
-          cat >"$WRAP_DIR/go" <<EOF
-          #!/bin/sh
-          if [ "\$1" = "mod" ] && [ "\$2" = "tidy" ]; then
-            exec flock "${WRAP_DIR}/tidy.lock" "$REAL_GO" "\$@"
-          fi
-          exec "$REAL_GO" "\$@"
-          EOF
+          # Write wrapper without YAML indent so shebang is valid.
+          printf '%s\n' \
+            '#!/bin/sh' \
+            "if [ \"\$1\" = \"mod\" ] && [ \"\$2\" = \"tidy\" ]; then" \
+            "  exec flock \"${WRAP_DIR}/tidy.lock\" \"${REAL_GO}\" \"\$@\"" \
+            'fi' \
+            "exec \"${REAL_GO}\" \"\$@\"" \
+            >"$WRAP_DIR/go"
           chmod +x "$WRAP_DIR/go"
           export PATH="$WRAP_DIR:$PATH"
           doctest test -v --label-all ./...

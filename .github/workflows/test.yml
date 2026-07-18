@@ -43,23 +43,30 @@ jobs:
           if ! command -v doctest >/dev/null 2>&1; then
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
-      - name: Prefetch modules (reduce concurrent go mod tidy races)
+      - name: Ensure flock available
+        run: |
+          if ! command -v flock >/dev/null 2>&1; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends util-linux
+          fi
+      - name: Prefetch modules
         run: |
           go mod download
-          # Warm the module graph once so concurrent suite tidies are less likely
-          # to rewrite go.mod mid-flight.
           go mod tidy
       - name: Doctest
-        # Concurrent mapping-gen go mod tidy can race ("existing contents have changed").
-        # Retry once — second pass almost always passes when modules are already cached.
+        # doctest mapping-gen shares one go.mod across suites; concurrent
+        # `go mod tidy` races with "existing contents have changed since last read".
+        # Serialize tidy via a PATH wrapper around the real go binary.
         run: |
-          set +e
-          doctest test -v --label-all ./...
-          code=$?
-          if [ "$code" -ne 0 ]; then
-            echo "doctest first pass exit=$code; retrying once after go mod tidy..."
-            go mod tidy
-            doctest test -v --label-all ./...
-            code=$?
+          REAL_GO="$(command -v go)"
+          WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
+          mkdir -p "$WRAP_DIR"
+          cat >"$WRAP_DIR/go" <<EOF
+          #!/bin/sh
+          if [ "\$1" = "mod" ] && [ "\$2" = "tidy" ]; then
+            exec flock "${WRAP_DIR}/tidy.lock" "$REAL_GO" "\$@"
           fi
-          exit "$code"
+          exec "$REAL_GO" "\$@"
+          EOF
+          chmod +x "$WRAP_DIR/go"
+          export PATH="$WRAP_DIR:$PATH"
+          doctest test -v --label-all ./...

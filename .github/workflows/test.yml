@@ -7,23 +7,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container:
-      image: golang:1.25.0
-    env:
-      GOFLAGS: -buildvcs=false
-      HOME: ${{ github.workspace }}/.ci-home
     steps:
       - uses: actions/checkout@v4
-      - name: Configure git for container checkout
-        run: |
-          # HOME is remapped to workspace/.ci-home; create it before git config.
-          mkdir -p "${HOME}"
-          git config --global --add safe.directory '*'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: Stage complete embeds from fixtures (go:embed)
         run: |
           # tracked tree only has placeholder.txt; stage complete mini fixtures so
           # control server / go:embed paths work in CI without npm or network hydrate.
-          mkdir -p "${HOME}" browseragent/embedded/extension browseragent/embedded/session-page
+          mkdir -p browseragent/embedded/extension browseragent/embedded/session-page
           cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
           cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
           # browser-trace has its own //go:embed tree (separate from browseragent).
@@ -43,33 +36,23 @@ jobs:
           if ! command -v doctest >/dev/null 2>&1; then
             go install github.com/xhd2015/doctest/cmd/doctest@latest
           fi
-      - name: Ensure flock available
-        run: |
-          if ! command -v flock >/dev/null 2>&1; then
-            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends util-linux
-          fi
       - name: Prefetch modules
         run: |
           go mod download
           go mod tidy
       - name: Doctest
-        # doctest mapping-gen shares one go.mod across suites; concurrent
-        # `go mod tidy` races with "existing contents have changed since last read".
-        # Serialize tidy via a PATH wrapper around the real go binary.
+        # mapping-gen shares one go.mod across suites; concurrent go mod tidy can
+        # race. Serialize go via flock and run each DOCTEST.md suite sequentially.
         run: |
           REAL_GO="$(command -v go)"
           WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
           mkdir -p "$WRAP_DIR"
-          # Serialize ALL go invocations (not only tidy). Concurrent
-          # `go mod tidy` + mapping-gen still races if only tidy is locked.
           printf '%s\n' \
             '#!/bin/sh' \
             "exec flock \"${WRAP_DIR}/go.lock\" \"${REAL_GO}\" \"\$@\"" \
             >"$WRAP_DIR/go"
           chmod +x "$WRAP_DIR/go"
           export PATH="$WRAP_DIR:$PATH"
-          # Prefer sequential suite runs so mapping-gen go.mod is not rewritten
-          # by multiple tree generators at once.
           failed=0
           find tests -name DOCTEST.md -print | sort >"$WRAP_DIR/suites.list"
           while IFS= read -r doc; do

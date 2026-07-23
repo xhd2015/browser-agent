@@ -1,8 +1,7 @@
 ## Expected
 
 - `SessionNew` succeeds.
-- Stdout mentions `open-managed-chrome` (not bare `open-chrome` command).
-- Stdout contains session id in context of managed hint line.
+- Stdout does not mention `open-managed-chrome`.
 
 ## Side Effects
 
@@ -10,7 +9,7 @@
 
 ## Errors
 
-- Missing managed hint fails.
+- A managed-profile suggestion fails the test.
 
 ## Exit Code
 
@@ -29,7 +28,6 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	if resp.SessionNewErr != "" {
 		t.Fatalf("SessionNew error: %s", resp.SessionNewErr)
 	}
-	assertContainsFold(t, resp.Stdout, "open-managed-chrome", req.SessionID)
-	assertNotContainsFold(t, resp.Stdout, "browser-agent open-chrome")
+	assertNotContainsFold(t, resp.Stdout, "open-managed-chrome")
 }
 ```

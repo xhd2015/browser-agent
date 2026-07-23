@@ -11,7 +11,8 @@ description: >-
 
 Drive **browser-agent** (control **127.0.0.1:43761**): **`session new` once** → keep session page → side commands with the **same** `--session-id`.
 
-Requires: `browser-agent` on PATH; extension connected to the session page.
+Do not run `open-managed-chrome` unless the user explicitly asks for a separate managed Chrome profile. It creates a new Chrome profile/window and is not part of the normal session workflow.
+
 
 ## Flow
 
@@ -103,4 +104,3 @@ browser-agent session screenshot --session-id sess-xqbsmo --tab-id 216774025 -o 
 
 Page-scoped methods (`Runtime.*`, `Page.*`, DOM/CSS/Network as needed) OK.  
 **Target.*** is a limited polyfill — use **create-tab** / **info**, not a full multi-target CDP graph.
-

@@ -73,7 +73,7 @@ browser-agent-extension-install-workflow
 │   ├── system-chrome-no-user-data-dir/       LaunchFn: --new-window + URL; NO user-data-dir/load-extension
 │   ├── extracts-before-open/                   canonical dir exists after SessionNew
 │   ├── stdout-extension-block/               path + install-chrome-extension + Chrome 137
-│   ├── stdout-open-managed-hint/             mentions open-managed-chrome (optional Next line)
+│   ├── stdout-no-managed-hint/               does not suggest opening a managed profile
 │   ├── no-open-chrome-skips-launch/          NoOpenChrome → LaunchFn 0; path still extracted
 │   └── pretty-output-still-has-recipes/      session info/eval/run markers preserved
 ├── open-managed-chrome/                    [renamed command]
@@ -108,7 +108,7 @@ browser-agent-extension-install-workflow
 | `session-new/system-chrome-no-user-data-dir` | `LaunchFn` argv: `--new-window` + URL; no `--user-data-dir` / `--load-extension` |
 | `session-new/extracts-before-open` | Canonical extension dir exists on disk after `SessionNew` |
 | `session-new/stdout-extension-block` | Stdout: canonical path + `install-chrome-extension` + Chrome 137 note |
-| `session-new/stdout-open-managed-hint` | Stdout Next mentions `open-managed-chrome` |
+| `session-new/stdout-no-managed-hint` | Stdout does not suggest `open-managed-chrome` |
 | `session-new/no-open-chrome-skips-launch` | `NoOpenChrome` → `LaunchFn` 0; canonical path still extracted |
 | `session-new/pretty-output-still-has-recipes` | Stdout still has session info/eval/run recipe lines |
 | `open-managed-chrome/cli-dispatch-ok` | `HandleCLI ["open-managed-chrome"]` exit 0 |
@@ -207,7 +207,7 @@ const (
 	SessionNewOpSystemChromeNoUserDataDir   = "system-chrome-no-user-data-dir"
 	SessionNewOpExtractsBeforeOpen          = "extracts-before-open"
 	SessionNewOpStdoutExtensionBlock        = "stdout-extension-block"
-	SessionNewOpStdoutOpenManagedHint       = "stdout-open-managed-hint"
+	SessionNewOpStdoutNoManagedHint         = "stdout-no-managed-hint"
 	SessionNewOpNoOpenChromeSkipsLaunch     = "no-open-chrome-skips-launch"
 	SessionNewOpPrettyOutputStillHasRecipes = "pretty-output-still-has-recipes"
 )

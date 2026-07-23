@@ -479,7 +479,6 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		fmt.Sprintf("  browser-agent session logs --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session screenshot --session-id %s -o out.png", result.SessionID),
 		fmt.Sprintf("  browser-agent session cdp --session-id %s Page.navigate '{\"url\":\"https://example.com\"}'", result.SessionID),
-		fmt.Sprintf("  browser-agent open-managed-chrome '%s'", result.SessionURL),
 		"",
 	}
 	for _, line := range lines {

@@ -31,7 +31,7 @@ Operator -> session info (human table + --json job_target)
 - Spec version **0.0.2**.
 - No `openChrome` — sessions created only via `POST /v1/sessions`.
 - Fake extension dials `/v1/ws?session=<id>` for CLI/info leaves.
-- E2e ASSERT frontmatter: `slow, ui-automation`.
+- E2e ASSERT frontmatter: `e2e, slow, ui-automation`.
 
 ```go
 import (
@@ -41,9 +41,9 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	if req.ReadyTimeout == 0 {
 		req.ReadyTimeout = 10 * time.Second
 	}

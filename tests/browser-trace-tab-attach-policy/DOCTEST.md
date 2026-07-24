@@ -208,7 +208,7 @@ type Response struct {
 }
 
 // Run invokes both pure helpers. No I/O, no Chrome.
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	// URL may be empty; that is intentional for reject/empty.
 	capturable := browsertrace.IsCapturableTabURL(req.URL)

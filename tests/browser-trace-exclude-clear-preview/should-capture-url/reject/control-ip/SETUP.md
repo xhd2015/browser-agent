@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Default control-IP root; with-path leaf overrides full URL.
 	req.CaptureURL = "http://127.0.0.1:43759/"

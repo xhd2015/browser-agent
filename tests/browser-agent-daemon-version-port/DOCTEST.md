@@ -357,7 +357,7 @@ type Response struct {
 	ResolveBaseURL string
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
@@ -548,8 +548,16 @@ func runPortMode(t *testing.T, req *Request) (*Response, error) {
 			WaitTimeout: req.ReadyTimeout,
 			SpawnFn: func() error {
 				spawnCalled = true
-				picked := browseragent.DefaultAddr
-				spawnAddr = picked
+				// EnsureDaemon resolves empty Addr to DefaultAddr (product contract).
+				// Record that resolved intent; bind an ephemeral port so the leaf is
+				// not flaky when 43761 is already taken on the host.
+				spawnAddr = browseragent.DefaultAddr
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					return err
+				}
+				picked := ln.Addr().String()
+				_ = ln.Close()
 				ctx := context.Background()
 				go func() {
 					_, _ = browseragent.RunDaemon(ctx, browseragent.DaemonConfig{

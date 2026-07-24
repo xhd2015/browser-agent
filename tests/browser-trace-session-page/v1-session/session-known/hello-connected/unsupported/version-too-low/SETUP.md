@@ -30,7 +30,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.HelloVersion = "1.1.0"
 	req.HelloFeatures = []string{"browser-trace", "multi-tab-window"}

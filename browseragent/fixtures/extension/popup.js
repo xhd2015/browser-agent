@@ -1,5 +1,6 @@
 // MV3 popup: no inline scripts allowed (CSP script-src 'self').
 // bundle-sum.js must load first (see popup.html).
+// "reachable" = HTTP /v1/health only — not the same as session WebSocket attach.
 (function () {
   var verEl = document.getElementById("pkg-version");
   var md5El = document.getElementById("pkg-md5");
@@ -25,12 +26,12 @@
       statusEl.textContent = "reachable";
       statusEl.className = "ok";
       hintEl.textContent =
-        "Serve is up. Keep a session page open so this extension can attach via WebSocket.";
+        "Control server is up (HTTP). Session attach is separate: keep a /go?session= page open so the service worker can connect via WebSocket.";
     })
     .catch(function () {
       statusEl.textContent = "unreachable";
       statusEl.className = "warn";
       hintEl.textContent =
-        "Start browser-agent serve, then open the session page.";
+        "Start browser-agent serve (or session new), then open the session page.";
     });
 })();

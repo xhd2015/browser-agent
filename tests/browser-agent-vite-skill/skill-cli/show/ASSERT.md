@@ -6,7 +6,7 @@ Requirement **C2** (nested session skill docs):
 - Stdout is skill body (non-empty).
 - Stdout contains:
   - `browser-agent`
-  - `BROWSER_AGENT_SESSION_ID`
+  - `session-id` (session identity / `--session-id` workflow)
   - `session` (nested side-command parent)
   - `eval` (side command)
   - `43761` (control port)
@@ -30,7 +30,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	assertExitZero(t, resp)
 	assertCLINilErr(t, resp)
@@ -38,7 +38,7 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	body := resp.Stdout
 	for _, needle := range []string{
 		"browser-agent",
-		"BROWSER_AGENT_SESSION_ID",
+		"session-id",
 		"eval",
 		"43761",
 	} {

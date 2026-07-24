@@ -47,10 +47,38 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/xhd2015/browser-agent/browseragent"
 )
+
+// setenvHOME isolates HOME for the rest of the leaf under processEnvMu.
+// Restore on defer. Hold covers EnsureCanonical (does not re-lock).
+func setenvHOME(home string) (restore func()) {
+	if home == "" {
+		return func() {}
+	}
+	browseragent.LockProcessEnv()
+	old, ok := os.LookupEnv("HOME")
+	_ = os.Setenv("HOME", home)
+	browseragent.UnlockProcessEnv()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			browseragent.LockProcessEnv()
+			if !ok {
+				_ = os.Unsetenv("HOME")
+			} else {
+				_ = os.Setenv("HOME", old)
+			}
+			browseragent.UnlockProcessEnv()
+		})
+	}
+}
+
+
+
 
 const (
 	CanonicalPathOpExtractsUnderBrowserAgent = "extracts-under-browser-agent"
@@ -72,7 +100,7 @@ type Response struct {
 	CanonicalExtensionsDir string
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req == nil {
 		t.Fatal("req is nil")
@@ -80,18 +108,9 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 	if req.CanonicalPathOp == "" {
 		t.Fatal("CanonicalPathOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
-	}
-
 	resp := &Response{}
-	layout, err := browseragent.DefaultExtensionInstallLayout()
-	if err != nil {
-		return resp, err
-	}
-	resp.CanonicalExtensionsDir = layout.BrowserAgentExtensionsDir
 
-	path1, ver1, err := browseragent.EnsureCanonicalExtension()
+	path1, ver1, err := browseragent.EnsureCanonicalExtensionWithHome(req.TestHome)
 	if err != nil {
 		return resp, err
 	}
@@ -99,11 +118,24 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 	resp.ExtensionVer = ver1
 	resp.ManifestPath = filepath.Join(path1, "manifest.json")
 
+	// Layout for path assertions under the same HOME.
+	err = browseragent.WithProcessEnv(map[string]string{"HOME": req.TestHome}, func() error {
+		layout, e := browseragent.DefaultExtensionInstallLayout()
+		if e != nil {
+			return e
+		}
+		resp.CanonicalExtensionsDir = layout.BrowserAgentExtensionsDir
+		return nil
+	})
+	if err != nil {
+		return resp, err
+	}
+
 	switch req.CanonicalPathOp {
 	case CanonicalPathOpExtractsUnderBrowserAgent:
 		return resp, nil
 	case CanonicalPathOpIdempotentSameVersion:
-		path2, ver2, err2 := browseragent.EnsureCanonicalExtension()
+		path2, ver2, err2 := browseragent.EnsureCanonicalExtensionWithHome(req.TestHome)
 		if err2 != nil {
 			return resp, err2
 		}

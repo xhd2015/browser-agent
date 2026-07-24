@@ -1,16 +1,17 @@
 # Scenario
 
-**Feature**: SessionNew uses managed Chrome instead of legacy openChrome
+**Feature**: SessionNew opens system Chrome (argv shape; no real browser)
 
 ```
-SessionNew -> OpenManagedChrome -> ManagedChromeTestHooks.LaunchFn(argv)
+SessionNew(OpenChromeFn=record, NoWait) -> BuildChromeArgs(url, "") once
 ```
 
 ## Preconditions
 
 - ModeSessionNewIntegration.
 - Ephemeral daemon on loopback `:0`.
-- ManagedChromeTestHooks.LaunchFn injected by Run.
+- `OpenChromeFn` records system-chrome argv (`--new-window` + URL; no user-data-dir).
+- `NoWait` so leaves do not poll 30s for a real extension.
 
 ## Steps
 
@@ -18,14 +19,14 @@ SessionNew -> OpenManagedChrome -> ManagedChromeTestHooks.LaunchFn(argv)
 
 ## Context
 
-- Does not override OpenChromeFn; exercises production managed path.
+- Per-config `OpenChromeFn` (not global `ManagedChromeTestHooks`) — parallel-safe.
 
 ```go
 import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Mode = ModeSessionNewIntegration
 	return nil

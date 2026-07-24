@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	if resp == nil {
 		t.Fatal("resp is nil")
@@ -39,6 +39,13 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	}
 	if !strings.Contains(text, "browser-agent") {
 		t.Fatalf("contentScript must mention browser-agent feature/product; text=%s", truncate(text, 500))
+	}
+	// Session attach: /go?session= page must register with the service worker.
+	if !strings.Contains(text, "register") || !strings.Contains(text, "sendMessage") {
+		t.Fatalf("contentScript must register session via chrome.runtime.sendMessage; text=%s", truncate(text, 600))
+	}
+	if !strings.Contains(text, "session_id") && !strings.Contains(text, "sessionId") {
+		t.Fatalf("contentScript register payload must include session_id; text=%s", truncate(text, 600))
 	}
 }
 ```

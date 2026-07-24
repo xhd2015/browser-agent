@@ -19,10 +19,11 @@ GET /v1/session -> extension_install_path canonical
   `filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))`.
 - Package `browseragent` will export canonical APIs (RED until implemented):
   `DefaultExtensionInstallLayout`, `EnsureCanonicalExtension`.
-- `browseragent/inject` exports `SessionNewTestHooks` + `ManagedChromeTestHooks`.
+- Package SessionNew: `OpenChromeFn` + `NoWait` (parallel-safe config inject).
+- CLI open-managed: `inject.WithManagedChromeHooks` around HandleCLI only.
 - Canonical-path / install leaves set isolated `TestHome` via `t.Setenv("HOME", …)`.
 - Daemon leaves use ephemeral `127.0.0.1:0` + temp `BaseDir`.
-- No real Chrome; `LaunchFn` / `OpenChromeFn` record calls only.
+- No real Chrome; never bare-assign process-global hooks under `t.Parallel()`.
 
 ## Steps
 
@@ -46,9 +47,9 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	dir := t.TempDir()
 	req.BaseDir = filepath.Join(dir, "browser-agent-base")
 	if err := os.MkdirAll(req.BaseDir, 0o755); err != nil {

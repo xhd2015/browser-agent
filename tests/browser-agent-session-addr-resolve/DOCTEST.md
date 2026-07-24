@@ -195,7 +195,7 @@ type Response struct {
 	DispatchTimedOut bool
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Sidecmd == "" {
 		t.Fatal("Sidecmd must be set by grouping/leaf Setup")
@@ -204,7 +204,7 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 		t.Fatal("AddrSource must be set by leaf Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 	if req.CLIEnv == nil {
 		req.CLIEnv = map[string]string{}

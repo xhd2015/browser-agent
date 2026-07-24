@@ -31,7 +31,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Grouping marker: leave URL and wants to reject/allow children.
 	// Reaffirm gates open so this branch isolates URL class.

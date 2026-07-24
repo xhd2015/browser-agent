@@ -116,11 +116,13 @@ func OpenManagedChrome(cfg OpenManagedChromeConfig) (*OpenChromeResult, error) {
 	WarnLoadExtensionIgnored(stderr, extPath)
 
 	launchFn := cfg.LaunchFn
-	if launchFn == nil && inj.ManagedChromeTestHooks != nil && inj.ManagedChromeTestHooks.LaunchFn != nil {
-		launchFn = inj.ManagedChromeTestHooks.LaunchFn
+	if launchFn == nil {
+		launchFn = inj.ManagedChromeLaunchFn()
 	}
 	if launchFn == nil {
-		launchFn = launchChromeWithArgs
+		// Avoid re-entering ManagedChromeLaunchFn via launchChromeWithArgs when
+		// cfg.LaunchFn was intentionally nil and no CLI hooks are installed.
+		launchFn = startChromeProcess
 	}
 	if err := launchFn(args); err != nil {
 		return nil, fmt.Errorf("launch chrome: %w", err)

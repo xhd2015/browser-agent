@@ -85,7 +85,8 @@ browser-agent-active-tab-routing
 ```sh
 doctest vet ./tests/browser-agent-active-tab-routing
 doctest test ./tests/browser-agent-active-tab-routing
-doctest test --label 'slow && ui-automation' ./tests/browser-agent-active-tab-routing/e2e/...
+doctest test --label 'e2e' ./tests/browser-agent-active-tab-routing/e2e/...
+# or: doctest test --label 'slow && ui-automation' ./tests/browser-agent-active-tab-routing/e2e/...
 ```
 
 E2e leaves skip when `playwright-debug` is absent from PATH. **GREEN** expected
@@ -93,6 +94,7 @@ E2e leaves skip when `playwright-debug` is absent from PATH. **GREEN** expected
 
 ```go
 import (
+	"github.com/xhd2015/doctest/session"
 	"bufio"
 	"bytes"
 	"context"
@@ -175,20 +177,20 @@ type Response struct {
 	AssertLines        []PlaywrightAssertLine
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 
 	switch req.Mode {
 	case ModeExtSource:
 		return runExtSource(t, req)
 	case ModeE2E:
-		return runE2E(t, req)
+		return runE2E(t, d, req)
 	default:
 		return nil, fmt.Errorf("unknown Mode %q", req.Mode)
 	}
@@ -220,7 +222,7 @@ func runExtSource(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
-func runE2E(t *testing.T, req *Request) (*Response, error) {
+func runE2E(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	resp := &Response{}
 
@@ -238,7 +240,7 @@ func runE2E(t *testing.T, req *Request) (*Response, error) {
 		t.Fatal("PlaywrightOp must be set by leaf Setup")
 	}
 
-	scriptPath, err := scriptPathForOp(req.PlaywrightOp)
+	scriptPath, err := scriptPathForOp(d, req.PlaywrightOp)
 	if err != nil {
 		return nil, err
 	}
@@ -284,10 +286,10 @@ func runE2E(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func scriptPathForOp(op string) (string, error) {
+func scriptPathForOp(d *session.Doctest, op string) (string, error) {
 	switch op {
 	case PlaywrightOpEvalOnActiveUserTab:
-		return filepath.Join(DOCTEST_ROOT, "e2e", "eval-on-active-user-tab", "testdata", "active-tab-routing.js"), nil
+		return filepath.Join(d.DOCTEST_ROOT, "e2e", "eval-on-active-user-tab", "testdata", "active-tab-routing.js"), nil
 	default:
 		return "", fmt.Errorf("no script mapping for PlaywrightOp %q", op)
 	}

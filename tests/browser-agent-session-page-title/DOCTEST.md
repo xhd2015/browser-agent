@@ -200,7 +200,7 @@ type Request struct {
 	Mode string
 
 	// ModuleRoot is module directory (filesystem leaves).
-	// Root Setup sets from DOCTEST_ROOT/../..
+	// Root Setup sets from d.DOCTEST_ROOT/../..
 	ModuleRoot string
 
 	// BaseDir is temp parent for registry fixtures.
@@ -245,13 +245,13 @@ type Response struct {
 	ErrText      string
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 	switch req.Mode {
 	case ModeGoHTML:

@@ -32,7 +32,7 @@ Extension SW -> WS daemon per session tab on /go?session=id
 - Spec version **0.0.2**.
 - No `openChrome` / `SessionNew` — sessions created only via `POST /v1/sessions`.
 - Playwright scripts print JSON assert lines to stdout for harness parsing.
-- ASSERT frontmatter labels: `slow, ui-automation` (run via `--label 'slow && ui-automation'`).
+- ASSERT frontmatter labels: `e2e, slow, ui-automation` (run via `--label 'e2e'` or `--label 'slow && ui-automation'`; excluded by `--label '!e2e'`).
 
 ```go
 import (
@@ -42,9 +42,9 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	dir := t.TempDir()
 	req.BaseDir = filepath.Join(dir, "browser-agent-e2e")
 	if err := os.MkdirAll(req.BaseDir, 0o755); err != nil {

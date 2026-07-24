@@ -39,10 +39,10 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
-	_ = os.RemoveAll(filepath.Join(DOCTEST_ROOT, "completeness", "session-page", "html-without-js"))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
+	_ = os.RemoveAll(filepath.Join(d.DOCTEST_ROOT, "completeness", "session-page", "html-without-js"))
 	return nil
 }
 

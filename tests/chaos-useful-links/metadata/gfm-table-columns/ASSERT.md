@@ -25,7 +25,7 @@ import (
 	"github.com/xhd2015/browser-agent/script/debug/chaos-useful-links/seedload"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	assertResolveOK(t, resp)
 

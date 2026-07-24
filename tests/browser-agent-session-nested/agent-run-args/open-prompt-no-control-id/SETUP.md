@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.AgentArgsControlID = "ctrl-open-unique-zz9"
 	// Absolute playbook path must NOT include the control id (id is only via --env).

@@ -40,15 +40,44 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/xhd2015/browser-agent/browseragent"
 )
 
-func Setup(t *testing.T, req *Request) error {
+// setenvHOME isolates HOME for the rest of the leaf under processEnvMu.
+// Restore on defer. Hold covers EnsureCanonical (does not re-lock).
+func setenvHOME(home string) (restore func()) {
+	if home == "" {
+		return func() {}
+	}
+	// Set HOME without holding processEnvMu across the leaf (avoids blocking
+	// other daemons). EnsureCanonicalExtension serializes extracts briefly.
+	old, ok := os.LookupEnv("HOME")
+	_ = os.Setenv("HOME", home)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !ok {
+				_ = os.Unsetenv("HOME")
+			} else {
+				_ = os.Setenv("HOME", old)
+			}
+		})
+	}
+}
+
+
+
+
+
+
+
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	dir := t.TempDir()
 	req.BaseDir = filepath.Join(dir, "browser-agent-base")
 	if err := os.MkdirAll(req.BaseDir, 0o755); err != nil {
@@ -58,7 +87,8 @@ func Setup(t *testing.T, req *Request) error {
 	if err := os.MkdirAll(req.TestHome, 0o755); err != nil {
 		return err
 	}
-	t.Setenv("HOME", req.TestHome)
+	// Do not setenv here: Setup returns before Run; HOME isolation must wrap Run.
+	// Leaves/Run apply setenvHOME(req.TestHome) around extract/serve work.
 	if req.ReadyTimeout == 0 {
 		req.ReadyTimeout = 5 * time.Second
 	}

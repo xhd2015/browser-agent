@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	if resp == nil {
 		t.Fatal("resp is nil")
@@ -64,6 +64,11 @@ func Assert(t *testing.T, req *Request, resp *Response, err error) {
 	if hit < 3 && !hasExtraCDP {
 		t.Fatalf("embedded background too thin: job-type hits=%d need≥3 or extra CDP tokens; path=%v snippet=%s",
 			hit, resp.FoundPaths, truncate(src, 600))
+	}
+	// Per-session WS: must open /v1/ws?session= (not only bare /v1/ws).
+	if !strings.Contains(src, "session=") && !strings.Contains(src, "wsURLForSession") {
+		t.Fatalf("embedded background must open WebSocket with session query; path=%v snippet=%s",
+			resp.FoundPaths, truncate(src, 500))
 	}
 }
 ```

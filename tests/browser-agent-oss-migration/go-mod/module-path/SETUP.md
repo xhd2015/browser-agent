@@ -23,7 +23,7 @@ Test Client <- module github.com/xhd2015/browser-agent
 ```go
 import "testing"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Leaf = LeafModulePath
 	return nil

@@ -63,7 +63,8 @@ browser-agent-e2e-playwright
 
 ```sh
 doctest vet ./tests/browser-agent-e2e-playwright
-doctest test --label 'slow && ui-automation' ./tests/browser-agent-e2e-playwright
+doctest test --label 'e2e' ./tests/browser-agent-e2e-playwright
+# or: doctest test --label 'slow && ui-automation' ./tests/browser-agent-e2e-playwright
 doctest test ./tests/browser-agent-daemon-phase8
 ```
 
@@ -83,6 +84,7 @@ Requires `playwright-debug` on PATH and Chromium for Playwright. Leaves are
 
 ```go
 import (
+	"github.com/xhd2015/doctest/session"
 	"bufio"
 	"bytes"
 	"context"
@@ -148,7 +150,7 @@ type Response struct {
 	AssertLines        []PlaywrightAssertLine
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	resp := &Response{}
 
@@ -166,7 +168,7 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 		t.Fatal("PlaywrightOp must be set by leaf Setup")
 	}
 
-	scriptPath, err := scriptPathForOp(req.PlaywrightOp)
+	scriptPath, err := scriptPathForOp(d, req.PlaywrightOp)
 	if err != nil {
 		return nil, err
 	}
@@ -227,14 +229,14 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func scriptPathForOp(op string) (string, error) {
+func scriptPathForOp(d *session.Doctest, op string) (string, error) {
 	switch op {
 	case PlaywrightOpExtensionConnects:
-		return filepath.Join(DOCTEST_ROOT, "single-session", "extension-connects", "testdata", "extension-connects.js"), nil
+		return filepath.Join(d.DOCTEST_ROOT, "single-session", "extension-connects", "testdata", "extension-connects.js"), nil
 	case PlaywrightOpWarningBanner:
-		return filepath.Join(DOCTEST_ROOT, "session-page", "warning-banner-visible", "testdata", "warning-banner.js"), nil
+		return filepath.Join(d.DOCTEST_ROOT, "session-page", "warning-banner-visible", "testdata", "warning-banner.js"), nil
 	case PlaywrightOpTwoWindowsIsolated:
-		return filepath.Join(DOCTEST_ROOT, "multi-session", "two-windows-isolated", "testdata", "two-windows-isolated.js"), nil
+		return filepath.Join(d.DOCTEST_ROOT, "multi-session", "two-windows-isolated", "testdata", "two-windows-isolated.js"), nil
 	default:
 		return "", fmt.Errorf("no script mapping for PlaywrightOp %q", op)
 	}

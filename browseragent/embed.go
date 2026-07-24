@@ -162,11 +162,28 @@ func extractEmbeddedExtensionUnder(baseDir, intermediateDir string) (installPath
 // path and writes user-facing Load unpacked instructions to w. baseDir is ignored
 // (canonical path is always under home). Output ends with a trailing newline.
 func InstallChromeExtension(w io.Writer, baseDir string) error {
+	processEnvMu.Lock()
+	defer processEnvMu.Unlock()
+	return installChromeExtensionBody(w, baseDir)
+}
+
+// InstallChromeExtensionWithHome isolates HOME for the install (parallel-safe).
+func InstallChromeExtensionWithHome(w io.Writer, baseDir, home string) error {
+	env := map[string]string{}
+	if home != "" {
+		env["HOME"] = home
+	}
+	return WithProcessEnv(env, func() error {
+		return installChromeExtensionBody(w, baseDir)
+	})
+}
+
+func installChromeExtensionBody(w io.Writer, baseDir string) error {
 	if w == nil {
 		w = io.Discard
 	}
-	_ = baseDir // canonical layout is independent of daemon --base-dir
-	path, version, err := EnsureCanonicalExtension()
+	_ = baseDir
+	path, version, err := ensureCanonicalExtensionBody()
 	if err != nil {
 		return err
 	}

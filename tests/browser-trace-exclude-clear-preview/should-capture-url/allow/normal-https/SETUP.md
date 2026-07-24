@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.CaptureURL = "https://api.example.com/v1/users?limit=10"
 	return nil

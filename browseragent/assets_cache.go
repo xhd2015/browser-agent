@@ -16,6 +16,13 @@ import (
 //	else:
 //	  filepath.Join(home, ".cache", "browser-agent", "asset-cache")
 func AssetCacheRoot() string {
+	// Do not lock here: callers that isolate env use WithProcessEnv (holds
+	// processEnvMu) and would deadlock. Isolation relies on WithProcessEnv /
+	// EnsureCanonicalExtension holding the mutex around env mutation + use.
+	return assetCacheRootUnlocked()
+}
+
+func assetCacheRootUnlocked() string {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); xdg != "" {
 		return filepath.Join(xdg, "browser-agent", "asset-cache")
 	}
@@ -31,6 +38,10 @@ func AssetCacheRoot() string {
 // Layout: {AssetCacheRoot}/{product}/{version}/{kind}
 func AssetCacheDir(product, version, kind string) string {
 	return filepath.Join(AssetCacheRoot(), strings.TrimSpace(product), normalizeCacheVersion(version), strings.TrimSpace(kind))
+}
+
+func assetCacheDirUnlocked(product, version, kind string) string {
+	return filepath.Join(assetCacheRootUnlocked(), strings.TrimSpace(product), normalizeCacheVersion(version), strings.TrimSpace(kind))
 }
 
 // WriteAssetCache copies src tree into the cache key dir and returns the absolute dir written.
@@ -120,6 +131,15 @@ func OpenAssetCache(product, version, kind string) (fsys fs.FS, dir string, ok b
 // (EmbedCompleteFS rules on DirFS). Missing dir → false.
 func CacheComplete(product, version, kind string) bool {
 	dir := AssetCacheDir(product, version, kind)
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return false
+	}
+	return EmbedCompleteFS(os.DirFS(dir), strings.TrimSpace(kind))
+}
+
+func cacheCompleteUnlocked(product, version, kind string) bool {
+	dir := assetCacheDirUnlocked(product, version, kind)
 	st, err := os.Stat(dir)
 	if err != nil || !st.IsDir() {
 		return false

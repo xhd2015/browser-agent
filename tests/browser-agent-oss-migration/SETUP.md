@@ -32,9 +32,9 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.RepoRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.RepoRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	return nil
 }
 

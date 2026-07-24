@@ -144,6 +144,7 @@ release scripts (P7).
 
 ```go
 import (
+	"github.com/xhd2015/doctest/session"
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
@@ -156,6 +157,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -252,29 +254,29 @@ type Response struct {
 	ExitCode int
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 	switch req.Mode {
 	case ModeCompleteness:
-		return runCompleteness(t, req)
+		return runCompleteness(t, d, req)
 	case ModeDownload:
-		return runDownload(t, req)
+		return runDownload(t, d, req)
 	case ModeCLI:
-		return runCLI(t, req)
+		return runCLI(t, d, req)
 	default:
 		return nil, fmt.Errorf("unknown Mode %q", req.Mode)
 	}
 }
 
-func runCompleteness(t *testing.T, req *Request) (*Response, error) {
+func runCompleteness(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
-	fsys, root, err := openFixtureFS(t, req.FixtureName)
+	fsys, root, err := openFixtureFS(t, d, req.FixtureName)
 	if err != nil {
 		return nil, err
 	}
@@ -289,14 +291,12 @@ func runCompleteness(t *testing.T, req *Request) (*Response, error) {
 	}, nil
 }
 
-func runDownload(t *testing.T, req *Request) (*Response, error) {
+func runDownload(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.DownloadOp == "" {
 		t.Fatal("DownloadOp must be set by leaf Setup")
 	}
-	if req.XDGCacheHome != "" {
-		t.Setenv(EnvXDGCacheHome, req.XDGCacheHome)
-	}
+	// Do not t.Setenv: workspace leaves run under t.Parallel().
 
 	product := req.DownloadProduct
 	if product == "" {
@@ -315,7 +315,7 @@ func runDownload(t *testing.T, req *Request) (*Response, error) {
 		fixture = FixtureExtensionComplete
 	}
 
-	tarBytes, err := buildFixtureTarGZ(t, fixture)
+	tarBytes, err := buildFixtureTarGZ(t, d, fixture)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +349,21 @@ func runDownload(t *testing.T, req *Request) (*Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	dir, err1 := browseragent.EnsureAsset(ctx, product, version, kind, cfg)
+	env := map[string]string{}
+	if req.XDGCacheHome != "" {
+		env[EnvXDGCacheHome] = req.XDGCacheHome
+	}
+
+	var (
+		dir  string
+		err1 error
+	)
+	if err := withProcessEnv(env, func() error {
+		dir, err1 = browseragent.EnsureAsset(ctx, product, version, kind, cfg)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 	resp := &Response{
 		EnsureDir:          dir,
 		EnsureErr:          err1,
@@ -361,10 +375,17 @@ func runDownload(t *testing.T, req *Request) (*Response, error) {
 	if v, ok := lastPath.Load().(string); ok {
 		resp.LastRequestPath = v
 	}
+	// Re-evaluate completeness under the same isolated XDG when set.
+	if req.XDGCacheHome != "" {
+		_ = withProcessEnv(env, func() error {
+			resp.CacheCompleteAfter = browseragent.CacheComplete(product, version, kind)
+			return nil
+		})
+	}
 	return resp, nil
 }
 
-func runCLI(t *testing.T, req *Request) (*Response, error) {
+func runCLI(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.CLIOp == "" {
 		t.Fatal("CLIOp must be set by leaf Setup")
@@ -379,11 +400,10 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 	}
 	if req.XDGCacheHome != "" {
 		env[EnvXDGCacheHome] = req.XDGCacheHome
-		t.Setenv(EnvXDGCacheHome, req.XDGCacheHome)
 	}
 
 	if req.CLIServeExtensionTar {
-		extTar, err := buildFixtureTarGZ(t, FixtureExtensionComplete)
+		extTar, err := buildFixtureTarGZ(t, d, FixtureExtensionComplete)
 		if err != nil {
 			return nil, err
 		}
@@ -406,10 +426,10 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 		t.Cleanup(srv.Close)
 		base := strings.TrimRight(srv.URL, "/") + "/releases/download"
 		env[EnvBrowserAgentAssetBase] = base
-		t.Setenv(EnvBrowserAgentAssetBase, base)
 	}
 
 	var stdout, stderr bytes.Buffer
+	// HandleCLI applies env under browseragent.WithProcessEnv (do not nest-lock here).
 	cliErr := browsertrace.HandleCLI(req.CLIArgs, env, &stdout, &stderr)
 
 	resp := &Response{
@@ -428,11 +448,20 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 			ver = v
 		}
 	}
-	resp.CacheCompleteExt = browseragent.CacheComplete(ProductBrowserTrace, ver, KindExtension)
+	// CacheComplete reads XDG_CACHE_HOME from the process; evaluate under isolation.
+	_ = withProcessEnv(env, func() error {
+		resp.CacheCompleteExt = browseragent.CacheComplete(ProductBrowserTrace, ver, KindExtension)
+		return nil
+	})
 	return resp, nil
 }
 
-func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
+// withProcessEnv delegates to browseragent.WithProcessEnv (process-wide lock).
+func withProcessEnv(env map[string]string, fn func() error) error {
+	return browseragent.WithProcessEnv(env, fn)
+}
+
+func openFixtureFS(t *testing.T, d *session.Doctest, fixtureName string) (fs.FS, string, error) {
 	t.Helper()
 	if fixtureName == "" {
 		return nil, "", fmt.Errorf("fixture name is required")
@@ -441,7 +470,7 @@ func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
 		dir := t.TempDir()
 		return os.DirFS(dir), dir, nil
 	}
-	root := filepath.Join(DOCTEST_ROOT, "testdata", fixtureName)
+	root := filepath.Join(d.DOCTEST_ROOT, "testdata", fixtureName)
 	st, err := os.Stat(root)
 	if err != nil {
 		return nil, "", fmt.Errorf("fixture %q: %w", fixtureName, err)
@@ -452,9 +481,9 @@ func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
 	return os.DirFS(root), root, nil
 }
 
-func buildFixtureTarGZ(t *testing.T, fixtureName string) ([]byte, error) {
+func buildFixtureTarGZ(t *testing.T, d *session.Doctest, fixtureName string) ([]byte, error) {
 	t.Helper()
-	root := filepath.Join(DOCTEST_ROOT, "testdata", fixtureName)
+	root := filepath.Join(d.DOCTEST_ROOT, "testdata", fixtureName)
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)

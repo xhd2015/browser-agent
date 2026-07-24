@@ -13,7 +13,8 @@ Test Client -> OpenManagedChrome({LaunchFn}) -> record argv (no real Chrome)
 Operator -> HandleCLI(open-chrome [--root] [url]) -> pretty stdout + LaunchFn
 
 # Session new integration
-SessionNew -> OpenManagedChrome({URL}) -> ManagedChromeTestHooks.LaunchFn
+SessionNew -> OpenChromeFn(record) + NoWait  # package API, parallel-safe
+HandleCLI open-managed-chrome -> WithManagedChromeHooks(LaunchFn)  # CLI only
 ```
 
 ## Preconditions
@@ -24,9 +25,10 @@ SessionNew -> OpenManagedChrome({URL}) -> ManagedChromeTestHooks.LaunchFn
 - Package `browseragent` exports managed chrome APIs (TDD red until implemented):
   `DefaultManagedChromeLayout`, `LayoutFromRoot`, `EnsureManagedExtension`,
   `BuildManagedChromeArgs`, `OpenManagedChrome`, `OpenChromeResult`.
-- `browseragent/inject` exports `ManagedChromeHooks` + `ManagedChromeTestHooks`.
+- Package API: inject `cfg.LaunchFn` / `SessionNewConfig.OpenChromeFn` (not bare globals).
+- CLI: `inject.WithManagedChromeHooks` for the HandleCLI critical section only.
 - Each leaf uses isolated temp dirs for custom `--root`; default-root uses real home.
-- No real Chrome; `LaunchFn` always injected in open/session leaves.
+- No real Chrome; SessionNew leaves use `NoWait` (no extension poll).
 - `install-chrome-extension` command remains unchanged (not under test here).
 
 ## Steps
@@ -52,9 +54,9 @@ import (
 	"github.com/xhd2015/browser-agent/browseragent"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	dir := t.TempDir()
 	req.ManagedRoot = filepath.Join(dir, "managed-chrome")
 	req.BaseDir = filepath.Join(dir, "browser-agent-sessions")

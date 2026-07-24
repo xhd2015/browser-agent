@@ -63,7 +63,8 @@ browser-agent-daemon-phase8
 │   ├── skip-open-chrome/                    NoOpenChrome → OpenChrome 0; stdout markers
 │   ├── duplicate-409/                       second same id → error / 409
 │   ├── auto-generate-id/                    omit id → ^sess-[a-z0-9]{6}$
-│   └── pretty-output-markers/               stdout session/export/inspect hints
+│   ├── pretty-output-markers/               stdout session/export/inspect hints
+│   └── wait-timeout-progress/               stdout instructions then stderr wait/timeout
 └── cli-dispatch/                        [HandleCLI session new]
     └── session-new-subcommand/            CLI creates session + stdout markers
 ```
@@ -86,6 +87,7 @@ browser-agent-daemon-phase8
 | `session-new/duplicate-409` | Second `SessionNew` same id → duplicate error |
 | `session-new/auto-generate-id` | Omitted id → generated `sess-` + 6 alnum; session on server |
 | `session-new/pretty-output-markers` | Stdout has session id, export hint, nested session recipes |
+| `session-new/wait-timeout-progress` | Stdout instructions first; stderr Waiting… + soft timeout warning |
 | `cli-dispatch/session-new-subcommand` | `HandleCLI session new` exit 0; session registered |
 
 **Leaf count: 8**
@@ -111,7 +113,7 @@ OpenChromeFn, AgentRunProbeFn, Stdout, Stderr}`; when `NoOpenChrome` skip
 `OpenChromeFn`; never invokes agent-run; pretty stdout.
 
 **CLI** — `HandleCLI session new [--session-id] [--base-dir] [--addr]`; optional
-`SessionNewTestHooks` for test injection when hooks are not passed via config.
+`inject.WithSessionNewHooks` for CLI leaves; package `SessionNew` uses `cfg.OpenChromeFn`.
 
 ```go
 import (
@@ -154,6 +156,9 @@ const (
 	SessionNewOpDuplicate409        = "duplicate-409"
 	SessionNewOpAutoGenerateID      = "auto-generate-id"
 	SessionNewOpPrettyOutputMarkers = "pretty-output-markers"
+	// SessionNewOpWaitTimeoutProgress: NoWait=false, short WaitExtensionTimeout;
+	// asserts operator instructions on stdout then wait/timeout on stderr.
+	SessionNewOpWaitTimeoutProgress = "wait-timeout-progress"
 )
 
 // CLIDispatchOp — HandleCLI probes.
@@ -178,6 +183,13 @@ type Request struct {
 
 	// NoOpenChrome skips OpenChromeFn when true (session-new/skip-open-chrome).
 	NoOpenChrome bool
+
+	// NoWait skips extension wait; default true for most leaves (no real extension).
+	// Set false for SessionNewOpWaitTimeoutProgress.
+	NoWait *bool
+
+	// WaitExtensionTimeout overrides SessionNew wait (zero → production default 30s).
+	WaitExtensionTimeout time.Duration
 
 	ReadyTimeout time.Duration
 }
@@ -213,7 +225,7 @@ type Response struct {
 	ServerSessionIDs []string
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
@@ -358,15 +370,21 @@ func runSessionNewMode(t *testing.T, req *Request) (*Response, error) {
 	}
 
 	var stdout, stderr bytes.Buffer
+	noWait := true
+	if req.NoWait != nil {
+		noWait = *req.NoWait
+	}
 	cfg := browseragent.SessionNewConfig{
-		BaseDir:         req.BaseDir,
-		Addr:            req.Addr,
-		SessionID:       req.SessionID,
-		NoOpenChrome:    req.NoOpenChrome,
-		OpenChromeFn:    recordOpen,
-		AgentRunProbeFn: recordAgentProbe,
-		Stdout:          &stdout,
-		Stderr:          &stderr,
+		BaseDir:              req.BaseDir,
+		Addr:                 req.Addr,
+		SessionID:            req.SessionID,
+		NoOpenChrome:         req.NoOpenChrome,
+		OpenChromeFn:         recordOpen,
+		AgentRunProbeFn:      recordAgentProbe,
+		NoWait:               noWait,
+		WaitExtensionTimeout: req.WaitExtensionTimeout,
+		Stdout:               &stdout,
+		Stderr:               &stderr,
 	}
 
 	err := browseragent.SessionNew(cfg)
@@ -445,7 +463,7 @@ func runCLIDispatchMode(t *testing.T, req *Request) (*Response, error) {
 	var openURL, openExt string
 	var hookMu sync.Mutex
 
-	hooks := &browseragent.SessionNewTestHooks{
+	hooks := &inj.SessionNewHooks{
 		OpenChromeFn: func(sessionURL, extPath string) error {
 			hookMu.Lock()
 			defer hookMu.Unlock()
@@ -460,8 +478,6 @@ func runCLIDispatchMode(t *testing.T, req *Request) (*Response, error) {
 			return fmt.Errorf("agent-run must not be invoked during session new")
 		},
 	}
-	inj.SessionNewTestHooks = hooks
-	defer func() { inj.SessionNewTestHooks = nil }()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -479,11 +495,15 @@ func runCLIDispatchMode(t *testing.T, req *Request) (*Response, error) {
 		"--base-dir", req.BaseDir,
 		"--host", host,
 		"--server-port", portStr,
+		"--no-wait",
 	}
 	if req.SessionID != "" {
 		args = append(args, "--session-id", req.SessionID)
 	}
-	cliErr := browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+	// Mutex-scoped CLI install for the HandleCLI call only (parallel-safe).
+	cliErr := inj.WithSessionNewHooks(hooks, func() error {
+		return browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+	})
 	resp.Stdout = stdout.String()
 	resp.Stderr = stderr.String()
 	if cliErr != nil {

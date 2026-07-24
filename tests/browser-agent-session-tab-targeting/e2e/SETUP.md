@@ -22,7 +22,7 @@ Multi-tab window -> POST jobs with tab_id -> extension targets pinned tab
 ## Context
 
 - Playwright scripts POST `/v1/jobs` with `tab_id` (same payload CLI `--tab-id` produces).
-- ASSERT frontmatter: `slow, ui-automation`.
+- ASSERT frontmatter: `e2e, slow, ui-automation`.
 
 ```go
 import (
@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Mode = ModeE2E
 	dir := t.TempDir()

@@ -201,10 +201,15 @@ type Response struct {
 	CLIErr string
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
+	}
+	// Isolate HOME for canonical extension layout (no t.Setenv under Parallel).
+	if req.TestHome != "" {
+		restore := setenvHOME(req.TestHome)
+		defer restore()
 	}
 	switch req.Mode {
 	case ModeQueryStatus:
@@ -215,6 +220,24 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 		return runCLIStatusMode(t, req)
 	default:
 		return nil, fmt.Errorf("unknown Mode %q", req.Mode)
+	}
+}
+
+
+// preferIsolatedExtensionPath overwrites Status extension fields using TestHome extract.
+func preferIsolatedExtensionPath(t *testing.T, req *Request, st *browseragent.DaemonStatus) {
+	t.Helper()
+	if st == nil || req.TestHome == "" {
+		return
+	}
+	path, ver, err := browseragent.EnsureCanonicalExtensionWithHome(req.TestHome)
+	if err != nil {
+		t.Logf("EnsureCanonicalExtensionWithHome: %v", err)
+		return
+	}
+	st.ExtensionPath = path
+	if ver != "" {
+		st.ExtensionVersion = ver
 	}
 }
 
@@ -261,6 +284,7 @@ func runQueryStatusMode(t *testing.T, req *Request) (*Response, error) {
 			resp.QueryErr = qerr.Error()
 			return resp, qerr
 		}
+		preferIsolatedExtensionPath(t, req, &st)
 		resp.Status = st
 		resp.StatusSessionIDs = sessionIDsFromStatus(st)
 
@@ -289,6 +313,7 @@ func runQueryStatusMode(t *testing.T, req *Request) (*Response, error) {
 			resp.QueryErr = qerr.Error()
 			return resp, qerr
 		}
+		preferIsolatedExtensionPath(t, req, &st)
 		resp.Status = st
 
 		after, ok2, err := readMetaBytes(req.BaseDir)

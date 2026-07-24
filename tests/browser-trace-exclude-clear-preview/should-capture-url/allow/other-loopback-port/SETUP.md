@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.CaptureURL = "http://127.0.0.1:8080/api/local"
 	return nil

@@ -72,61 +72,62 @@ func cliAssetsEnsure(args []string, env map[string]string, stdout, stderr io.Wri
 	if hasHelpFlag(args) {
 		return writeAssetsHelp(stdout)
 	}
-	// Apply env map into process for AssetCacheRoot / EnsureAsset when provided.
-	applyAssetsEnv(env)
-
-	cfg := AssetDownloadConfig{
-		BaseURL: assetBaseURLFromEnv(env),
-	}
-	version := ClientVersion()
-	product := ProductName
-	kinds := []string{AssetKindSessionPage, AssetKindExtension}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	for _, kind := range kinds {
-		dir, err := EnsureAsset(ctx, product, version, kind, cfg)
-		if err != nil {
-			return fmt.Errorf("assets ensure %s: %w", kind, err)
+	// Isolate asset env for the whole ensure (process-wide lock; parallel-safe).
+	// Use EnsureAsset under lock carefully: EnsureAsset does not take processEnvMu.
+	return WithProcessEnv(assetEnvSubset(env), func() error {
+		cfg := AssetDownloadConfig{
+			BaseURL: assetBaseURLFromEnvUnlocked(env),
 		}
-		_, _ = fmt.Fprintf(stdout, "ensured %s -> %s\n", kind, dir)
-	}
-	return nil
+		version := ClientVersion()
+		product := ProductName
+		kinds := []string{AssetKindSessionPage, AssetKindExtension}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		for _, kind := range kinds {
+			dir, err := EnsureAsset(ctx, product, version, kind, cfg)
+			if err != nil {
+				return fmt.Errorf("assets ensure %s: %w", kind, err)
+			}
+			_, _ = fmt.Fprintf(stdout, "ensured %s -> %s\n", kind, dir)
+		}
+		return nil
+	})
 }
 
 func cliAssetsStatus(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if hasHelpFlag(args) {
 		return writeAssetsHelp(stdout)
 	}
-	applyAssetsEnv(env)
+	return WithProcessEnv(assetEnvSubset(env), func() error {
+		version := normalizeCacheVersion(ClientVersion())
+		product := ProductName
 
-	version := normalizeCacheVersion(ClientVersion())
-	product := ProductName
+		// session-page (unlocked cache paths — already hold processEnvMu)
+		spEmbed := SessionPageEmbedComplete()
+		spCache := cacheCompleteUnlocked(product, version, AssetKindSessionPage)
+		spPath := assetCacheDirUnlocked(product, version, AssetKindSessionPage)
+		_, _ = fmt.Fprintf(stdout, "session-page:\n")
+		_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(spEmbed))
+		_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(spCache))
+		_, _ = fmt.Fprintf(stdout, "  path:   %s\n", spPath)
 
-	// session-page
-	spEmbed := SessionPageEmbedComplete()
-	spCache := CacheComplete(product, version, AssetKindSessionPage)
-	spPath := AssetCacheDir(product, version, AssetKindSessionPage)
-	_, _ = fmt.Fprintf(stdout, "session-page:\n")
-	_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(spEmbed))
-	_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(spCache))
-	_, _ = fmt.Fprintf(stdout, "  path:   %s\n", spPath)
+		// extension
+		extEmbed := ExtensionEmbedComplete()
+		extCache := cacheCompleteUnlocked(product, version, AssetKindExtension)
+		extPath := assetCacheDirUnlocked(product, version, AssetKindExtension)
+		_, _ = fmt.Fprintf(stdout, "extension:\n")
+		_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(extEmbed))
+		_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(extCache))
+		_, _ = fmt.Fprintf(stdout, "  path:   %s\n", extPath)
 
-	// extension
-	extEmbed := ExtensionEmbedComplete()
-	extCache := CacheComplete(product, version, AssetKindExtension)
-	extPath := AssetCacheDir(product, version, AssetKindExtension)
-	_, _ = fmt.Fprintf(stdout, "extension:\n")
-	_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(extEmbed))
-	_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(extCache))
-	_, _ = fmt.Fprintf(stdout, "  path:   %s\n", extPath)
-
-	// Optional: note live embed roots for operators.
-	if sub, err := fs.Sub(embeddedSessionPage, embeddedSessionPageRoot); err == nil && EmbedCompleteFS(sub, AssetKindSessionPage) {
-		_, _ = fmt.Fprintf(stdout, "note: live session-page embed is complete\n")
-	}
-	return nil
+		// Optional: note live embed roots for operators.
+		if sub, err := fs.Sub(embeddedSessionPage, embeddedSessionPageRoot); err == nil && EmbedCompleteFS(sub, AssetKindSessionPage) {
+			_, _ = fmt.Fprintf(stdout, "note: live session-page embed is complete\n")
+		}
+		return nil
+	})
 }
 
 func completeLabel(ok bool) string {
@@ -136,18 +137,34 @@ func completeLabel(ok bool) string {
 	return "incomplete (false)"
 }
 
-func applyAssetsEnv(env map[string]string) {
+func assetEnvSubset(env map[string]string) map[string]string {
 	if env == nil {
-		return
+		return nil
 	}
+	out := map[string]string{}
 	for _, key := range []string{"XDG_CACHE_HOME", "HOME", "USERPROFILE", "BROWSER_AGENT_ASSET_BASE_URL"} {
 		if v, ok := env[key]; ok {
-			_ = os.Setenv(key, v)
+			out[key] = v
 		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// applyAssetsEnv sets asset-related keys without locking (legacy). Prefer WithProcessEnv.
+func applyAssetsEnv(env map[string]string) {
+	for k, v := range assetEnvSubset(env) {
+		_ = os.Setenv(k, v)
 	}
 }
 
 func assetBaseURLFromEnv(env map[string]string) string {
+	return assetBaseURLFromEnvUnlocked(env)
+}
+
+func assetBaseURLFromEnvUnlocked(env map[string]string) string {
 	if env != nil {
 		if v := strings.TrimSpace(env["BROWSER_AGENT_ASSET_BASE_URL"]); v != "" {
 			return v

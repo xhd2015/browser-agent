@@ -52,7 +52,7 @@ import (
 // OpaqueHost is the single bucket name for invalid/unparseable request URLs.
 const OpaqueHost = "opaque"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	if req.Entries == nil {
 		req.Entries = make(map[string]popupstats.EntryValue)

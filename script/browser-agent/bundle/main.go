@@ -72,11 +72,12 @@ Also see: go run ./script/browser-agent/install
 
 	fmt.Printf("Staged extension into %s\n", res.ExtensionDir)
 	fmt.Printf("Staged session-page into %s\n", res.SessionPageDir)
-	if res.UsedFixture {
-		fmt.Printf("UsedFixture=true\n")
-		fmt.Fprintln(os.Stderr, "hint: full build needs node for react/; extension stages from public/ without npm")
-	} else {
-		fmt.Printf("UsedFixture=false\n")
+	fmt.Printf("UsedFixture=%v SessionPageFromFixture=%v ExtensionFromFixture=%v\n",
+		res.UsedFixture, res.SessionPageFromFixture, res.ExtensionFromFixture)
+	if res.SessionPageFromFixture {
+		fmt.Fprintln(os.Stderr, "hint: session-page is mini fixture; full SPA needs: go run ./script/browser-agent/install (node+vite in react/)")
+	} else if res.UsedFixture {
+		fmt.Fprintln(os.Stderr, "hint: extension used fixture; session-page is real SPA")
 	}
 	return nil
 }

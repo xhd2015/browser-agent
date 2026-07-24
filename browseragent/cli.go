@@ -79,6 +79,7 @@ session new flags:
   --host <host>              Control server host (default: 127.0.0.1)
   --server-port <port>       Control server port (default: 43761; reads server.json when omitted)
   --no-open-chrome           Do not launch Chrome
+  --no-wait                  Skip waiting for extension connection
 
 open-managed-chrome flags:
   --root <dir>               Managed Chrome root (default: ~/.browser-agent/managed-chrome)
@@ -295,6 +296,7 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	baseDir := flagString(args, "--base-dir")
 	sessionID := flagString(args, "--session-id")
 	noOpenChrome := flagBool(args, "--no-open-chrome")
+	noWait := flagBool(args, "--no-wait")
 	addr := sessionNewAddrFromFlags(args)
 
 	if baseDir == "" {
@@ -306,13 +308,13 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 		Addr:         addr,
 		SessionID:    sessionID,
 		NoOpenChrome: noOpenChrome,
+		NoWait:       noWait,
 		Stdout:       stdout,
 		Stderr:       stderr,
 	}
-	if inj.SessionNewTestHooks != nil {
-		if cfg.OpenChromeFn == nil && inj.SessionNewTestHooks.OpenChromeFn != nil {
-			cfg.OpenChromeFn = inj.SessionNewTestHooks.OpenChromeFn
-		}
+	// Snapshot CLI inject hooks onto cfg so SessionNew does not re-read globals.
+	if cfg.OpenChromeFn == nil {
+		cfg.OpenChromeFn = inj.SessionNewOpenChromeFn()
 	}
 	return SessionNew(cfg)
 }
@@ -339,8 +341,9 @@ func cliOpenManagedChrome(args []string, env map[string]string, stdout, stderr i
 		Stdout: stdout,
 		Stderr: stderr,
 	}
-	if inj.ManagedChromeTestHooks != nil && inj.ManagedChromeTestHooks.LaunchFn != nil {
-		cfg.LaunchFn = inj.ManagedChromeTestHooks.LaunchFn
+	// Snapshot CLI inject hooks onto cfg so OpenManagedChrome uses call-local LaunchFn.
+	if cfg.LaunchFn == nil {
+		cfg.LaunchFn = inj.ManagedChromeLaunchFn()
 	}
 	_, err := OpenManagedChrome(cfg)
 	return err

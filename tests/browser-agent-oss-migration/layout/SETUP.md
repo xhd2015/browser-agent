@@ -24,7 +24,7 @@ Test Client <- har-viewer present; casement artifacts absent
 ```go
 import "testing"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Category = CategoryLayout
 	return nil

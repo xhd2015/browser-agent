@@ -1,5 +1,5 @@
 ---
-label: slow, ui-automation
+label: e2e, slow, ui-automation
 explanation: Real Chromium + MV3 extension; two-tab active-tab routing regression
 ---
 
@@ -32,7 +32,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	if resp == nil {
 		t.Fatal("resp is nil")

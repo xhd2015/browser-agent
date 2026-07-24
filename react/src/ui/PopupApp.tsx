@@ -32,7 +32,8 @@ export function PopupApp({
         {connected ? "Connected" : "Not connected"}
       </p>
       <p className="muted">
-        Open a {product.cliName} session page to attach this extension.
+        HTTP health is not the same as session WebSocket attach. Open a{" "}
+        {product.cliName} /go?session= page so this extension can register.
       </p>
     </div>
   );

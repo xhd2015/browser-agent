@@ -20,16 +20,17 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	if !resp.SpawnFnCalled {
 		t.Fatal("SpawnFn not called")
 	}
 	if resp.SpawnAddrUsed != "127.0.0.1:43761" {
-		t.Fatalf("spawn addr=%q want 127.0.0.1:43761 (no pickEphemeralAddr)", resp.SpawnAddrUsed)
+		t.Fatalf("spawn addr intent=%q want 127.0.0.1:43761 (EnsureDaemon resolves empty Addr to DefaultAddr)", resp.SpawnAddrUsed)
 	}
-	if resp.Meta.Addr != "" && !strings.HasSuffix(resp.Meta.Addr, ":43761") {
-		t.Fatalf("meta.Addr=%q want :43761 suffix", resp.Meta.Addr)
+	// Actual listen may use a free port so the leaf is host-safe; still must not be ":0" alone.
+	if resp.Meta.Addr != "" && (resp.Meta.Addr == ":0" || strings.HasSuffix(resp.Meta.Addr, ":0")) {
+		t.Fatalf("meta.Addr=%q must not be ephemeral :0", resp.Meta.Addr)
 	}
 }
 ```

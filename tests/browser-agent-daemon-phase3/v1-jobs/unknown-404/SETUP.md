@@ -25,7 +25,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.ForceUnknownSession = true
 	req.UnknownSessionID = "does-not-exist"

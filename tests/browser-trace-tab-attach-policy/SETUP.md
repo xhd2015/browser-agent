@@ -51,7 +51,7 @@ const CapturableFixture = "https://app.example.com/app/weekly"
 // ControlPageFixture is the product control session page (attach allowed).
 const ControlPageFixture = "http://127.0.0.1:43759/go"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Gates open by default — capturable-url leaves only vary URL.
 	req.Recording = true

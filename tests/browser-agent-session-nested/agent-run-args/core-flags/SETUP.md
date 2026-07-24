@@ -29,7 +29,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.AgentArgsControlID = "ctrl-core-1"
 	req.AgentArgsPromptPath = "/tmp/sessions/ctrl-core-1/SYSTEM.md"

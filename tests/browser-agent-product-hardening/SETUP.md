@@ -50,11 +50,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xhd2015/doctest/session"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	req.NoOpenChrome = true
 	req.NoAgentRun = true
 	if req.ReadyTimeout == 0 {
@@ -112,12 +114,15 @@ func assertSessionResolveErrorText(t *testing.T, text string) {
 	}
 }
 
-func readLeafManifest(t *testing.T, name string) []byte {
+func readLeafManifest(t *testing.T, d *session.Doctest, name string) []byte {
 	t.Helper()
-	// ASSERT/SETUP run with leaf cwd; prefer sibling manifest.json.
-	path := name
+	// Leaves run without chdir; resolve relative to d.DOCTEST_CASE.
 	if name == "" {
-		path = "manifest.json"
+		name = "manifest.json"
+	}
+	path := name
+	if d != nil && d.DOCTEST_CASE != "" && !filepath.IsAbs(name) {
+		path = filepath.Join(d.DOCTEST_CASE, name)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {

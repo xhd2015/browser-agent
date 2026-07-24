@@ -10,7 +10,7 @@ HandleCLI ["session","new", flags...] -> EnsureDaemon + create + stdout; exit 0
 
 - Mode `ModeCLIDispatch`.
 - Leaf sets `CLIDispatchOp`.
-- `SessionNewTestHooks` used for OpenChrome recording (no real Chrome).
+- `inject.WithSessionNewHooks` around HandleCLI; `--no-wait` (no real Chrome / no extension poll).
 
 ## Steps
 
@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Mode = ModeCLIDispatch
 	return nil

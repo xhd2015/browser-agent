@@ -20,16 +20,29 @@ func TestEmbedCompleteFS_placeholderOnly(t *testing.T) {
 }
 
 func TestDiskPlaceholderLayout_gitKeepFiles(t *testing.T) {
-	// Repo must ship placeholders at these paths (tracked).
-	for _, p := range []string{
-		"embedded/extension/placeholder.txt",
-		"embedded/session-page/placeholder.txt",
+	// Each embed root must exist: either placeholder (incomplete) or a real staged tree.
+	// Production bundle scripts replace placeholders with built assets.
+	for _, dir := range []string{
+		"embedded/extension",
+		"embedded/session-page",
 	} {
-		if _, err := os.Stat(filepath.Join(".", p)); err != nil {
-			// tests run with package dir = browseragent/
-			if _, err2 := os.Stat(p); err2 != nil {
-				t.Fatalf("missing %s: %v / %v", p, err, err2)
-			}
+		base := dir
+		if _, err := os.Stat(base); err != nil {
+			base = filepath.Join(".", dir)
+		}
+		st, err := os.Stat(base)
+		if err != nil || !st.IsDir() {
+			t.Fatalf("missing embed dir %s: %v", dir, err)
+		}
+		// Accept placeholder OR real payload (manifest.json / index.html).
+		ph := filepath.Join(base, "placeholder.txt")
+		mani := filepath.Join(base, "manifest.json")
+		idx := filepath.Join(base, "index.html")
+		_, e1 := os.Stat(ph)
+		_, e2 := os.Stat(mani)
+		_, e3 := os.Stat(idx)
+		if e1 != nil && e2 != nil && e3 != nil {
+			t.Fatalf("%s: need placeholder.txt and/or staged payload (manifest.json/index.html)", dir)
 		}
 	}
 }

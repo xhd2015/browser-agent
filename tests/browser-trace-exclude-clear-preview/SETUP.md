@@ -67,7 +67,7 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	dir := t.TempDir()
 	req.BaseDir = filepath.Join(dir, "browser-trace-base")

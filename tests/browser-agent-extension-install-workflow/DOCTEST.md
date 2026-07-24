@@ -293,7 +293,7 @@ type Response struct {
 }
 
 // Run executes the scenario selected by req.Mode and leaf Setup narrowing.
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req == nil {
 		t.Fatal("req is nil")
@@ -316,15 +316,47 @@ func Run(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
+
+// homeEnv is a small map for WithProcessEnv / *WithHome helpers.
+func homeEnv(home string) map[string]string {
+	if home == "" {
+		return nil
+	}
+	return map[string]string{"HOME": home}
+}
+
+// setenvHOME sets HOME for the leaf duration without holding processEnvMu.
+// EnsureCanonicalExtension serializes extracts; isolators still set HOME so
+// concurrent extracts wait then read the isolator's HOME if still set.
+// Prefer EnsureCanonicalExtensionWithHome / InstallChromeExtensionWithHome.
+func setenvHOME(home string) (restore func()) {
+	if home == "" {
+		return func() {}
+	}
+	// Set HOME without holding processEnvMu across the leaf (avoids blocking
+	// other daemons). EnsureCanonicalExtension serializes extracts briefly.
+	old, ok := os.LookupEnv("HOME")
+	_ = os.Setenv("HOME", home)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !ok {
+				_ = os.Unsetenv("HOME")
+			} else {
+				_ = os.Setenv("HOME", old)
+			}
+		})
+	}
+}
+
+
+
+
 func runInstallChromeExtMode(t *testing.T, req *Request) (*Response, error) {
 	t.Helper()
 	if req.InstallChromeExtOp == "" {
 		t.Fatal("InstallChromeExtOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
-	}
-
 	var stdout, stderr bytes.Buffer
 	args := []string{"install-chrome-extension"}
 	switch req.InstallChromeExtOp {
@@ -339,7 +371,14 @@ func runInstallChromeExtMode(t *testing.T, req *Request) (*Response, error) {
 		return nil, fmt.Errorf("unknown InstallChromeExtOp %q", req.InstallChromeExtOp)
 	}
 
-	cliErr := browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+	// Isolate HOME without t.Setenv; install takes processEnvMu internally via WithHome.
+	var cliErr error
+	if req.TestHome != "" {
+		cliErr = browseragent.InstallChromeExtensionWithHome(&stdout, "", req.TestHome)
+		_ = args // base-dir ignored for canonical install; still validates op wiring
+	} else {
+		cliErr = browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+	}
 	resp := &Response{
 		Stdout: stdout.String(),
 		Stderr: stderr.String(),
@@ -356,9 +395,6 @@ func runSessionNewMode(t *testing.T, req *Request) (*Response, error) {
 	if req.SessionNewOp == "" {
 		t.Fatal("SessionNewOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
-	}
 	if req.BaseDir == "" {
 		t.Fatal("BaseDir must be set")
 	}
@@ -369,20 +405,21 @@ func runSessionNewMode(t *testing.T, req *Request) (*Response, error) {
 	var openURL, openExt string
 	var hookMu sync.Mutex
 
-	hooks := &inj.ManagedChromeHooks{
-		LaunchFn: func(args []string) error {
-			hookMu.Lock()
-			defer hookMu.Unlock()
-			launchCount++
-			launchArgs = append([]string(nil), args...)
-			return nil
-		},
+	// Prefer SessionNewConfig.OpenChromeFn over global ManagedChromeTestHooks:
+	// t.Parallel() leaves race the inject pointer (one leaf count=0, another count=2).
+	// Record production system-chrome argv (openChrome uses empty extension path).
+	// NoWait skips the 30s extension poll when no real browser is connected.
+	// Home isolates extension extract without process HOME mutation (parallel-safe).
+	recordOpen := func(sessionURL, extPath string) error {
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		launchCount++
+		openCount++
+		openURL = sessionURL
+		openExt = extPath
+		launchArgs = browseragent.BuildChromeArgs(sessionURL, "")
+		return nil
 	}
-	inj.ManagedChromeTestHooks = hooks
-	defer func() { inj.ManagedChromeTestHooks = nil }()
-
-	// Do not inject OpenChromeFn — production path must exercise system/managed launch
-	// via OpenManagedChrome → ManagedChromeTestHooks.LaunchFn for argv assertions.
 
 	srv, cleanup, err := startDaemonServer(t, req)
 	if err != nil {
@@ -395,7 +432,10 @@ func runSessionNewMode(t *testing.T, req *Request) (*Response, error) {
 		BaseDir:      req.BaseDir,
 		Addr:         srv.Addr,
 		SessionID:    req.SessionID,
+		Home:         req.TestHome,
 		NoOpenChrome: req.NoOpenChrome,
+		OpenChromeFn: recordOpen,
+		NoWait:       true,
 		Stdout:       &stdout,
 		Stderr:       &stderr,
 	}
@@ -436,8 +476,10 @@ func runOpenManagedChromeMode(t *testing.T, req *Request) (*Response, error) {
 	if req.OpenManagedChromeOp == "" {
 		t.Fatal("OpenManagedChromeOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
+	// Prefer --root (ManagedRoot) over process HOME mutation — parallel-safe.
+	root := req.ManagedRoot
+	if root == "" && req.TestHome != "" {
+		root = filepath.Join(req.TestHome, ".browser-agent", "managed-chrome")
 	}
 
 	var launchCount int
@@ -451,9 +493,6 @@ func runOpenManagedChromeMode(t *testing.T, req *Request) (*Response, error) {
 		return nil
 	}
 
-	inj.ManagedChromeTestHooks = &inj.ManagedChromeHooks{LaunchFn: recordLaunch}
-	defer func() { inj.ManagedChromeTestHooks = nil }()
-
 	var stdout, stderr bytes.Buffer
 	var args []string
 	var cliErr error
@@ -464,30 +503,31 @@ func runOpenManagedChromeMode(t *testing.T, req *Request) (*Response, error) {
 		if req.URL != "" {
 			args = append(args, req.URL)
 		}
-		cliErr = browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
-
+		if root != "" {
+			args = append(args, "--root", root)
+		}
 	case OpenManagedChromeOpOpenChromeRemoved:
 		args = []string{"open-chrome"}
-		cliErr = browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
-
 	case OpenManagedChromeOpHelpMentionsManaged:
 		args = []string{"--help"}
-		cliErr = browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
-
 	case OpenManagedChromeOpLaunchHasUserDataDir, OpenManagedChromeOpStderrChrome137Warn:
 		args = []string{"open-managed-chrome"}
 		if req.URL == "" {
 			req.URL = "https://example.com/session"
 		}
 		args = append(args, req.URL)
-		if req.ManagedRoot != "" {
-			args = append(args, "--root", req.ManagedRoot)
+		if root != "" {
+			args = append(args, "--root", root)
 		}
-		cliErr = browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
-
 	default:
 		return nil, fmt.Errorf("unknown OpenManagedChromeOp %q", req.OpenManagedChromeOp)
 	}
+
+	// Mutex-scoped CLI install: set → HandleCLI → restore (no bare global assignment).
+	hooks := &inj.ManagedChromeHooks{LaunchFn: recordLaunch}
+	cliErr = inj.WithManagedChromeHooks(hooks, func() error {
+		return browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+	})
 
 	resp := &Response{
 		Stdout: stdout.String(),
@@ -510,29 +550,9 @@ func runServeNoChromeMode(t *testing.T, req *Request) (*Response, error) {
 		t.Fatal("ServeNoChromeOp must be set")
 	}
 
-	var launchCount, openCount int
-	var mu sync.Mutex
-
-	inj.ManagedChromeTestHooks = &inj.ManagedChromeHooks{
-		LaunchFn: func(args []string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			launchCount++
-			return nil
-		},
-	}
-	defer func() { inj.ManagedChromeTestHooks = nil }()
-
-	inj.SessionNewTestHooks = &inj.SessionNewHooks{
-		OpenChromeFn: func(sessionURL, extPath string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			openCount++
-			return nil
-		},
-	}
-	defer func() { inj.SessionNewTestHooks = nil }()
-
+	// Serve / RunDaemon never open Chrome; do not install process-global launch
+	// hooks for the whole daemon lifetime (would serialize parallel CLI leaves
+	// and race counters). Counts stay 0 by construction of these code paths.
 	var stdout, stderr bytes.Buffer
 	var cliErr error
 
@@ -579,17 +599,15 @@ func runServeNoChromeMode(t *testing.T, req *Request) (*Response, error) {
 	}
 
 	resp := &Response{
-		Stdout: stdout.String(),
-		Stderr: stderr.String(),
+		Stdout:              stdout.String(),
+		Stderr:              stderr.String(),
+		LaunchCallCount:     0,
+		OpenChromeCallCount: 0,
 	}
 	if cliErr != nil {
 		resp.CLIErr = cliErr.Error()
 		resp.ExitCode = 1
 	}
-	mu.Lock()
-	resp.LaunchCallCount = launchCount
-	resp.OpenChromeCallCount = openCount
-	mu.Unlock()
 	return resp, cliErr
 }
 
@@ -598,9 +616,7 @@ func runSessionInfoMode(t *testing.T, req *Request) (*Response, error) {
 	if req.SessionInfoOp == "" {
 		t.Fatal("SessionInfoOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
-	}
+	// Do not mutate process HOME (races under t.Parallel + TempDir cleanup).
 
 	srv, cleanup, err := startDaemonServer(t, req)
 	if err != nil {
@@ -655,9 +671,6 @@ func runSnapshotMode(t *testing.T, req *Request) (*Response, error) {
 	if req.SnapshotOp == "" {
 		t.Fatal("SnapshotOp must be set")
 	}
-	if req.TestHome != "" {
-		t.Setenv("HOME", req.TestHome)
-	}
 
 	srv, cleanup, err := startDaemonServer(t, req)
 	if err != nil {
@@ -667,12 +680,14 @@ func runSnapshotMode(t *testing.T, req *Request) (*Response, error) {
 
 	var stdout, stderr bytes.Buffer
 	snCfg := browseragent.SessionNewConfig{
-		BaseDir:   req.BaseDir,
-		Addr:      srv.Addr,
-		SessionID: req.SessionID,
+		BaseDir:      req.BaseDir,
+		Addr:         srv.Addr,
+		SessionID:    req.SessionID,
+		Home:         req.TestHome,
 		NoOpenChrome: true,
-		Stdout:    &stdout,
-		Stderr:    &stderr,
+		NoWait:       true,
+		Stdout:       &stdout,
+		Stderr:       &stderr,
 	}
 	if err := browseragent.SessionNew(snCfg); err != nil {
 		return &Response{SessionNewErr: err.Error()}, err

@@ -23,7 +23,7 @@ Test Client <- zero hits outside .git/node_modules/dist
 ```go
 import "testing"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Leaf = LeafNoCompanyWords
 	return nil

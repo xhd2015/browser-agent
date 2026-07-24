@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.BundleSumJS = validBundleSumFixture("1.0.1", "a1b2c3d4e5f6789012345678abcdef01")
 	return nil

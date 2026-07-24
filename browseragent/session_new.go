@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,18 @@ type SessionNewConfig struct {
 	AgentRunProbeFn func(sessionID, systemPromptPath, workspaceDir string, env map[string]string) error
 	Stdout          io.Writer
 	Stderr          io.Writer
+
+	// Home, when non-empty, extracts the canonical extension under
+	// {Home}/.browser-agent/... without mutating process HOME (parallel-safe
+	// for doctests). Empty means use the process HOME via EnsureCanonicalExtension.
+	Home string
+
+	// WaitExtensionTimeout is how long to wait for extension connection.
+	// Default 30s. Zero means use default.
+	WaitExtensionTimeout time.Duration
+
+	// NoWait skips waiting entirely (new --no-wait flag).
+	NoWait bool
 }
 
 // EnsureDaemon returns daemon meta when the control plane at Addr is healthy and
@@ -356,9 +369,19 @@ func SessionNew(cfg SessionNewConfig) error {
 		return fmt.Errorf("daemon meta missing base URL")
 	}
 
-	extPath, _, err := EnsureCanonicalExtension()
-	if err != nil {
-		return fmt.Errorf("ensure canonical extension: %w", err)
+	var extPath string
+	if home := strings.TrimSpace(cfg.Home); home != "" {
+		p, _, err := EnsureCanonicalExtensionWithHome(home)
+		if err != nil {
+			return fmt.Errorf("ensure canonical extension: %w", err)
+		}
+		extPath = p
+	} else {
+		p, _, err := EnsureCanonicalExtension()
+		if err != nil {
+			return fmt.Errorf("ensure canonical extension: %w", err)
+		}
+		extPath = p
 	}
 
 	result, err := postCreateSessionHTTP(baseURL, strings.TrimSpace(cfg.SessionID))
@@ -368,8 +391,8 @@ func SessionNew(cfg SessionNewConfig) error {
 
 	if !cfg.NoOpenChrome {
 		openFn := cfg.OpenChromeFn
-		if openFn == nil && inj.SessionNewTestHooks != nil && inj.SessionNewTestHooks.OpenChromeFn != nil {
-			openFn = inj.SessionNewTestHooks.OpenChromeFn
+		if openFn == nil {
+			openFn = inj.SessionNewOpenChromeFn()
 		}
 		if openFn != nil {
 			if err := openFn(result.SessionURL, extPath); err != nil {
@@ -380,8 +403,21 @@ func SessionNew(cfg SessionNewConfig) error {
 		}
 	}
 
+	// Always print operator instructions first so URL / install path are visible
+	// before any wait (or if the wait times out).
 	if err := formatSessionNewOutput(stdout, result, baseURL, extPath); err != nil {
 		return err
+	}
+
+	// Then wait for extension connection (unless NoOpenChrome or NoWait).
+	if !cfg.NoOpenChrome && !cfg.NoWait {
+		timeout := cfg.WaitExtensionTimeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		if err := waitForExtensionConnection(baseURL, result.SessionID, timeout, stderr); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -487,4 +523,84 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		}
 	}
 	return nil
+}
+
+// waitForExtensionConnection polls GET /v1/session?session=<id> every 500ms until
+// the extension connects with browser-agent support, connects without support, or
+// timeout is reached. Progress ticks go to stderr. On timeout, a warning is printed
+// to stderr and nil is returned (session remains usable).
+func waitForExtensionConnection(baseURL, sessionID string, timeout time.Duration, stderr io.Writer) error {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	pollInterval := 500 * time.Millisecond
+	progressEvery := 5 * time.Second
+	started := time.Now()
+	nextProgress := started.Add(progressEvery)
+
+	timeoutLabel := timeout.Truncate(time.Second)
+	if timeoutLabel < time.Second {
+		timeoutLabel = timeout
+	}
+	fmt.Fprintf(stderr, "Waiting for extension WebSocket (timeout %s)…\n", timeoutLabel)
+
+	for {
+		connected, supports, err := pollSessionExtension(baseURL, sessionID)
+		if err != nil {
+			return fmt.Errorf("daemon unreachable during extension wait: %w", err)
+		}
+		if connected {
+			if supports {
+				fmt.Fprintln(stderr, "Extension connected ✓")
+				return nil
+			}
+			return fmt.Errorf("Error: extension does not support browser-agent. Please install the bundled extension.")
+		}
+
+		now := time.Now()
+		if now.After(deadline) {
+			fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", timeoutLabel)
+			return nil
+		}
+		if !now.Before(nextProgress) {
+			elapsed := now.Sub(started).Truncate(time.Second)
+			fmt.Fprintf(stderr, "  … still waiting (%s)\n", elapsed)
+			nextProgress = now.Add(progressEvery)
+		}
+
+		time.Sleep(pollInterval)
+	}
+}
+
+// pollSessionExtension fetches a session snapshot and returns extension.connected
+// and extension.supports_browser_agent.
+func pollSessionExtension(baseURL, sessionID string) (connected, supports bool, err error) {
+	u := strings.TrimRight(baseURL, "/") + "/v1/session?session=" + url.QueryEscape(sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, false, err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, false, err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return false, false, err
+	}
+	if res.StatusCode != http.StatusOK {
+		return false, false, fmt.Errorf("GET /v1/session status %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var snap sessionSnapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		return false, false, fmt.Errorf("parse session snapshot: %w", err)
+	}
+	return snap.Extension.Connected, snap.Extension.SupportsBrowserAgent, nil
 }

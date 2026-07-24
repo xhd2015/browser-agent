@@ -124,6 +124,7 @@ func AssetReleaseNames(version string) []string
 
 ```go
 import (
+	"github.com/xhd2015/doctest/session"
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
@@ -136,6 +137,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -355,39 +357,39 @@ type Response struct {
 	ExitCode int
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 	switch req.Mode {
 	case ModeCompleteness:
-		return runCompleteness(t, req)
+		return runCompleteness(t, d, req)
 	case ModeResolve:
-		return runResolve(t, req)
+		return runResolve(t, d, req)
 	case ModeCache:
-		return runCache(t, req)
+		return runCache(t, d, req)
 	case ModeDownload:
-		return runDownload(t, req)
+		return runDownload(t, d, req)
 	case ModeImplicit:
-		return runImplicit(t, req)
+		return runImplicit(t, d, req)
 	case ModeCLI:
-		return runCLI(t, req)
+		return runCLI(t, d, req)
 	case ModeRelease:
 		return runRelease(t, req)
 	case ModeDocs:
-		return runDocs(t, req)
+		return runDocs(t, d, req)
 	default:
 		return nil, fmt.Errorf("unknown Mode %q", req.Mode)
 	}
 }
 
-func runCompleteness(t *testing.T, req *Request) (*Response, error) {
+func runCompleteness(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
-	fsys, root, err := openFixtureFS(t, req.FixtureName)
+	fsys, root, err := openFixtureFS(t, d, req.FixtureName)
 	if err != nil {
 		return nil, err
 	}
@@ -402,13 +404,13 @@ func runCompleteness(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func runResolve(t *testing.T, req *Request) (*Response, error) {
+func runResolve(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	name := req.ResolveFixtureName
 	if name == "" {
 		name = req.FixtureName
 	}
-	fsys, root, err := openFixtureFS(t, name)
+	fsys, root, err := openFixtureFS(t, d, name)
 	if err != nil {
 		return nil, err
 	}
@@ -423,12 +425,13 @@ func runResolve(t *testing.T, req *Request) (*Response, error) {
 	}, nil
 }
 
-func runCache(t *testing.T, req *Request) (*Response, error) {
+func runCache(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.CacheOp == "" {
 		t.Fatal("CacheOp must be set by leaf Setup")
 	}
-	applyCacheEnv(t, req)
+	restore := applyCacheEnv(t, req)
+	defer restore()
 
 	product := req.CacheProduct
 	if product == "" {
@@ -452,7 +455,7 @@ func runCache(t *testing.T, req *Request) (*Response, error) {
 		return resp, nil
 
 	case CacheOpWriteThenOpenHit:
-		src, _, err := openFixtureFS(t, req.CacheWriteFixture)
+		src, _, err := openFixtureFS(t, d, req.CacheWriteFixture)
 		if err != nil {
 			return nil, err
 		}
@@ -484,7 +487,7 @@ func runCache(t *testing.T, req *Request) (*Response, error) {
 		return resp, nil
 
 	case CacheOpProductIsolation:
-		src, _, err := openFixtureFS(t, req.CacheWriteFixture)
+		src, _, err := openFixtureFS(t, d, req.CacheWriteFixture)
 		if err != nil {
 			return nil, err
 		}
@@ -510,12 +513,13 @@ func runCache(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
-func runDownload(t *testing.T, req *Request) (*Response, error) {
+func runDownload(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.DownloadOp == "" {
 		t.Fatal("DownloadOp must be set by leaf Setup")
 	}
-	applyCacheEnv(t, req)
+	restore := applyCacheEnv(t, req)
+	defer restore()
 
 	product := req.DownloadProduct
 	if product == "" {
@@ -538,7 +542,7 @@ func runDownload(t *testing.T, req *Request) (*Response, error) {
 
 	var tarBytes []byte
 	if !req.DownloadServe404 {
-		b, err := buildFixtureTarGZ(t, fixture)
+		b, err := buildFixtureTarGZ(t, d, fixture)
 		if err != nil {
 			return nil, err
 		}
@@ -610,12 +614,13 @@ func runDownload(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func runImplicit(t *testing.T, req *Request) (*Response, error) {
+func runImplicit(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.ImplicitOp == "" {
 		t.Fatal("ImplicitOp must be set by leaf Setup")
 	}
-	applyCacheEnv(t, req)
+	restore := applyCacheEnv(t, req)
+	defer restore()
 
 	version := req.ImplicitVersion
 	if version == "" {
@@ -626,7 +631,7 @@ func runImplicit(t *testing.T, req *Request) (*Response, error) {
 	if embedName == "" {
 		embedName = FixtureEmpty
 	}
-	embedFS, embedRoot, err := openFixtureFS(t, embedName)
+	embedFS, embedRoot, err := openFixtureFS(t, d, embedName)
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +653,7 @@ func runImplicit(t *testing.T, req *Request) (*Response, error) {
 				serveFix = FixtureSessionPageComplete
 			}
 		}
-		tarBytes, err := buildFixtureTarGZ(t, serveFix)
+		tarBytes, err := buildFixtureTarGZ(t, d, serveFix)
 		if err != nil {
 			return nil, err
 		}
@@ -726,7 +731,7 @@ func runImplicit(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
-func runCLI(t *testing.T, req *Request) (*Response, error) {
+func runCLI(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.CLIOp == "" {
 		t.Fatal("CLIOp must be set by leaf Setup")
@@ -741,17 +746,14 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 	}
 	if req.XDGCacheHome != "" {
 		env[EnvXDGCacheHome] = req.XDGCacheHome
-		// Also set process env so AssetCacheRoot (if it reads process env) sees isolation
-		// when HandleCLI merges env into process — tests prefer env map.
-		t.Setenv(EnvXDGCacheHome, req.XDGCacheHome)
 	}
 
 	if req.CLIServeBothArchives {
-		spTar, err := buildFixtureTarGZ(t, FixtureSessionPageComplete)
+		spTar, err := buildFixtureTarGZ(t, d, FixtureSessionPageComplete)
 		if err != nil {
 			return nil, err
 		}
-		extTar, err := buildFixtureTarGZ(t, FixtureExtensionComplete)
+		extTar, err := buildFixtureTarGZ(t, d, FixtureExtensionComplete)
 		if err != nil {
 			return nil, err
 		}
@@ -774,10 +776,10 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 		t.Cleanup(srv.Close)
 		base := strings.TrimRight(srv.URL, "/") + "/releases/download"
 		env[EnvBrowserAgentAssetBase] = base
-		t.Setenv(EnvBrowserAgentAssetBase, base)
 	}
 
 	var stdout, stderr bytes.Buffer
+	// HandleCLI isolates env via WithProcessEnv; do not nest-lock around the call.
 	cliErr := browseragent.HandleCLI(req.CLIArgs, env, &stdout, &stderr)
 
 	resp := &Response{
@@ -788,7 +790,7 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 		ExitCode:  0,
 	}
 
-	// After ensure: report cache completeness for current product version.
+	// After ensure: report cache completeness for current product version under same env.
 	ver := CacheVersion
 	if v := strings.TrimSpace(browseragent.ClientVersion()); v != "" {
 		if !strings.HasPrefix(v, "v") {
@@ -797,8 +799,11 @@ func runCLI(t *testing.T, req *Request) (*Response, error) {
 			ver = v
 		}
 	}
-	resp.CacheCompleteSP = browseragent.CacheComplete(ProductBrowserAgent, ver, KindSessionPage)
-	resp.CacheCompleteExt = browseragent.CacheComplete(ProductBrowserAgent, ver, KindExtension)
+	_ = browseragent.WithProcessEnv(env, func() error {
+		resp.CacheCompleteSP = browseragent.CacheComplete(ProductBrowserAgent, ver, KindSessionPage)
+		resp.CacheCompleteExt = browseragent.CacheComplete(ProductBrowserAgent, ver, KindExtension)
+		return nil
+	})
 	return resp, nil
 }
 
@@ -823,14 +828,14 @@ func runRelease(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
-func runDocs(t *testing.T, req *Request) (*Response, error) {
+func runDocs(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.DocsOp == "" {
 		t.Fatal("DocsOp must be set by leaf Setup")
 	}
 	root := req.ModuleRoot
 	if root == "" {
-		root = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		root = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 	resp := &Response{ExitCode: 0, DocsPaths: nil}
 
@@ -880,22 +885,60 @@ func runDocs(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func applyCacheEnv(t *testing.T, req *Request) {
-	t.Helper()
-	if req.XDGCacheHome != "" {
-		t.Setenv("XDG_CACHE_HOME", req.XDGCacheHome)
+// applyProcessEnv uses the process-wide browseragent lock (shared across packages).
+func applyProcessEnv(env map[string]string) (restore func()) {
+	if len(env) == 0 {
+		return func() {}
 	}
-	if req.IsolateHome {
-		home := t.TempDir()
-		t.Setenv("HOME", home)
-		t.Setenv("USERPROFILE", home)
-		if req.XDGCacheHome == "" {
-			t.Setenv("XDG_CACHE_HOME", "")
-		}
+	browseragent.LockProcessEnv()
+	type prev struct {
+		val string
+		ok  bool
+	}
+	saved := make(map[string]prev, len(env))
+	for k, v := range env {
+		old, ok := os.LookupEnv(k)
+		saved[k] = prev{val: old, ok: ok}
+		_ = os.Setenv(k, v)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for k, p := range saved {
+				if !p.ok {
+					_ = os.Unsetenv(k)
+				} else {
+					_ = os.Setenv(k, p.val)
+				}
+			}
+			browseragent.UnlockProcessEnv()
+		})
 	}
 }
 
-func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
+// applyCacheEnv isolates XDG/HOME for cache APIs. Returns restore; defer it.
+// Never uses t.Setenv (incompatible with workspace t.Parallel).
+func applyCacheEnv(t *testing.T, req *Request) (restore func()) {
+	t.Helper()
+	env := map[string]string{}
+	if req.XDGCacheHome != "" {
+		env["XDG_CACHE_HOME"] = req.XDGCacheHome
+	}
+	if req.IsolateHome {
+		home := t.TempDir()
+		env["HOME"] = home
+		env["USERPROFILE"] = home
+		if req.XDGCacheHome == "" {
+			env["XDG_CACHE_HOME"] = ""
+		}
+	}
+	if len(env) == 0 {
+		return func() {}
+	}
+	return applyProcessEnv(env)
+}
+
+func openFixtureFS(t *testing.T, d *session.Doctest, fixtureName string) (fs.FS, string, error) {
 	t.Helper()
 	if fixtureName == "" {
 		return nil, "", fmt.Errorf("fixture name is required")
@@ -904,7 +947,7 @@ func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
 		dir := t.TempDir()
 		return os.DirFS(dir), dir, nil
 	}
-	root := filepath.Join(DOCTEST_ROOT, "testdata", fixtureName)
+	root := filepath.Join(d.DOCTEST_ROOT, "testdata", fixtureName)
 	st, err := os.Stat(root)
 	if err != nil {
 		return nil, "", fmt.Errorf("fixture %q: %w", fixtureName, err)
@@ -915,9 +958,9 @@ func openFixtureFS(t *testing.T, fixtureName string) (fs.FS, string, error) {
 	return os.DirFS(root), root, nil
 }
 
-func buildFixtureTarGZ(t *testing.T, fixtureName string) ([]byte, error) {
+func buildFixtureTarGZ(t *testing.T, d *session.Doctest, fixtureName string) ([]byte, error) {
 	t.Helper()
-	root := filepath.Join(DOCTEST_ROOT, "testdata", fixtureName)
+	root := filepath.Join(d.DOCTEST_ROOT, "testdata", fixtureName)
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)

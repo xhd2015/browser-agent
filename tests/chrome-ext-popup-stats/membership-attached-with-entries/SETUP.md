@@ -33,7 +33,7 @@ import (
 	"github.com/xhd2015/browser-agent/popupstats"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Ensure maps exist so leaves can addEntry/setTabMeta without nil checks.
 	if req.Entries == nil {

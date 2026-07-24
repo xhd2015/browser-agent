@@ -33,7 +33,7 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.ReadyHeartbeat = 50 * time.Millisecond
 	req.ReadyTimeout = 400 * time.Millisecond

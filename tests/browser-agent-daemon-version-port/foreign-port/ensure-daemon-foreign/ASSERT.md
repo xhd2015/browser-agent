@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	if resp.CLIErr == "" {
 		t.Fatal("expected SessionNew/EnsureDaemon failure on foreign port")
 	}

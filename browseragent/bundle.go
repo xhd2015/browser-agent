@@ -35,7 +35,13 @@ type BundleOptions struct {
 type BundleResult struct {
 	ExtensionDir   string // absolute path staged for embed
 	SessionPageDir string
-	UsedFixture    bool
+	// UsedFixture is true if extension and/or session-page came from mini fixtures.
+	UsedFixture bool
+	// SessionPageFromFixture is true when the staged session-page is the mini
+	// fixture (not a vite react/dist build). Full install must treat this as failure.
+	SessionPageFromFixture bool
+	// ExtensionFromFixture is true when the staged extension came from fixtures.
+	ExtensionFromFixture bool
 }
 
 // Bundle stages extension and session-page content into embed paths under Root.
@@ -110,14 +116,15 @@ func Bundle(opts BundleOptions) (*BundleResult, error) {
 	}
 
 	return &BundleResult{
-		ExtensionDir:   absExt,
-		SessionPageDir: absSess,
-		UsedFixture:    usedFixture,
+		ExtensionDir:           absExt,
+		SessionPageDir:         absSess,
+		UsedFixture:            usedFixture,
+		SessionPageFromFixture: true,
+		ExtensionFromFixture:   true,
 	}, nil
 }
 
 func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest string) (*BundleResult, error) {
-	usedFixture := false
 	extFromFixture := false
 	sessFromFixture := false
 
@@ -143,37 +150,36 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 		}
 	}
 
-	// --- Session-page: vite build under react/, then stage ---
+	// --- Session-page: always prefer a fresh vite build under react/ ---
+	// Full (non-fixture) mode must not silently ship the mini poller SPA.
 	sessSrc := ""
+	buildErr := error(nil)
 	if dist, err := BuildSessionPage(absRoot); err == nil {
 		sessSrc = dist
-		// Ensure index.html for embed contract.
 		_ = normalizeSessionPageDist(sessSrc)
 		fmt.Fprintln(os.Stderr, "browser-agent bundle: staged session-page from react/dist (vite)")
 	} else {
+		buildErr = err
+		// Allow pre-built react/dist only when it is not a mini fixture tree.
 		for _, cand := range []string{
 			filepath.Join(absRoot, "react", "dist"),
 			filepath.Join(absRoot, "react", "dist", "session-page"),
 		} {
-			if hasSessionIndex(cand) {
+			if hasSessionIndex(cand) && !SessionPageDirIsMiniFixture(cand) {
 				sessSrc = cand
 				_ = normalizeSessionPageDist(sessSrc)
-				fmt.Fprintln(os.Stderr, "browser-agent bundle: using existing react/dist")
+				fmt.Fprintln(os.Stderr, "browser-agent bundle: using existing react/dist (vite build failed; reusing non-fixture dist)")
+				fmt.Fprintf(os.Stderr, "browser-agent bundle: warning: vite rebuild failed: %v\n", err)
 				break
 			}
 		}
 		if sessSrc == "" {
-			src, rerr := resolveFixtureSessionPageDir(absRoot, opts.FixtureSessionPageDir)
-			if rerr != nil {
-				return nil, fmt.Errorf("session-page build failed (%v) and no fixture: %w", err, rerr)
-			}
-			sessSrc = src
-			sessFromFixture = true
-			fmt.Fprintf(os.Stderr, "browser-agent bundle: session-page dist unavailable (%v); staging fixture\n", err)
+			return nil, fmt.Errorf(
+				"session-page vite build failed: %w\n  fix: install node + run npm/pnpm in react/, or: go run ./script/browser-agent/bundle --fixture (tests only)\n  full install will not embed the mini fixture SPA",
+				buildErr,
+			)
 		}
 	}
-
-	usedFixture = extFromFixture || sessFromFixture
 
 	if err := stageDir(extSrc, extDest); err != nil {
 		return nil, fmt.Errorf("stage extension: %w", err)
@@ -185,6 +191,10 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 	_ = normalizeSessionPageDist(sessDest)
 	// Canonical /assets/session-page.js for tests + stable URLs (vite uses hashes).
 	_ = ensureCanonicalSessionAssets(sessDest)
+
+	if SessionPageDirIsMiniFixture(sessDest) {
+		return nil, fmt.Errorf("staged session-page still looks like the mini fixture under %s; refuse to embed (rebuild react/)", sessDest)
+	}
 
 	absExt, err := filepath.Abs(extDest)
 	if err != nil {
@@ -198,9 +208,11 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 		return nil, err
 	}
 	return &BundleResult{
-		ExtensionDir:   absExt,
-		SessionPageDir: absSess,
-		UsedFixture:    usedFixture,
+		ExtensionDir:           absExt,
+		SessionPageDir:         absSess,
+		UsedFixture:            extFromFixture || sessFromFixture,
+		SessionPageFromFixture: sessFromFixture,
+		ExtensionFromFixture:   extFromFixture,
 	}, nil
 }
 

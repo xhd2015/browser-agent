@@ -101,43 +101,43 @@ func cliAssetsEnsure(args []string, env map[string]string, stdout, stderr io.Wri
 	if hasHelpFlag(args) {
 		return writeAssetsHelp(stdout)
 	}
-	applyAssetsEnv(env)
+	return browseragent.WithProcessEnv(assetEnvSubset(env), func() error {
+		cfg := browseragent.AssetDownloadConfig{
+			BaseURL: assetBaseURLFromEnv(env),
+		}
+		version := browseragent.ClientVersion()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
 
-	cfg := browseragent.AssetDownloadConfig{
-		BaseURL: assetBaseURLFromEnv(env),
-	}
-	version := browseragent.ClientVersion()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	dir, err := browseragent.EnsureAsset(ctx, ProductName, version, browseragent.AssetKindExtension, cfg)
-	if err != nil {
-		return fmt.Errorf("assets ensure extension: %w", err)
-	}
-	_, _ = fmt.Fprintf(stdout, "ensured extension -> %s\n", dir)
-	return nil
+		dir, err := browseragent.EnsureAsset(ctx, ProductName, version, browseragent.AssetKindExtension, cfg)
+		if err != nil {
+			return fmt.Errorf("assets ensure extension: %w", err)
+		}
+		_, _ = fmt.Fprintf(stdout, "ensured extension -> %s\n", dir)
+		return nil
+	})
 }
 
 func cliAssetsStatus(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if hasHelpFlag(args) {
 		return writeAssetsHelp(stdout)
 	}
-	applyAssetsEnv(env)
+	return browseragent.WithProcessEnv(assetEnvSubset(env), func() error {
+		version := browseragent.ClientVersion()
+		if v := strings.TrimSpace(version); v != "" && !strings.HasPrefix(v, "v") {
+			version = "v" + v
+		}
 
-	version := browseragent.ClientVersion()
-	if v := strings.TrimSpace(version); v != "" && !strings.HasPrefix(v, "v") {
-		version = "v" + v
-	}
+		embedOK := extensionEmbedComplete()
+		cacheOK := browseragent.CacheComplete(ProductName, version, browseragent.AssetKindExtension)
+		path := browseragent.AssetCacheDir(ProductName, version, browseragent.AssetKindExtension)
 
-	embedOK := extensionEmbedComplete()
-	cacheOK := browseragent.CacheComplete(ProductName, version, browseragent.AssetKindExtension)
-	path := browseragent.AssetCacheDir(ProductName, version, browseragent.AssetKindExtension)
-
-	_, _ = fmt.Fprintf(stdout, "extension:\n")
-	_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(embedOK))
-	_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(cacheOK))
-	_, _ = fmt.Fprintf(stdout, "  path:   %s\n", path)
-	return nil
+		_, _ = fmt.Fprintf(stdout, "extension:\n")
+		_, _ = fmt.Fprintf(stdout, "  embed:  %s\n", completeLabel(embedOK))
+		_, _ = fmt.Fprintf(stdout, "  cache:  %s\n", completeLabel(cacheOK))
+		_, _ = fmt.Fprintf(stdout, "  path:   %s\n", path)
+		return nil
+	})
 }
 
 func extensionEmbedComplete() bool {
@@ -155,15 +155,20 @@ func completeLabel(ok bool) string {
 	return "incomplete (false)"
 }
 
-func applyAssetsEnv(env map[string]string) {
+func assetEnvSubset(env map[string]string) map[string]string {
 	if env == nil {
-		return
+		return nil
 	}
+	out := map[string]string{}
 	for _, key := range []string{"XDG_CACHE_HOME", "HOME", "USERPROFILE", "BROWSER_AGENT_ASSET_BASE_URL"} {
 		if v, ok := env[key]; ok {
-			_ = os.Setenv(key, v)
+			out[key] = v
 		}
 	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func assetBaseURLFromEnv(env map[string]string) string {

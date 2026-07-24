@@ -24,9 +24,9 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	data := readLeafManifest(t, "manifest.json")
+	data := readLeafManifest(t, d, "manifest.json")
 	mustValidJSONObject(t, data)
 	req.ManifestJSON = data
 	req.ManifestSource = ManifestSourceBytes

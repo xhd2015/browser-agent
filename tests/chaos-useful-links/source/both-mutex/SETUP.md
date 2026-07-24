@@ -26,11 +26,11 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.SourceOp = SourceBoth
 	req.RandomLinks = true
-	req.LinksPath = filepath.Join(DOCTEST_ROOT, "testdata", "mixed.md")
+	req.LinksPath = filepath.Join(d.DOCTEST_ROOT, "testdata", "mixed.md")
 	return nil
 }
 ```

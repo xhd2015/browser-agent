@@ -193,6 +193,7 @@ remove corpus.json default load path
 
 ```go
 import (
+	"github.com/xhd2015/doctest/session"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -225,7 +226,7 @@ type Request struct {
 	// ModuleRoot is workspace module directory.
 	ModuleRoot string
 
-	// Fixture is a filename under DOCTEST_ROOT/testdata (preferred).
+	// Fixture is a filename under d.DOCTEST_ROOT/testdata (preferred).
 	Fixture string
 
 	// Text is inline document body when Fixture is empty (rare).
@@ -258,26 +259,26 @@ type Response struct {
 	ExitCode int
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
 	}
 	if req.ModuleRoot == "" {
-		req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+		req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	}
 
 	switch req.Mode {
 	case ModeExtract, ModeHistorical, ModeMaxSeeds, ModeMetadata:
-		return runLoadOrExtract(t, req)
+		return runLoadOrExtract(t, d, req)
 	case ModeSource:
-		return runSource(t, req)
+		return runSource(t, d, req)
 	default:
 		return nil, fmt.Errorf("unknown Mode %q", req.Mode)
 	}
 }
 
-func runLoadOrExtract(t *testing.T, req *Request) (*Response, error) {
+func runLoadOrExtract(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	opts := seedload.Options{
 		IncludeArchived: req.IncludeArchived,
@@ -291,7 +292,7 @@ func runLoadOrExtract(t *testing.T, req *Request) (*Response, error) {
 	)
 
 	if req.Fixture != "" {
-		path := fixturePath(req.Fixture)
+		path := fixturePath(d, req.Fixture)
 		resolved, err = seedload.LoadSeedsFromFile(path, opts)
 	} else if req.Text != "" {
 		resolved, err = seedload.ExtractLinks(req.Text, opts)
@@ -312,7 +313,7 @@ func runLoadOrExtract(t *testing.T, req *Request) (*Response, error) {
 	return resp, nil
 }
 
-func runSource(t *testing.T, req *Request) (*Response, error) {
+func runSource(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.SourceOp == "" {
 		t.Fatal("SourceOp must be set by leaf Setup for ModeSource")
@@ -356,7 +357,7 @@ func runSource(t *testing.T, req *Request) (*Response, error) {
 	case SourceBoth:
 		path := req.LinksPath
 		if path == "" {
-			path = fixturePath("mixed.md")
+			path = fixturePath(d, "mixed.md")
 		}
 		resolved, err := seedload.ResolveSeedSource(path, true, opts)
 		resp.Resolved = resolved
@@ -372,8 +373,8 @@ func runSource(t *testing.T, req *Request) (*Response, error) {
 	}
 }
 
-func fixturePath(name string) string {
-	return filepath.Join(DOCTEST_ROOT, "testdata", name)
+func fixturePath(d *session.Doctest, name string) string {
+	return filepath.Join(d.DOCTEST_ROOT, "testdata", name)
 }
 
 func seedURLs(seeds []seedload.Seed) []string {

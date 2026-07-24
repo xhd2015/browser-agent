@@ -1,13 +1,15 @@
-// Install bundles extension + session-page into browseragent embed trees, then
-// installs browser-agent into $GOBIN or $GOPATH/bin via `go install`.
+// Install rebuilds extension + React session-page into browseragent embed trees,
+// then installs browser-agent into $GOBIN or $GOPATH/bin via `go install`.
 //
 // Usage (from module root):
 //
 //	go run ./script/browser-agent/install
-//	go run ./script/browser-agent/install --fixture   # mini embed (no npm / vite)
+//	go run ./script/browser-agent/install --fixture   # mini embed only (tests / offline)
+//	go run ./script/browser-agent/install --skip-bundle  # only if a real SPA is already staged
 //
-// Git tracks only browseragent/embedded/**/placeholder.txt. Generated payloads
-// are gitignored; this install auto-bundles when the on-disk embed is incomplete.
+// By default install always runs a full bundle (vite session-page + extension)
+// so the binary embeds a fresh React app — it does not skip when a mini fixture
+// already sits under browseragent/embedded/session-page/.
 package main
 
 import (
@@ -35,7 +37,8 @@ func main() {
 
 func handle(args []string) error {
 	var fixture bool
-	var forceBundle bool
+	var skipBundle bool
+	var forceBundle bool // kept for compatibility; full mode always bundles unless --skip-bundle
 	var extra []string
 	for _, a := range args {
 		switch a {
@@ -44,7 +47,10 @@ func handle(args []string) error {
 			return nil
 		case "--fixture", "--mini":
 			fixture = true
+		case "--skip-bundle":
+			skipBundle = true
 		case "--force-bundle":
+			// Historical flag: full install always rebundles; accept as no-op.
 			forceBundle = true
 		default:
 			extra = append(extra, a)
@@ -53,33 +59,66 @@ func handle(args []string) error {
 	if len(extra) > 0 {
 		return fmt.Errorf("unrecognized args: %s", strings.Join(extra, " "))
 	}
+	if fixture && skipBundle {
+		return fmt.Errorf("cannot combine --fixture and --skip-bundle")
+	}
+	_ = forceBundle
 
 	root, err := findModuleRoot()
 	if err != nil {
 		return err
 	}
 
-	// 1) Auto-bundle when on-disk embeds are incomplete (placeholders only), or when forced.
-	needBundle := forceBundle || fixture || diskEmbedsIncomplete(root)
-	if needBundle {
-		if !forceBundle && !fixture {
-			fmt.Println("==> Embed incomplete (placeholders / missing outstanding files); auto-bundling…")
-		} else {
-			fmt.Println("==> Bundling browser-agent embed (extension + session-page)")
+	sessEmbed := filepath.Join(root, "browseragent", "embedded", "session-page")
+
+	// 1) Stage embed trees.
+	switch {
+	case fixture:
+		fmt.Println("==> Bundling mini fixtures into embed (--fixture)")
+		res, berr := browseragent.Bundle(browseragent.BundleOptions{
+			Root:       root,
+			UseFixture: true,
+		})
+		if berr != nil {
+			return fmt.Errorf("fixture bundle failed: %w", berr)
 		}
-		bundleArgs := []string{"run", "./script/browser-agent/bundle"}
-		if fixture {
-			bundleArgs = append(bundleArgs, "--fixture")
+		fmt.Printf("Staged fixture extension → %s\n", res.ExtensionDir)
+		fmt.Printf("Staged fixture session-page → %s\n", res.SessionPageDir)
+		fmt.Fprintln(os.Stderr, "warning: --fixture embeds the mini session-page (no React SPA)")
+
+	case skipBundle:
+		fmt.Println("==> Skipping bundle (--skip-bundle); verifying on-disk embed is a real SPA")
+		if diskEmbedsIncomplete(root) {
+			return fmt.Errorf("--skip-bundle: on-disk embed incomplete under browseragent/embedded/; omit --skip-bundle to rebuild")
 		}
-		if err := cmd.Debug().Dir(root).Run("go", bundleArgs...); err != nil {
-			return fmt.Errorf("bundle failed: %w\n  hint: fix node/vite or use --fixture; or hydrate at runtime (docs/assets-hydrate.md)", err)
+		if browseragent.SessionPageDirIsMiniFixture(sessEmbed) {
+			return fmt.Errorf("--skip-bundle: session-page under %s is still the mini fixture; omit --skip-bundle to run a full vite embed", sessEmbed)
 		}
-	} else {
-		fmt.Println("==> On-disk embed already complete; skipping bundle (pass --force-bundle to refresh)")
+		fmt.Printf("Using existing session-page embed → %s\n", sessEmbed)
+
+	default:
+		// Full install: always rebuild so //go:embed picks up a fresh React app.
+		// Do not skip when a mini fixture already satisfies weak "complete" checks.
+		fmt.Println("==> Full bundle (extension + fresh React session-page) → embed")
+		res, berr := browseragent.Bundle(browseragent.BundleOptions{
+			Root:       root,
+			UseFixture: false,
+		})
+		if berr != nil {
+			return fmt.Errorf("full bundle failed: %w\n  hint: need node + npm/pnpm in react/ for vite; or use --fixture for a mini embed only", berr)
+		}
+		if res.SessionPageFromFixture || browseragent.SessionPageDirIsMiniFixture(res.SessionPageDir) {
+			return fmt.Errorf("refusing to install: session-page is still a mini fixture at %s (React SPA not embedded)", res.SessionPageDir)
+		}
+		fmt.Printf("Staged extension → %s\n", res.ExtensionDir)
+		fmt.Printf("Staged session-page (React) → %s\n", res.SessionPageDir)
+		if res.ExtensionFromFixture {
+			fmt.Fprintln(os.Stderr, "warning: extension came from fixture; session-page is real SPA")
+		}
 	}
 
-	// 2) go install into GOBIN / GOPATH/bin.
-	fmt.Println("==> Installing browser-agent (go install)")
+	// 2) go install into GOBIN / GOPATH/bin (embeds browseragent/embedded/**).
+	fmt.Println("==> Installing browser-agent (go install; embeds staged session-page)")
 	if err := cmd.Debug().Dir(root).Run("go", "install", pkgPath); err != nil {
 		return fmt.Errorf("go install %s failed: %w", pkgPath, err)
 	}
@@ -91,14 +130,21 @@ func handle(args []string) error {
 		fmt.Printf("\nInstalled %s\n", dest)
 		fmt.Printf("Ensure %s is on your PATH.\n", filepath.Dir(dest))
 	}
+	if !fixture {
+		fmt.Println()
+		fmt.Println("Session page: React SPA embedded (not the mini fixture).")
+		fmt.Println("Restart any running daemon so it loads this binary:")
+		fmt.Println("  browser-agent serve --stop")
+		fmt.Println("  browser-agent session new")
+	}
 	fmt.Println()
 	fmt.Println("Next:")
 	fmt.Println("  browser-agent serve")
 	fmt.Println("  browser-agent install-chrome-extension")
 	fmt.Println("  browser-agent skill --show")
 	fmt.Println()
-	fmt.Println("Load unpacked extension from the path printed by install-chrome-extension")
-	fmt.Println("(or Chrome-Ext-Browser-Agent/build after bundle). Default control port: 43761.")
+	fmt.Println("Load unpacked extension from the path printed by install-chrome-extension.")
+	fmt.Println("Default control port: 43761.")
 	return nil
 }
 
@@ -113,26 +159,25 @@ func diskEmbedsIncomplete(root string) bool {
 func printHelp() {
 	fmt.Print(`Usage: go run ./script/browser-agent/install [options]
 
-Stage Chrome-Ext-Browser-Agent + react session-page into
-browseragent/embedded/** (for go:embed), then install the binary:
+Always rebuilds a full embed (Chrome extension + React session-page via vite)
+into browseragent/embedded/**, then:
 
   go install ./cmd/browser-agent
 
-Git tracks only embedded/**/placeholder.txt; generated files are gitignored.
-When the on-disk embed is incomplete (placeholders only), install auto-bundles
-before go install.
-
-The binary lands in $GOBIN if set, otherwise $GOPATH/bin (default ~/go/bin).
+so the binary //go:embed includes a fresh SPA — not a leftover mini fixture.
 
 Options:
-  --fixture, --mini   Stage mini fixtures only (no vite / node build)
-  --force-bundle      Bundle even if the on-disk embed looks complete
+  --fixture, --mini   Stage mini fixtures only (no vite). Not for normal use.
+  --skip-bundle       Skip rebuild; require an existing non-fixture SPA on disk.
+  --force-bundle      Accepted for compatibility (full mode always bundles).
   -h, --help          Show this help
 
-Without --fixture, bundle will:
-  1. Copy Chrome-Ext-Browser-Agent/public → build → embed
-  2. npm/pnpm install + vite build under react/ → embed
+Default (recommended):
+  1. vite build react/ → browseragent/embedded/session-page
+  2. stage extension → browseragent/embedded/extension
   3. go install ./cmd/browser-agent
+
+If vite/node is missing, install fails (does not silently embed the fixture SPA).
 `)
 }
 

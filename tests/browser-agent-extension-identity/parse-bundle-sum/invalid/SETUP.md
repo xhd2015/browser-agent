@@ -25,7 +25,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Deliberately missing BROWSER_AGENT_BUNDLE_* assignments.
 	req.BundleSumJS = []byte("// not a bundle-sum\nconsole.log('nope');\n")

@@ -29,7 +29,7 @@ Mock Extension ?-> /v1/hello, /v1/commands, /v1/status, /v1/complete
 ```go
 import "testing"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.OccupyAddr = false
 	// Addr empty → Run allocates free port.

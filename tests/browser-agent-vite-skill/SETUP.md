@@ -58,9 +58,9 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
-	req.ModuleRoot = filepath.Clean(filepath.Join(DOCTEST_ROOT, "..", ".."))
+	req.ModuleRoot = filepath.Clean(filepath.Join(d.DOCTEST_ROOT, "..", ".."))
 	dir := t.TempDir()
 	req.BaseDir = filepath.Join(dir, "browser-agent-vite-base")
 	if err := os.MkdirAll(req.BaseDir, 0o755); err != nil {

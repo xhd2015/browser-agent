@@ -290,7 +290,7 @@ type Response struct {
 }
 
 // Run executes the scenario selected by req.Mode and leaf Setup narrowing.
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req == nil {
 		t.Fatal("req is nil")
@@ -438,10 +438,6 @@ func runOpenManagedMode(t *testing.T, req *Request) (*Response, error) {
 		return resp, nil
 
 	case OpenManagedOpStdoutMarkers:
-		hooks := &inj.ManagedChromeHooks{LaunchFn: recordLaunch}
-		inj.ManagedChromeTestHooks = hooks
-		defer func() { inj.ManagedChromeTestHooks = nil }()
-
 		var stdout, stderr bytes.Buffer
 		args := []string{"open-managed-chrome"}
 		if req.URL != "" {
@@ -450,7 +446,10 @@ func runOpenManagedMode(t *testing.T, req *Request) (*Response, error) {
 		if req.ManagedRoot != "" {
 			args = append(args, "--root", req.ManagedRoot)
 		}
-		cliErr := browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+		hooks := &inj.ManagedChromeHooks{LaunchFn: recordLaunch}
+		cliErr := inj.WithManagedChromeHooks(hooks, func() error {
+			return browseragent.HandleCLI(args, map[string]string{}, &stdout, &stderr)
+		})
 		resp := &Response{
 			Stdout: stdout.String(),
 			Stderr: stderr.String(),
@@ -504,20 +503,22 @@ func runSessionNewIntegrationMode(t *testing.T, req *Request) (*Response, error)
 		t.Fatal("BaseDir must be set")
 	}
 
+	// Prefer SessionNewConfig.OpenChromeFn (not global ManagedChromeTestHooks):
+	// workspace leaves run under t.Parallel() and the inject pointer races —
+	// one leaf sees LaunchCallCount=0 while another sees 2. Record the same
+	// argv shape as production openChrome (empty extension path → no
+	// --load-extension). NoWait avoids the 30s extension poll when no real
+	// browser connects.
 	var launchCount int
 	var launchArgs []string
 	var mu sync.Mutex
-	hooks := &inj.ManagedChromeHooks{
-		LaunchFn: func(args []string) error {
-			mu.Lock()
-			defer mu.Unlock()
-			launchCount++
-			launchArgs = append([]string(nil), args...)
-			return nil
-		},
+	recordOpen := func(sessionURL, _ string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		launchCount++
+		launchArgs = browseragent.BuildChromeArgs(sessionURL, "")
+		return nil
 	}
-	inj.ManagedChromeTestHooks = hooks
-	defer func() { inj.ManagedChromeTestHooks = nil }()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -547,11 +548,13 @@ func runSessionNewIntegrationMode(t *testing.T, req *Request) (*Response, error)
 
 	var stdout, stderr bytes.Buffer
 	snCfg := browseragent.SessionNewConfig{
-		BaseDir:   req.BaseDir,
-		Addr:      addr,
-		SessionID: req.SessionID,
-		Stdout:    &stdout,
-		Stderr:    &stderr,
+		BaseDir:      req.BaseDir,
+		Addr:         addr,
+		SessionID:    req.SessionID,
+		OpenChromeFn: recordOpen,
+		NoWait:       true,
+		Stdout:       &stdout,
+		Stderr:       &stderr,
 	}
 	snErr := browseragent.SessionNew(snCfg)
 	resp := &Response{

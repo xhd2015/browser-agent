@@ -24,7 +24,7 @@ meta may record timeout/failure; recording.har must not be a corrupt partial fin
 ```go
 import "testing"
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	// Explicit leaf confirmation of parent intent.
 	req.ExtensionScript = ExtRecordNoComplete

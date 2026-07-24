@@ -9,10 +9,11 @@ import (
 )
 
 // launchChromeWithArgs launches Chrome with pre-built argv (managed or system).
-// Consults ManagedChromeTestHooks.LaunchFn when set (doctest argv recording).
+// Consults ManagedChromeTestHooks.LaunchFn when set (CLI doctest argv recording).
+// Prefer OpenManagedChromeConfig.LaunchFn / SessionNewConfig.OpenChromeFn in tests.
 func launchChromeWithArgs(args []string) error {
-	if inj.ManagedChromeTestHooks != nil && inj.ManagedChromeTestHooks.LaunchFn != nil {
-		return inj.ManagedChromeTestHooks.LaunchFn(args)
+	if fn := inj.ManagedChromeLaunchFn(); fn != nil {
+		return fn(args)
 	}
 	return startChromeProcess(args)
 }

@@ -276,7 +276,7 @@ type Response struct {
 	JobsSeen          []map[string]any
 }
 
-func Run(t *testing.T, req *Request) (*Response, error) {
+func Run(t *testing.T, d *session.Doctest, req *Request) (*Response, error) {
 	t.Helper()
 	if req.Mode == "" {
 		t.Fatal("Mode must be set by grouping/leaf Setup")
@@ -574,14 +574,11 @@ func startAgentServer(t *testing.T, req *Request) (*agentServer, func(), error) 
 	if sid == "" {
 		sid = fmt.Sprintf("sess-nested-%d", time.Now().UnixNano()%1e12)
 	}
+	// Bind with :0 inside Run (no listen/close TOCTOU). Discover the bound
+	// address from the session meta.json Run writes (Run does not write server.json).
 	addr := req.Addr
 	if addr == "" {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, nil, err
-		}
-		addr = ln.Addr().String()
-		_ = ln.Close()
+		addr = "127.0.0.1:0"
 	}
 	readyTO := req.ReadyTimeout
 	if readyTO <= 0 {
@@ -603,7 +600,20 @@ func startAgentServer(t *testing.T, req *Request) (*agentServer, func(), error) 
 		_, err := browseragent.Run(ctx, cfg)
 		errCh <- err
 	}()
-	baseURL := "http://" + addr
+	boundAddr, err := waitSessionMetaAddr(baseDir, sid, readyTO)
+	if err != nil {
+		cancel()
+		// Surface early Run failures (e.g. extract) when meta never appears.
+		select {
+		case runErr := <-errCh:
+			if runErr != nil {
+				return nil, nil, fmt.Errorf("serve ready: %v (run: %w)", err, runErr)
+			}
+		default:
+		}
+		return nil, nil, fmt.Errorf("serve ready: %w", err)
+	}
+	baseURL := "http://" + boundAddr
 	if err := waitHealth(baseURL, readyTO); err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("serve health: %w", err)
@@ -618,6 +628,46 @@ func startAgentServer(t *testing.T, req *Request) (*agentServer, func(), error) 
 		_ = os.RemoveAll(baseDir)
 	}
 	return srv, cleanup, nil
+}
+
+func waitSessionMetaAddr(baseDir, sessionID string, timeout time.Duration) (string, error) {
+	metaPath := filepath.Join(baseDir, "sessions", sessionID, "meta.json")
+	deadline := time.Now().Add(timeout)
+	var last error
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(metaPath)
+		if err != nil {
+			last = err
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		var meta struct {
+			Addr    string `json:"addr"`
+			BaseURL string `json:"base_url"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			last = err
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if strings.TrimSpace(meta.Addr) != "" {
+			return strings.TrimSpace(meta.Addr), nil
+		}
+		if u := strings.TrimSpace(meta.BaseURL); u != "" {
+			u = strings.TrimPrefix(u, "http://")
+			u = strings.TrimPrefix(u, "https://")
+			u = strings.TrimRight(u, "/")
+			if u != "" {
+				return u, nil
+			}
+		}
+		last = fmt.Errorf("session meta missing addr")
+		time.Sleep(10 * time.Millisecond)
+	}
+	if last == nil {
+		last = fmt.Errorf("session meta timeout")
+	}
+	return "", last
 }
 
 func waitHealth(baseURL string, timeout time.Duration) error {

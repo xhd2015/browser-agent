@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.ReadyTimeout = 5 * time.Second
 	// Default complete window; complete-fail shortens it.

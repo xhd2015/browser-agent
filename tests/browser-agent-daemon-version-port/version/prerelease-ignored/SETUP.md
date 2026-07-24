@@ -25,7 +25,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.VersionOp = VersionOpPrereleaseIgnored
 	req.CompareA = "0.2.0-beta"

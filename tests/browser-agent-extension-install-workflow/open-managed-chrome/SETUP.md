@@ -3,13 +3,13 @@
 **Feature**: open-managed-chrome renamed command + Chrome 137 warning
 
 ```
-Operator -> HandleCLI(open-managed-chrome [url]) -> ManagedChromeTestHooks.LaunchFn
+Operator -> WithManagedChromeHooks -> HandleCLI(open-managed-chrome [url]) -> LaunchFn
 open-chrome removed; stderr WarnLoadExtensionIgnored
 ```
 
 ## Preconditions
 
-- `ManagedChromeTestHooks.LaunchFn` injected by Run.
+- `inject.WithManagedChromeHooks` installs `LaunchFn` for the HandleCLI call only.
 - `TestHome` for managed layout when needed.
 
 ## Steps
@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	req.Mode = ModeOpenManagedChrome
 	req.ManagedRoot = filepath.Join(t.TempDir(), "managed-chrome")

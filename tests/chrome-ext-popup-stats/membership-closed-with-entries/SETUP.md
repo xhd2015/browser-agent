@@ -32,7 +32,7 @@ import (
 	"github.com/xhd2015/browser-agent/popupstats"
 )
 
-func Setup(t *testing.T, req *Request) error {
+func Setup(t *testing.T, d *session.Doctest, req *Request) error {
 	t.Helper()
 	if req.Entries == nil {
 		req.Entries = make(map[string]popupstats.EntryValue)

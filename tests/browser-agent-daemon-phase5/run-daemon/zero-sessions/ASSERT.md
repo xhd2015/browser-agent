@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-func Assert(t *testing.T, req *Request, resp *Response, err error) {
+func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
 	assertHTTPStatus(t, resp, http.StatusOK)
 	if len(resp.SessionsListIDs) != 0 {

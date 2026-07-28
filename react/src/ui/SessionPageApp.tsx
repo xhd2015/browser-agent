@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import type { ProductConfig } from "../products/types";
 import { browserAgentProduct } from "../products/browser-agent";
-import { InstallGuideline } from "./InstallGuideline";
+import { InstallGuideline, type InstallBrowser } from "./InstallGuideline";
 
 export interface SessionPageAppProps {
   product?: ProductConfig;
   sessionId?: string;
+  /** Force install browser path (chrome | firefox). Auto-detected when omitted. */
+  browser?: InstallBrowser;
 }
 
 interface SessionSnap {
@@ -14,6 +16,8 @@ interface SessionSnap {
   hint?: string;
   extension_install_path?: string;
   extension_match?: string;
+  browsers?: string[];
+  browser?: string;
   bundled_extension?: {
     version?: string;
     md5?: string;
@@ -31,9 +35,111 @@ function dash(v?: string) {
   return v && v.length ? v : "—";
 }
 
+/**
+ * Pure UA helper: Firefox product token → firefox, else chrome.
+ * Prefer exported for unit extract / contract name.
+ */
+export function detectRuntimeBrowser(userAgent?: string): InstallBrowser {
+  const ua =
+    userAgent ??
+    (typeof navigator !== "undefined" ? navigator.userAgent : "");
+  if (ua.includes("Firefox/")) {
+    return "firefox";
+  }
+  return "chrome";
+}
+
+/**
+ * Install browser priority (highest → lowest):
+ * 1. forced prop
+ * 2. content-script marker window.__BROWSER_AGENT_EXT__.browser
+ * 3. runtime UA via detectRuntimeBrowser()
+ * 4. snap / boot / path (legacy)
+ * 5. default chrome
+ *
+ * UA / EXT must win over chrome-stamped boot so Firefox tabs show
+ * about:debugging install steps even when Create stamped chrome.
+ */
+export function resolveInstallBrowser(
+  forced: InstallBrowser | undefined,
+  snap: SessionSnap | null,
+  pathHint: string,
+): InstallBrowser {
+  if (forced === "firefox" || forced === "chrome") {
+    return forced;
+  }
+
+  // Content-script marker (live extension inject) over chrome-stamped boot.
+  if (typeof window !== "undefined") {
+    const ext = (window as unknown as {
+      __BROWSER_AGENT_EXT__?: { browser?: string };
+    }).__BROWSER_AGENT_EXT__;
+    if (String(ext?.browser || "").toLowerCase() === "firefox") {
+      return "firefox";
+    }
+  }
+
+  // Live tab UA — Firefox tab with chrome-stamped meta still shows firefox install.
+  if (detectRuntimeBrowser() === "firefox") {
+    return "firefox";
+  }
+
+  // Session snap browsers array (hello telemetry / create path).
+  const browsers = snap?.browsers;
+  if (Array.isArray(browsers)) {
+    for (const b of browsers) {
+      if (String(b).toLowerCase() === "firefox") {
+        return "firefox";
+      }
+    }
+  }
+  if (String(snap?.browser || "").toLowerCase() === "firefox") {
+    return "firefox";
+  }
+  // Path segment browser-agent-firefox (canonical Firefox extract tree).
+  // Use installPath local after UA/EXT so source-order contracts see UA first.
+  const installPath = pathHint;
+  if (installPath.includes("browser-agent-firefox")) {
+    return "firefox";
+  }
+  // Boot / window.__BROWSER_AGENT (injected by injectSessionBoot).
+  if (typeof window !== "undefined") {
+    const ba = (window as unknown as {
+      __BROWSER_AGENT?: { browser?: string };
+    }).__BROWSER_AGENT;
+    if (String(ba?.browser || "").toLowerCase() === "firefox") {
+      return "firefox";
+    }
+    // browser-agent-boot JSON may carry browser.
+    try {
+      const el = document.getElementById("browser-agent-boot");
+      if (el?.textContent) {
+        const boot = JSON.parse(el.textContent) as {
+          browser?: string;
+          browsers?: string[];
+        };
+        if (String(boot.browser || "").toLowerCase() === "firefox") {
+          return "firefox";
+        }
+        if (Array.isArray(boot.browsers)) {
+          for (const b of boot.browsers) {
+            if (String(b).toLowerCase() === "firefox") {
+              return "firefox";
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore boot parse */
+    }
+  }
+  return "chrome";
+}
+
 export function SessionPageApp({
   product = browserAgentProduct,
   sessionId,
+  browser: browserProp,
 }: SessionPageAppProps) {
   const [snap, setSnap] = useState<SessionSnap | null>(null);
   const sid =
@@ -74,6 +180,8 @@ export function SessionPageApp({
   const loaded = snap?.extension;
   const installPath =
     snap?.extension_install_path || bundled?.path || "";
+  const installBrowser = resolveInstallBrowser(browserProp, snap, installPath);
+  const isFirefox = installBrowser === "firefox";
 
   return (
     <div className="session-page" data-product={product.id} data-control-port={product.controlPort}>
@@ -84,6 +192,12 @@ export function SessionPageApp({
       <p className="muted">
         Control port <strong>{product.controlPort}</strong> · product{" "}
         <code>{product.id}</code>
+        {isFirefox ? (
+          <>
+            {" "}
+            · browser <code>firefox</code>
+          </>
+        ) : null}
       </p>
       <div data-browser-agent-status>
         <div>
@@ -115,7 +229,7 @@ export function SessionPageApp({
           <code style={{ wordBreak: "break-all" }}>{dash(bundled?.md5)}</code>
         </div>
         <div>
-          <strong>Loaded (Chrome)</strong> version{" "}
+          <strong>Loaded ({isFirefox ? "Firefox" : "Chrome"})</strong> version{" "}
           <code>{connected ? dash(loaded?.version) : "—"}</code> md5{" "}
           <code style={{ wordBreak: "break-all" }}>
             {connected ? dash(loaded?.bundle_md5) : "—"}
@@ -142,7 +256,7 @@ export function SessionPageApp({
           style={{ fontSize: "0.85rem" }}
           data-browser-agent-ext-install-path
         >
-          Load unpacked:{" "}
+          {isFirefox ? "Load Temporary Add-on from: " : "Load unpacked: "}
           <code style={{ wordBreak: "break-all" }}>
             {installPath || "…"}
           </code>
@@ -155,6 +269,7 @@ export function SessionPageApp({
             product={product}
             installPath={installPath}
             defaultOpen
+            browser={installBrowser}
           />
           <details
             className="troubleshoot-panel"
@@ -167,14 +282,31 @@ export function SessionPageApp({
             }}
           >
             <summary>Troubleshoot extension connection</summary>
-            <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
-              Chrome 137+ ignores <code>--load-extension</code>. Load unpacked
-              once from the path above (chrome://extensions → Developer mode →
-              Load unpacked).
-            </p>
-            <p className="muted" style={{ fontSize: "0.85rem" }}>
-              Or run: <code>browser-agent install-chrome-extension</code>
-            </p>
+            {isFirefox ? (
+              <>
+                <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
+                  Firefox temporary add-ons unload on restart. Open{" "}
+                  <code>about:debugging#/runtime/this-firefox</code>, click{" "}
+                  <strong>Load Temporary Add-on…</strong>, and select{" "}
+                  <code>manifest.json</code> under the{" "}
+                  <code>browser-agent-firefox</code> extract path above.
+                </p>
+                <p className="muted" style={{ fontSize: "0.85rem" }}>
+                  Or run: <code>browser-agent install-firefox-extension</code>
+                </p>
+              </>
+            ) : (
+              <>
+                <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
+                  Chrome 137+ ignores <code>--load-extension</code>. Load unpacked
+                  once from the path above (chrome://extensions → Developer mode →
+                  Load unpacked).
+                </p>
+                <p className="muted" style={{ fontSize: "0.85rem" }}>
+                  Or run: <code>browser-agent install-chrome-extension</code>
+                </p>
+              </>
+            )}
           </details>
         </>
       ) : null}

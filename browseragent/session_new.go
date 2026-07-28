@@ -27,6 +27,25 @@ type EnsureDaemonConfig struct {
 	KillFn        func(meta DaemonMeta) error
 	Stderr        io.Writer
 	WaitTimeout   time.Duration
+
+	// PrepareUpgradeFn, when non-nil, is called instead of HTTP POST
+	// /v1/admin/prepare-upgrade. Errors are ignored (best-effort).
+	PrepareUpgradeFn func(baseURL string, delayMS int) error
+	// FetchSessionsFn, when non-nil, supplies session connectivity for waitList
+	// and reattach polling instead of GET /v1/sessions.
+	FetchSessionsFn func(baseURL string) ([]SessionConnView, error)
+	// SleepFn, when non-nil, replaces time.Sleep for prepare delay+slack.
+	SleepFn func(d time.Duration)
+	// ReattachWait is the max wait after waitDaemonReady for waitList reattach.
+	// Default DefaultReattachWait (30s) when <= 0.
+	ReattachWait time.Duration
+	// PrepareDelayMS is delay_ms for prepare-upgrade and the pre-kill sleep base.
+	// Default DefaultPrepareReconnectDelayMS (1000) when <= 0.
+	PrepareDelayMS int
+	// PrepareSlackMS is extra pre-kill sleep after delay. Default 200 when the
+	// zero-value product config applies both prepare defaults; explicit 0 with a
+	// positive PrepareDelayMS means no slack.
+	PrepareSlackMS int
 }
 
 // SessionNewTestHooks records injectable session-new hooks for CLI doctest.
@@ -39,13 +58,21 @@ type SessionNewConfig struct {
 	SessionID       string
 	NoOpenChrome    bool
 	OpenChromeFn    func(sessionURL, extensionInstallPath string) error
+	// OpenFirefoxFn opens Firefox with the session URL only (no extension path).
+	// Used when Browser == "firefox". Tests inject this; production uses openFirefox.
+	OpenFirefoxFn   func(sessionURL string) error
 	AgentRunProbeFn func(sessionID, systemPromptPath, workspaceDir string, env map[string]string) error
 	Stdout          io.Writer
 	Stderr          io.Writer
 
+	// Browser selects the operator browser path: "" / "chrome" (default) or "firefox".
+	// Invalid values return an error.
+	Browser string
+
 	// Home, when non-empty, extracts the canonical extension under
 	// {Home}/.browser-agent/... without mutating process HOME (parallel-safe
-	// for doctests). Empty means use the process HOME via EnsureCanonicalExtension.
+	// for doctests). Empty means use the process HOME via EnsureCanonicalExtension
+	// (chrome) or EnsureCanonicalFirefoxExtension (firefox).
 	Home string
 
 	// WaitExtensionTimeout is how long to wait for extension connection.
@@ -58,8 +85,9 @@ type SessionNewConfig struct {
 
 // EnsureDaemon returns daemon meta when the control plane at Addr is healthy and
 // server.json matches BaseDir; otherwise invokes SpawnFn (default: detached serve)
-// and polls until healthy. When client > daemon, may kill+respawn unless blocked
-// by extension-connected sessions (Q1).
+// and polls until healthy. When client > daemon, upgrades via prepare-upgrade
+// (best-effort), kill+respawn (session dirs kept), and wait for reattach (default
+// 30s). Extension-connected sessions no longer block upgrade.
 func EnsureDaemon(cfg EnsureDaemonConfig) (DaemonMeta, error) {
 	if strings.TrimSpace(cfg.BaseDir) == "" {
 		return DaemonMeta{}, fmt.Errorf("BaseDir is required")
@@ -97,20 +125,7 @@ func EnsureDaemon(cfg EnsureDaemonConfig) (DaemonMeta, error) {
 		cmp := CompareVersion(clientVer, daemonVer)
 		switch {
 		case cmp > 0:
-			sessions, _ := fetchDaemonSessions(baseURL)
-			connected := connectedSessionIDs(sessions)
-			if len(connected) > 0 {
-				upgradeWarnConnected(stderr, connected, daemonVer, clientVer)
-				return meta, nil
-			}
-			orphans := disconnectedSessionIDs(sessions)
-			if len(orphans) > 0 {
-				upgradeWarnOrphans(stderr, orphans)
-			}
-			if err := ensureDaemonKillAndRespawn(cfg, meta, stderr, orphans); err != nil {
-				return DaemonMeta{}, err
-			}
-			return waitDaemonReady(cfg, wantAddr, timeout)
+			return ensureDaemonUpgradeClientNewer(cfg, meta, baseURL, daemonVer, clientVer, wantAddr, timeout, stderr)
 		case cmp < 0:
 			warnOlderClient(stderr, clientVer, daemonVer)
 			return meta, nil
@@ -133,6 +148,10 @@ func EnsureDaemon(cfg EnsureDaemonConfig) (DaemonMeta, error) {
 }
 
 func ensureDaemonKillAndRespawn(cfg EnsureDaemonConfig, meta DaemonMeta, stderr io.Writer, orphanIDs []string) error {
+	// orphanIDs are warned by the caller; session dirs are intentionally kept
+	// so a respawned daemon can RestoreSessionsFromDisk.
+	_ = orphanIDs
+	_ = stderr
 	killFn := cfg.KillFn
 	if killFn == nil {
 		killFn = func(m DaemonMeta) error {
@@ -142,9 +161,7 @@ func ensureDaemonKillAndRespawn(cfg EnsureDaemonConfig, meta DaemonMeta, stderr 
 	if err := killFn(meta); err != nil {
 		return fmt.Errorf("kill daemon for upgrade: %w", err)
 	}
-	if len(orphanIDs) > 0 {
-		removeSessionDirs(cfg.BaseDir, orphanIDs)
-	}
+	// Phase 1: do NOT removeSessionDirs — preserve orphan session directories.
 	spawnFn := cfg.SpawnFn
 	if spawnFn == nil {
 		addr := ResolveEnsureAddr(cfg.Addr)
@@ -156,6 +173,12 @@ func ensureDaemonKillAndRespawn(cfg EnsureDaemonConfig, meta DaemonMeta, stderr 
 		return fmt.Errorf("respawn daemon: %w", err)
 	}
 	return nil
+}
+
+// TestExported_ensureDaemonKillAndRespawn exposes ensureDaemonKillAndRespawn for
+// doctests that exercise the upgrade wipe policy without exporting the helper.
+func TestExported_ensureDaemonKillAndRespawn(cfg EnsureDaemonConfig, meta DaemonMeta, stderr io.Writer, orphanIDs []string) error {
+	return ensureDaemonKillAndRespawn(cfg, meta, stderr, orphanIDs)
 }
 
 func waitDaemonReady(cfg EnsureDaemonConfig, wantAddr string, timeout time.Duration) (DaemonMeta, error) {
@@ -340,7 +363,8 @@ func spawnInProcessDaemon(baseDir, addr string) error {
 }
 
 // SessionNew ensures the daemon, creates a session via POST /v1/sessions, opens
-// Chrome via OpenChromeFn, and prints operator-facing stdout. Never launches agent-run.
+// the selected browser (Chrome default, or Firefox when Browser=firefox), and
+// prints operator-facing stdout. Never launches agent-run.
 func SessionNew(cfg SessionNewConfig) error {
 	if strings.TrimSpace(cfg.BaseDir) == "" {
 		return fmt.Errorf("BaseDir is required")
@@ -352,6 +376,11 @@ func SessionNew(cfg SessionNewConfig) error {
 	stderr := cfg.Stderr
 	if stderr == nil {
 		stderr = io.Discard
+	}
+
+	browser, err := normalizeSessionNewBrowser(cfg.Browser)
+	if err != nil {
+		return err
 	}
 
 	meta, err := EnsureDaemon(EnsureDaemonConfig{
@@ -369,43 +398,47 @@ func SessionNew(cfg SessionNewConfig) error {
 		return fmt.Errorf("daemon meta missing base URL")
 	}
 
-	var extPath string
-	if home := strings.TrimSpace(cfg.Home); home != "" {
-		p, _, err := EnsureCanonicalExtensionWithHome(home)
-		if err != nil {
-			return fmt.Errorf("ensure canonical extension: %w", err)
-		}
-		extPath = p
-	} else {
-		p, _, err := EnsureCanonicalExtension()
-		if err != nil {
-			return fmt.Errorf("ensure canonical extension: %w", err)
-		}
-		extPath = p
+	extPath, err := ensureSessionNewExtension(browser, cfg.Home)
+	if err != nil {
+		return err
 	}
 
-	result, err := postCreateSessionHTTP(baseURL, strings.TrimSpace(cfg.SessionID))
+	result, err := postCreateSessionHTTP(baseURL, strings.TrimSpace(cfg.SessionID), browser)
 	if err != nil {
 		return err
 	}
 
 	if !cfg.NoOpenChrome {
-		openFn := cfg.OpenChromeFn
-		if openFn == nil {
-			openFn = inj.SessionNewOpenChromeFn()
-		}
-		if openFn != nil {
-			if err := openFn(result.SessionURL, extPath); err != nil {
+		if browser == "firefox" {
+			openFn := cfg.OpenFirefoxFn
+			if openFn == nil {
+				openFn = inj.SessionNewOpenFirefoxFn()
+			}
+			if openFn != nil {
+				if err := openFn(result.SessionURL); err != nil {
+					fmt.Fprintf(stderr, "browser-agent: warning: open firefox: %v\n", err)
+				}
+			} else if err := openFirefox(result.SessionURL); err != nil {
+				fmt.Fprintf(stderr, "browser-agent: warning: open firefox: %v\n", err)
+			}
+		} else {
+			openFn := cfg.OpenChromeFn
+			if openFn == nil {
+				openFn = inj.SessionNewOpenChromeFn()
+			}
+			if openFn != nil {
+				if err := openFn(result.SessionURL, extPath); err != nil {
+					fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
+				}
+			} else if err := openChrome(result.SessionURL, ""); err != nil {
 				fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
 			}
-		} else if err := openChrome(result.SessionURL, ""); err != nil {
-			fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
 		}
 	}
 
 	// Always print operator instructions first so URL / install path are visible
 	// before any wait (or if the wait times out).
-	if err := formatSessionNewOutput(stdout, result, baseURL, extPath); err != nil {
+	if err := formatSessionNewOutput(stdout, result, baseURL, extPath, browser); err != nil {
 		return err
 	}
 
@@ -422,6 +455,51 @@ func SessionNew(cfg SessionNewConfig) error {
 	return nil
 }
 
+// normalizeSessionNewBrowser returns "chrome" or "firefox".
+// Empty / omitted browser defaults to chrome.
+func normalizeSessionNewBrowser(browser string) (string, error) {
+	b := strings.ToLower(strings.TrimSpace(browser))
+	switch b {
+	case "", "chrome":
+		return "chrome", nil
+	case "firefox":
+		return "firefox", nil
+	default:
+		return "", fmt.Errorf("unknown browser %q", browser)
+	}
+}
+
+// ensureSessionNewExtension extracts the canonical extension for the selected browser.
+func ensureSessionNewExtension(browser, home string) (string, error) {
+	home = strings.TrimSpace(home)
+	if browser == "firefox" {
+		if home != "" {
+			p, _, err := EnsureCanonicalFirefoxExtensionWithHome(home)
+			if err != nil {
+				return "", fmt.Errorf("ensure canonical firefox extension: %w", err)
+			}
+			return p, nil
+		}
+		p, _, err := EnsureCanonicalFirefoxExtension()
+		if err != nil {
+			return "", fmt.Errorf("ensure canonical firefox extension: %w", err)
+		}
+		return p, nil
+	}
+	if home != "" {
+		p, _, err := EnsureCanonicalExtensionWithHome(home)
+		if err != nil {
+			return "", fmt.Errorf("ensure canonical extension: %w", err)
+		}
+		return p, nil
+	}
+	p, _, err := EnsureCanonicalExtension()
+	if err != nil {
+		return "", fmt.Errorf("ensure canonical extension: %w", err)
+	}
+	return p, nil
+}
+
 type postCreateSessionResult struct {
 	SessionID  string
 	SessionURL string
@@ -430,10 +508,17 @@ type postCreateSessionResult struct {
 	SystemPath string
 }
 
-func postCreateSessionHTTP(baseURL, sessionID string) (*postCreateSessionResult, error) {
+func postCreateSessionHTTP(baseURL, sessionID, browser string) (*postCreateSessionResult, error) {
 	body := map[string]string{}
 	if sessionID != "" {
 		body["session_id"] = sessionID
+	}
+	// Stamp browser on the daemon Create so meta/snap use the matching extension tree.
+	// Empty / chrome omit the field (daemon defaults to Chrome).
+	if b := strings.ToLower(strings.TrimSpace(browser)); b == "firefox" {
+		body["browser"] = "firefox"
+	} else if b == "chrome" {
+		// Explicit chrome is fine; optional. Leave out to preserve empty-body chrome default.
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -485,12 +570,15 @@ func postCreateSessionHTTP(baseURL, sessionID string) (*postCreateSessionResult,
 	return result, nil
 }
 
-func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseURL, extPath string) error {
+func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseURL, extPath, browser string) error {
 	if w == nil {
 		w = io.Discard
 	}
 	if result == nil {
 		return fmt.Errorf("missing create session result")
+	}
+	if strings.EqualFold(strings.TrimSpace(browser), "firefox") {
+		return formatSessionNewFirefoxOutput(w, result, baseURL, extPath)
 	}
 	lines := []string{
 		fmt.Sprintf("session-id: %s", result.SessionID),
@@ -507,6 +595,55 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		"Note:",
 		"  Chrome 137+ cannot auto-load extensions. Load unpacked once in your Chrome",
 		"  (chrome://extensions → Developer mode → Load unpacked → path above).",
+		"",
+		"Next:",
+		fmt.Sprintf("  browser-agent session info --session-id %s", result.SessionID),
+		fmt.Sprintf("  browser-agent session eval --session-id %s 'document.title'", result.SessionID),
+		fmt.Sprintf("  browser-agent session run --session-id %s script.js", result.SessionID),
+		fmt.Sprintf("  browser-agent session logs --session-id %s", result.SessionID),
+		fmt.Sprintf("  browser-agent session screenshot --session-id %s -o out.png", result.SessionID),
+		fmt.Sprintf("  browser-agent session cdp --session-id %s Page.navigate '{\"url\":\"https://example.com\"}'", result.SessionID),
+		"",
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(w, strings.TrimRight(line, "\n")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formatSessionNewFirefoxOutput(w io.Writer, result *postCreateSessionResult, baseURL, extPath string) error {
+	if w == nil {
+		w = io.Discard
+	}
+	if result == nil {
+		return fmt.Errorf("missing create session result")
+	}
+	lines := []string{
+		fmt.Sprintf("session-id: %s", result.SessionID),
+		"",
+		fmt.Sprintf("export BROWSER_AGENT_SESSION_ID=%s", result.SessionID),
+		"",
+		fmt.Sprintf("Session URL: %s", result.SessionURL),
+		fmt.Sprintf("Control:     %s", baseURL),
+		fmt.Sprintf("browser:     firefox"),
+		"",
+		"Extension:",
+		fmt.Sprintf("  path    %s", extPath),
+		"  install browser-agent install-firefox-extension",
+		"",
+		"Install / load the temporary add-on:",
+		"",
+		"  1. Open about:debugging#/runtime/this-firefox",
+		"     (or type about:debugging in the address bar → This Firefox)",
+		"  2. Click Load Temporary Add-on…",
+		"  3. Select this folder's manifest.json:",
+		"",
+		fmt.Sprintf("     %s", extPath),
+		"",
+		"Note: temporary add-ons unload when Firefox restarts — re-run",
+		"install-firefox-extension and Load Temporary Add-on after a restart.",
 		"",
 		"Next:",
 		fmt.Sprintf("  browser-agent session info --session-id %s", result.SessionID),

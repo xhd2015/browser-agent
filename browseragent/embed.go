@@ -21,6 +21,14 @@ var embeddedExtension embed.FS
 
 const embeddedExtensionRoot = "embedded/extension"
 
+// embeddedFirefoxExtension is the Firefox MV3 temporary-add-on package.
+// Tracked under embedded/extension-firefox/ (P1 shell; not gitignored like Chrome).
+//
+//go:embed embedded/extension-firefox/**
+var embeddedFirefoxExtension embed.FS
+
+const embeddedFirefoxExtensionRoot = "embedded/extension-firefox"
+
 // embeddedSessionPage is the staged session-page SPA under embedded/session-page/.
 // Same placeholder / bundle / hydrate rules as the extension embed.
 //
@@ -36,16 +44,27 @@ func SessionPageFS() fs.FS {
 }
 
 // FormatSessionBootJSON returns boot config JSON for the session SPA:
-// session_id, product=browser-agent, control_port=43761.
+// session_id, product=browser-agent, control_port=43761 (chrome default).
 func FormatSessionBootJSON(sessionID string) string {
+	return FormatSessionBootJSONWithBrowser(sessionID, "chrome")
+}
+
+// FormatSessionBootJSONWithBrowser returns boot config JSON including the
+// operator browser ("chrome" or "firefox") so the SPA can pick install UX.
+func FormatSessionBootJSONWithBrowser(sessionID, browser string) string {
+	b := strings.ToLower(strings.TrimSpace(browser))
+	if b != "firefox" {
+		b = "chrome"
+	}
 	raw, err := json.Marshal(map[string]any{
 		"session_id":   sessionID,
 		"product":      ProductName,
 		"control_port": 43761,
+		"browser":      b,
 	})
 	if err != nil {
 		// Unreachable for string/int map values; keep a stable fallback.
-		return fmt.Sprintf(`{"session_id":%q,"product":%q,"control_port":43761}`, sessionID, ProductName)
+		return fmt.Sprintf(`{"session_id":%q,"product":%q,"control_port":43761,"browser":%q}`, sessionID, ProductName, b)
 	}
 	return string(raw)
 }

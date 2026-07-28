@@ -1,14 +1,18 @@
 ## Expected
 
-- client > daemon + connected → warn `cannot upgrade`; reuse; new session created
+- Phase 3 policy: client > daemon + connected → **upgrade proceeds** (no Q1 block).
+- SessionNew still creates session B after upgrade.
+- Stderr must **not** say `cannot upgrade` (connected no longer blocks).
+- Stderr should mention upgraded daemon (and may warn still-waiting reattach).
 
 ## Side Effects
 
-- See leaf scenario (may mutate daemon meta, session dirs, or stderr).
+- Old daemon may be killed and respawned; session dirs kept (Phase 1).
+- Fake extension on session A may not reattach within wait (soft warn).
 
 ## Errors
 
-- Wrong version/port/upgrade/stop behavior fails the assertion.
+- Reuse-without-upgrade (old Q1 `cannot upgrade`) fails this leaf.
 
 ## Exit Code
 
@@ -16,21 +20,16 @@
 
 ```go
 import (
-	"strings"
 	"testing"
 )
 
 func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err error) {
 	assertNoRunErr(t, err)
-	assertContainsFold(t, resp.Stderr, "cannot upgrade", req.SessionIDA)
-	if resp.KillFnCalled {
-		t.Fatal("connected session must block kill")
-	}
+	// Phase 3: connected sessions no longer block EnsureDaemon upgrade.
+	assertNotContainsFold(t, resp.Stderr, "cannot upgrade")
+	assertContainsFold(t, resp.Stderr, "upgraded daemon")
 	if !resp.SessionCreated {
-		t.Fatal("SessionNew should still create session B after blocked upgrade")
-	}
-	if resp.NewPID != 0 && resp.NewPID != resp.OldPID {
-		t.Fatal("original daemon PID should remain")
+		t.Fatal("SessionNew should still create session B after upgrade with connected sessions")
 	}
 }
 ```

@@ -9,6 +9,8 @@ import (
 )
 
 //go:embed VERSION.txt
+// VERSION.txt is generated from the repo-root VERSION.txt by
+// go run ./script/generate (install/bundle run generate first).
 var embeddedVersion string
 
 const (
@@ -21,7 +23,8 @@ const (
 // DefaultAddr is the product control listen address (host:port).
 const DefaultAddr = DefaultControlHost + ":43761"
 
-// ClientVersion returns the embedded CLI/daemon version from VERSION.txt.
+// ClientVersion returns the embedded CLI/daemon version from
+// browseragent/VERSION.txt (synced from root VERSION.txt via script/generate).
 func ClientVersion() string {
 	if inj.ClientVersionOverride != nil {
 		if v := strings.TrimSpace(inj.ClientVersionOverride()); v != "" {

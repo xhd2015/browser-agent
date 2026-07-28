@@ -7,6 +7,7 @@
 //	go run ./script/browser-agent/install --fixture   # mini embed only (tests / offline)
 //	go run ./script/browser-agent/install --skip-bundle  # only if a real SPA is already staged
 //
+// Always runs go run ./script/generate first (root VERSION.txt → sinks).
 // By default install always runs a full bundle (vite session-page + extension)
 // so the binary embeds a fresh React app — it does not skip when a mini fixture
 // already sits under browseragent/embedded/session-page/.
@@ -67,6 +68,12 @@ func handle(args []string) error {
 	root, err := findModuleRoot()
 	if err != nil {
 		return err
+	}
+
+	// 0) Stamp root VERSION.txt into package sinks before bundle / go install.
+	fmt.Println("==> generate (sync VERSION.txt)")
+	if err := cmd.Debug().Dir(root).Run("go", "run", "./script/generate"); err != nil {
+		return fmt.Errorf("generate failed: %w", err)
 	}
 
 	sessEmbed := filepath.Join(root, "browseragent", "embedded", "session-page")

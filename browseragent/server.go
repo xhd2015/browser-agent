@@ -68,9 +68,13 @@ func (c *controlServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", c.handleHealth)
 	mux.HandleFunc("/v1/shutdown", c.handleShutdown)
+	mux.HandleFunc("/v1/admin/prepare-upgrade", c.handlePrepareUpgrade)
 	mux.HandleFunc("/v1/sessions", c.handleSessions)
 	mux.HandleFunc("/v1/session", c.handleSession)
 	mux.HandleFunc("/v1/jobs", c.handleJobs)
+	mux.HandleFunc("/v1/ext/hello", c.handleExtHello)
+	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
+	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
 	mux.HandleFunc("/v1/ws", c.handleWS)
 	mux.HandleFunc("/go", c.handleGo)
 	mux.HandleFunc("/assets/", c.handleAssets)
@@ -166,6 +170,8 @@ func (c *controlServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 type createSessionRequest struct {
 	SessionID string `json:"session_id"`
+	// Browser optionally stamps chrome (default) or firefox extension install path.
+	Browser string `json:"browser,omitempty"`
 }
 
 func (c *controlServer) handleSessionsPost(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +218,7 @@ func (c *controlServer) handleSessionsPost(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	result, err := c.registry.Create(id)
+	result, err := c.registry.CreateWithOpts(id, CreateOpts{Browser: req.Browser})
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		if errors.Is(err, ErrSessionExists) {
@@ -223,7 +229,8 @@ func (c *controlServer) handleSessionsPost(w http.ResponseWriter, r *http.Reques
 			})
 			return
 		}
-		if ValidateSessionID(id) != nil {
+		// Unknown browser or invalid session id → 400.
+		if ValidateSessionID(id) != nil || strings.Contains(err.Error(), "unknown browser") {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -410,6 +417,8 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
+	// Wake HTTP long-poll clients waiting for work (no-op when none registered).
+	sess.notifyPollWaiters()
 
 	started := time.Now()
 	if shouldAlwaysLogJob(jobType, req.Params) {
@@ -586,12 +595,71 @@ func isSessionSPAHTML(htmlBody string) bool {
 	return false
 }
 
+// sessionSnapIsFirefox reports whether the session install path should use
+// Firefox temporary-add-on UX (browsers list or browser-agent-firefox path).
+func sessionSnapIsFirefox(snap sessionSnapshot) bool {
+	for _, b := range snap.Browsers {
+		if strings.EqualFold(strings.TrimSpace(b), "firefox") {
+			return true
+		}
+	}
+	path := snap.ExtensionInstallPath
+	if path == "" {
+		path = snap.BundledExtension.Path
+	}
+	return strings.Contains(path, "browser-agent-firefox")
+}
+
+// sessionInstallPanelHTML returns the expanded install <details> for Chrome or
+// Firefox. Both branches keep chrome://extensions and about:debugging copy in
+// source for dual-path contracts; runtime selects one panel.
+func sessionInstallPanelHTML(isFirefox bool) string {
+	if isFirefox {
+		return `
+<details id="browser-agent-install" open data-browser-agent-install data-product="browser-agent" data-control-port="43761" data-install-browser="firefox">
+  <summary>Install browser-agent Firefox extension</summary>
+  <div>
+    <p>Load the temporary Firefox add-on that connects to <code>127.0.0.1:43761</code> (path segment <code>browser-agent-firefox</code>).</p>
+    <ol>
+      <li>Open <strong>about:debugging#/runtime/this-firefox</strong> (or <strong>about:debugging</strong> → This Firefox)</li>
+      <li>Click <strong>Load Temporary Add-on…</strong></li>
+      <li>Open the folder under <code>…/browser-agent-firefox/&lt;version&gt;/</code></li>
+      <li>Select <strong>manifest.json</strong> (not the folder), then Open</li>
+      <li>Keep this page open so the extension can attach to the session</li>
+    </ol>
+    <p class="muted">Temporary add-ons unload when Firefox restarts. Or run: <code>browser-agent install-firefox-extension</code></p>
+  </div>
+</details>
+`
+	}
+	return `
+<details id="browser-agent-install" open data-browser-agent-install data-product="browser-agent" data-control-port="43761" data-install-browser="chrome">
+  <summary>Install browser-agent extension</summary>
+  <div>
+    <p>Load the unpacked Chrome extension that connects to <code>127.0.0.1:43761</code>.</p>
+    <ol>
+      <li>Open chrome://extensions</li>
+      <li>Enable Developer mode</li>
+      <li>Load unpacked the browser-agent package</li>
+      <li>Keep this page open so the extension can attach to the session</li>
+    </ol>
+    <p class="muted">Or run: <code>browser-agent install-chrome-extension</code></p>
+  </div>
+</details>
+`
+}
+
 // injectSessionBoot injects boot JSON / data attrs / __BROWSER_AGENT for the
 // live session. For SPA shells: boot only (React owns status/identity/install).
 // For non-SPA shells: also inject SSR identity + install panels once.
 func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string {
 	esc := html.EscapeString(sessionID)
-	bootJSON := FormatSessionBootJSON(sessionID)
+	isFirefox := sessionSnapIsFirefox(snap)
+	bootBrowser := "chrome"
+	if isFirefox {
+		bootBrowser = "firefox"
+	}
+	bootJSON := FormatSessionBootJSONWithBrowser(sessionID, bootBrowser)
 	// Escape </script> in JSON if session id ever contained that sequence.
 	bootJSONSafe := strings.ReplaceAll(bootJSON, "</", "<\\/")
 
@@ -601,10 +669,11 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
     product: "browser-agent",
     controlPort: 43761,
     defaultAddr: "127.0.0.1:43761",
-    sessionId: %q
+    sessionId: %q,
+    browser: %q
   };
 </script>
-`, bootJSONSafe, sessionID)
+`, bootJSONSafe, sessionID, bootBrowser)
 
 	out := htmlBody
 	// Page title: {sessionId} - Browser Agent (rewrite existing <title> or insert).
@@ -670,10 +739,15 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 
 	// SPA path: React SessionPageApp owns visible status/identity/install UI.
 	// Inject only a non-visible install marker so static HTML still documents
-	// chrome://extensions for contracts/tests (no second visible panel).
+	// chrome://extensions (Chrome) or about:debugging (Firefox) for contracts/tests.
 	if isSessionSPAHTML(htmlBody) {
 		if !strings.Contains(out, "data-browser-agent-install") {
-			marker := `<meta name="browser-agent-install" content="chrome://extensions Load unpacked" data-browser-agent-install data-install-via-spa="1" />`
+			var marker string
+			if isFirefox {
+				marker = `<meta name="browser-agent-install" content="about:debugging Load Temporary Add-on browser-agent-firefox" data-browser-agent-install data-install-via-spa="1" data-install-browser="firefox" />`
+			} else {
+				marker = `<meta name="browser-agent-install" content="chrome://extensions Load unpacked" data-browser-agent-install data-install-via-spa="1" data-install-browser="chrome" />`
+			}
 			if idx := strings.Index(strings.ToLower(out), "</head>"); idx >= 0 {
 				out = out[:idx] + marker + out[idx:]
 			} else {
@@ -698,21 +772,7 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 	// the dedicated install panel marker is already present.
 	if !strings.Contains(out, "data-browser-agent-install") &&
 		!strings.Contains(out, `id="browser-agent-install"`) {
-		panel := `
-<details id="browser-agent-install" open data-browser-agent-install data-product="browser-agent" data-control-port="43761">
-  <summary>Install browser-agent extension</summary>
-  <div>
-    <p>Load the unpacked Chrome extension that connects to <code>127.0.0.1:43761</code>.</p>
-    <ol>
-      <li>Open chrome://extensions</li>
-      <li>Enable Developer mode</li>
-      <li>Load unpacked the browser-agent package</li>
-      <li>Keep this page open so the extension can attach to the session</li>
-    </ol>
-    <p class="muted">Or run: <code>browser-agent install-chrome-extension</code></p>
-  </div>
-</details>
-`
+		panel := sessionInstallPanelHTML(isFirefox)
 		if idx := strings.Index(strings.ToLower(out), "</body>"); idx >= 0 {
 			out = out[:idx] + panel + out[idx:]
 		} else {
@@ -866,6 +926,12 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 	esc := html.EscapeString(sessionID)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	identity := extensionIdentityPanelHTML(sessionID, snap)
+	isFirefox := sessionSnapIsFirefox(snap)
+	bootBrowser := "chrome"
+	if isFirefox {
+		bootBrowser = "firefox"
+	}
+	installPanel := sessionInstallPanelHTML(isFirefox)
 	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>%s - Browser Agent</title>
 <style>
@@ -883,11 +949,12 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
     product: "browser-agent",
     controlPort: 43761,
     defaultAddr: "127.0.0.1:43761",
-    sessionId: %q
+    sessionId: %q,
+    browser: %q
   };
 </script>
 </head>
-<body data-browser-agent-session data-session-id="%s" data-product="browser-agent" data-control-port="43761">
+<body data-browser-agent-session data-session-id="%s" data-product="browser-agent" data-control-port="43761" data-browser="%s">
   %s
   <div id="root" data-browser-agent-root class="browser-agent-root">
   <h1>browser-agent</h1>
@@ -899,18 +966,7 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
     <div class="hint" id="st-hint">Loading status…</div>
   </div>
   %s
-  <details id="browser-agent-install" open data-browser-agent-install>
-    <summary>Install browser-agent extension</summary>
-    <div>
-      <p>Load the unpacked Chrome extension that connects to <code>127.0.0.1:43761</code>.</p>
-      <ol>
-        <li>Open chrome://extensions</li>
-        <li>Enable Developer mode</li>
-        <li>Load unpacked the browser-agent package</li>
-        <li>Keep this page open so the extension can attach to the session</li>
-      </ol>
-    </div>
-  </details>
+  %s
   <script>
 (function() {
   var sessionId = %q;
@@ -941,5 +997,5 @@ func (c *controlServer) writeFallbackSessionHTML(w http.ResponseWriter, sessionI
 })();
   </script>
   </div>
-</body></html>`, esc, FormatSessionBootJSON(sessionID), sessionID, esc, sessionWarningBannerHTML(sessionID), esc, identity, sessionID)
+</body></html>`, esc, FormatSessionBootJSONWithBrowser(sessionID, bootBrowser), sessionID, bootBrowser, esc, bootBrowser, sessionWarningBannerHTML(sessionID), esc, identity, installPanel, sessionID)
 }

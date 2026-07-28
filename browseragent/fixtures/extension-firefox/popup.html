@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Agent Firefox</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        min-width: 280px;
+        max-width: 360px;
+        margin: 12px;
+        font-size: 13px;
+      }
+      h1 {
+        font-size: 1.1rem;
+        margin: 0 0 0.5rem;
+      }
+      .muted {
+        color: #666;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Agent Firefox</h1>
+    <p class="muted">Control port <strong>43761</strong></p>
+    <p class="muted" id="hint">
+      Load as a temporary add-on via about:debugging (Load Temporary Add-on).
+    </p>
+    <script src="popup.js"></script>
+  </body>
+</html>

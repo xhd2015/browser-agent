@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -69,10 +70,33 @@ func (r *SessionRegistry) CreateSessionResultFor(id string) (*CreateSessionResul
 	}, true
 }
 
-// Create validates id, writes session artifacts, and registers the session.
+// CreateOpts configures optional fields when creating a session.
+type CreateOpts struct {
+	// Browser selects the extension install tree: "chrome" (default/empty) or "firefox".
+	// When "firefox", meta.json stamps browser=firefox and extension_install_path under
+	// browser-agent-firefox via EnsureCanonicalFirefoxExtension.
+	Browser string
+}
+
+// Create validates id, writes session artifacts, and registers the session (Chrome default).
 func (r *SessionRegistry) Create(id string) (*CreateSessionResult, error) {
+	return r.CreateWithOpts(id, CreateOpts{})
+}
+
+// CreateWithOpts is like Create but stamps browser-specific extension path and meta.
+func (r *SessionRegistry) CreateWithOpts(id string, opts CreateOpts) (*CreateSessionResult, error) {
 	if err := ValidateSessionID(id); err != nil {
 		return nil, err
+	}
+
+	browser := strings.ToLower(strings.TrimSpace(opts.Browser))
+	switch browser {
+	case "", "chrome":
+		browser = "chrome"
+	case "firefox":
+		// ok
+	default:
+		return nil, fmt.Errorf("unknown browser %q", opts.Browser)
 	}
 
 	r.mu.Lock()
@@ -90,7 +114,13 @@ func (r *SessionRegistry) Create(id string) (*CreateSessionResult, error) {
 		return nil, fmt.Errorf("create session dir: %w", err)
 	}
 
-	extPath, extVer, extErr := EnsureCanonicalExtension()
+	var extPath, extVer string
+	var extErr error
+	if browser == "firefox" {
+		extPath, extVer, extErr = EnsureCanonicalFirefoxExtension()
+	} else {
+		extPath, extVer, extErr = EnsureCanonicalExtension()
+	}
 	var embeddedSum BundleSum
 	if extErr == nil && extPath != "" {
 		if sum, sumErr := EnsureExtensionBundleSum(extPath, extVer); sumErr == nil {
@@ -124,6 +154,9 @@ func (r *SessionRegistry) Create(id string) (*CreateSessionResult, error) {
 		"product":            ProductName,
 		"control_port":       controlPort,
 	}
+	if browser == "firefox" {
+		meta["browser"] = "firefox"
+	}
 	if extPath != "" {
 		meta["extension_install_path"] = extPath
 		meta["extension_version"] = embeddedSum.Version
@@ -153,6 +186,10 @@ func (r *SessionRegistry) Create(id string) (*CreateSessionResult, error) {
 	if extPath != "" {
 		sess.setExtensionInstallPath(extPath)
 		sess.setEmbeddedIdentity(embeddedSum.Version, embeddedSum.MD5)
+	}
+	if browser == "firefox" {
+		// Stamp preferred browser so live snap / injectSessionBoot agree before telemetry.
+		sess.updateTelemetry("firefox", nil, nil)
 	}
 	r.sessions[id] = sess
 
@@ -245,6 +282,75 @@ func (r *SessionRegistry) Exists(id string) bool {
 		return true
 	}
 	return SessionDirExists(r.baseDir, id)
+}
+
+// RestoreSessionsFromDisk scans {baseDir}/sessions/*/ for valid session
+// directories with readable meta.json and registers them in-memory as
+// waiting_extension (extension.connected=false). It does not call Create and
+// does not rewrite disk files. Best-effort: invalid dirname, missing meta, or
+// corrupt meta are skipped. A missing sessions/ directory is not an error.
+func RestoreSessionsFromDisk(r *SessionRegistry) error {
+	if r == nil {
+		return errors.New("nil session registry")
+	}
+	sessionsRoot := filepath.Join(r.baseDir, "sessions")
+	entries, err := os.ReadDir(sessionsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read sessions dir: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		if ValidateSessionID(id) != nil {
+			continue
+		}
+		if _, ok := r.sessions[id]; ok {
+			continue
+		}
+		metaPath := filepath.Join(sessionsRoot, id, "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta map[string]any
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+
+		sess := newSession(id, r.baseDir)
+		if url, ok := meta["session_url"].(string); ok && strings.TrimSpace(url) != "" {
+			sess.setSessionURL(url)
+		} else {
+			// Fall back to current registry addr when meta lacks session_url.
+			sess.setSessionURL(r.BaseURL() + "/go?session=" + id)
+		}
+		if p, ok := meta["extension_install_path"].(string); ok && strings.TrimSpace(p) != "" {
+			sess.setExtensionInstallPath(p)
+		}
+		ver, _ := meta["extension_version"].(string)
+		md5, _ := meta["extension_md5"].(string)
+		if strings.TrimSpace(ver) != "" || strings.TrimSpace(md5) != "" {
+			sess.setEmbeddedIdentity(ver, md5)
+		}
+		// Restore stamped preferred browser so inject/session-info agree after restart.
+		if b, ok := meta["browser"].(string); ok {
+			b = strings.ToLower(strings.TrimSpace(b))
+			if b == "firefox" || b == "chrome" {
+				sess.updateTelemetry(b, nil, nil)
+			}
+		}
+		r.sessions[id] = sess
+	}
+	return nil
 }
 
 // Delete removes a session from the registry and deletes its on-disk directory.

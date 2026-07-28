@@ -8,6 +8,7 @@ import (
 // SessionNewHooks records injectable session-new hooks for CLI doctests.
 type SessionNewHooks struct {
 	OpenChromeFn    func(sessionURL, extensionInstallPath string) error
+	OpenFirefoxFn   func(sessionURL string) error
 	AgentRunProbeFn func(sessionID, systemPromptPath, workspaceDir string, env map[string]string) error
 }
 
@@ -47,6 +48,15 @@ func SessionNewOpenChromeFn() func(sessionURL, extensionInstallPath string) erro
 		return nil
 	}
 	return h.OpenChromeFn
+}
+
+// SessionNewOpenFirefoxFn returns a snapshot of OpenFirefoxFn (may be nil).
+func SessionNewOpenFirefoxFn() func(sessionURL string) error {
+	h := sessionNewHooks.Load()
+	if h == nil {
+		return nil
+	}
+	return h.OpenFirefoxFn
 }
 
 // SessionNewAgentRunProbeFn returns a snapshot of AgentRunProbeFn (may be nil).

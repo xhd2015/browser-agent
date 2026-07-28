@@ -8,7 +8,10 @@ const (
 	// FeatureBrowserAgent is the capability advertised by the extension hello.
 	FeatureBrowserAgent = "browser-agent"
 	// MinBrowserAgentVersion is the floor for supports_browser_agent.
-	MinBrowserAgentVersion = "1.0.0"
+	// After VERSION.txt unify, extension package version matches the product
+	// version (e.g. 0.3.1). Floor must stay below 0.x product numbers; the old
+	// extension-only scheme used 1.0.0+ and rejected unified 0.x hellos.
+	MinBrowserAgentVersion = "0.0.0"
 
 	// Session phases
 	PhaseWaitingExtension    = "waiting_extension"

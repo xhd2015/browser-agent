@@ -11,6 +11,7 @@ import (
 // BuildExtensionShell copies Chrome-Ext-Browser-Agent/public → build/.
 // No npm required when public/ exists (shell is static MV3 files).
 // Returns absolute path to build/ on success.
+// Chrome-only: does not stage Firefox-Ext-Browser-Agent.
 func BuildExtensionShell(root string) (buildDir string, err error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -23,6 +24,25 @@ func BuildExtensionShell(root string) (buildDir string, err error) {
 	}
 	if err := stageDir(publicDir, buildDir); err != nil {
 		return "", fmt.Errorf("stage extension public→build: %w", err)
+	}
+	return filepath.Abs(buildDir)
+}
+
+// BuildFirefoxExtensionShell copies Firefox-Ext-Browser-Agent/public → build/.
+// No npm required when public/ exists (shell is static MV3 files).
+// Returns absolute path to build/ on success.
+func BuildFirefoxExtensionShell(root string) (buildDir string, err error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	publicDir := filepath.Join(absRoot, "Firefox-Ext-Browser-Agent", "public")
+	buildDir = filepath.Join(absRoot, "Firefox-Ext-Browser-Agent", "build")
+	if st, err := os.Stat(filepath.Join(publicDir, "manifest.json")); err != nil || st.IsDir() {
+		return "", fmt.Errorf("extension public/manifest.json missing under %s", publicDir)
+	}
+	if err := stageDir(publicDir, buildDir); err != nil {
+		return "", fmt.Errorf("stage firefox extension public→build: %w", err)
 	}
 	return filepath.Abs(buildDir)
 }

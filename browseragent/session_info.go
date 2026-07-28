@@ -126,6 +126,19 @@ func FormatSessionInfo(w io.Writer, snap sessionSnapshot, browser map[string]any
 		if _, err := fmt.Fprintln(w, "  - Extension connected; browser-agent jobs are ready."); err != nil {
 			return err
 		}
+	} else if sessionSnapIsFirefox(snap) {
+		// Firefox temporary-add-on UX (about:debugging), not Chrome Load unpacked.
+		if _, err := fmt.Fprintln(w, "  - Run: browser-agent install-firefox-extension"); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w, "  - Open about:debugging#/runtime/this-firefox → Load Temporary Add-on…"); err != nil {
+			return err
+		}
+		if snap.ExtensionInstallPath != "" {
+			if _, err := fmt.Fprintf(w, "  - Load Temporary Add-on from: %s\n", snap.ExtensionInstallPath); err != nil {
+				return err
+			}
+		}
 	} else {
 		if _, err := fmt.Fprintln(w, "  - Run: browser-agent install-chrome-extension"); err != nil {
 			return err

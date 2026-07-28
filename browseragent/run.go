@@ -113,6 +113,10 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) (*Result, error) {
 	cfg.Addr = addr
 
 	registry := NewSessionRegistry(cfg.BaseDir, addr)
+	if err := RestoreSessionsFromDisk(registry); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("restore sessions from disk: %w", err)
+	}
 
 	baseURL := registry.BaseURL()
 	daemonVer := strings.TrimSpace(cfg.DaemonVersion)

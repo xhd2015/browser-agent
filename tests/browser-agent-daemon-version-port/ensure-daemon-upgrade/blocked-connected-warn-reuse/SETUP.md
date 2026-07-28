@@ -1,14 +1,16 @@
 # Scenario
 
-**Feature**: blocked connected warn reuse
+**Feature**: connected sessions no longer block upgrade (Phase 3)
 
 ```
-EnsureDaemon + CompareVersion -> reuse|warn|kill+respawn
+EnsureDaemon + CompareVersion + connected
+  -> prepare + kill+respawn (not reuse / cannot-upgrade)
+  SessionNew still creates session B
 ```
 
 ## Preconditions
 
-- `UpgradeOp = UpgradeOpBlockedConnected`.
+- `UpgradeOp = UpgradeOpBlockedConnected` (historical op name; behavior is allow-upgrade).
 
 ## Steps
 
@@ -16,7 +18,8 @@ EnsureDaemon + CompareVersion -> reuse|warn|kill+respawn
 
 ## Context
 
-- See ASSERT.md for expected outcomes.
+- Pre-Phase-3 Q1 reused the old daemon when extension-connected ≥1.
+- Phase 3 removes that block; ASSERT expects upgrade + session create.
 
 ```go
 import (

@@ -12,7 +12,7 @@ const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.1";
+    : "0.3.1";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 const FEATURES = ["browser-agent"];
@@ -257,12 +257,67 @@ function pushStatusForConnectedSessions() {
 function scheduleReconnect(sessionId) {
   const entry = sessions.get(sessionId);
   if (!entry || entry.reconnectTimer) return;
-  const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, entry.reconnectAttempt));
+  // Aggressive reconnect after prepare_reconnect: optional lower base/max from payload.
+  const base =
+    entry.prepareReconnectBaseMS > 0 ? entry.prepareReconnectBaseMS : RECONNECT_BASE_MS;
+  const max =
+    entry.prepareReconnectMaxMS > 0 ? entry.prepareReconnectMaxMS : RECONNECT_MAX_MS;
+  const delay = Math.min(max, base * Math.pow(2, entry.reconnectAttempt));
   entry.reconnectAttempt += 1;
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null;
     connectSession(sessionId, "reconnect");
   }, delay);
+}
+
+/**
+ * Control plane is about to restart (daemon upgrade). Schedule close after delay_ms,
+ * reset reconnectAttempt for aggressive reconnect, and apply optional retry hints.
+ */
+function handlePrepareReconnect(msg, sessionId, entry) {
+  const payload = (msg && msg.payload) || {};
+  let delayMs =
+    payload.delay_ms != null
+      ? Number(payload.delay_ms)
+      : payload.delayMs != null
+        ? Number(payload.delayMs)
+        : NaN;
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    delayMs = 1000;
+  }
+  if (payload.retry_base_ms != null && Number(payload.retry_base_ms) > 0) {
+    entry.prepareReconnectBaseMS = Number(payload.retry_base_ms);
+  } else if (payload.retryBaseMs != null && Number(payload.retryBaseMs) > 0) {
+    entry.prepareReconnectBaseMS = Number(payload.retryBaseMs);
+  }
+  if (payload.retry_max_ms != null && Number(payload.retry_max_ms) > 0) {
+    entry.prepareReconnectMaxMS = Number(payload.retry_max_ms);
+  } else if (payload.retryMaxMs != null && Number(payload.retryMaxMs) > 0) {
+    entry.prepareReconnectMaxMS = Number(payload.retryMaxMs);
+  }
+  // Force aggressive reconnect after the intentional close.
+  entry.reconnectAttempt = 0;
+  if (entry.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer);
+    entry.reconnectTimer = null;
+  }
+  baLog("log", "prepare_reconnect scheduled", {
+    session_id: sessionId,
+    delay_ms: delayMs,
+    reason: payload.reason || "",
+  });
+  setTimeout(() => {
+    entry.reconnectAttempt = 0;
+    if (entry.ws) {
+      try {
+        entry.ws.close();
+      } catch (e) {
+        /* ignore */
+      }
+    } else if (sessions.has(sessionId)) {
+      scheduleReconnect(sessionId);
+    }
+  }, delayMs);
 }
 
 /**
@@ -504,6 +559,10 @@ try {
 function handleMessage(msg, sessionId, entry) {
   if (!msg || typeof msg !== "object") return;
   const type = msg.type;
+  if (type === "prepare_reconnect") {
+    handlePrepareReconnect(msg, sessionId, entry);
+    return;
+  }
   if (type === "job") {
     handleJob(msg, sessionId, entry);
   }

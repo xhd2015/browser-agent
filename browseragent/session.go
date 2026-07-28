@@ -33,6 +33,10 @@ type session struct {
 	// Single extension WS writer (nil when disconnected).
 	ws *wsConn
 
+	// Poll-mode control events (e.g. prepare_reconnect) for HTTP transport sessions.
+	pollEvents  []map[string]any
+	pollWaiters []chan struct{}
+
 	// Optional hello observer (mismatch warning); called unlocked after state update.
 	onHello func(match string, embedded, loaded BundleSum, installPath string)
 
@@ -136,6 +140,71 @@ func (s *session) isExtensionConnected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.extConnected
+}
+
+// enqueuePollEvent appends a control event for HTTP poll clients and wakes waiters.
+func (s *session) enqueuePollEvent(ev map[string]any) {
+	if s == nil || ev == nil {
+		return
+	}
+	s.mu.Lock()
+	// Copy so callers can reuse maps freely.
+	cp := make(map[string]any, len(ev))
+	for k, v := range ev {
+		cp[k] = v
+	}
+	s.pollEvents = append(s.pollEvents, cp)
+	waiters := append([]chan struct{}(nil), s.pollWaiters...)
+	s.mu.Unlock()
+	for _, ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// drainPollEvents returns and clears all pending poll events.
+func (s *session) drainPollEvents() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.pollEvents) == 0 {
+		return []map[string]any{}
+	}
+	out := s.pollEvents
+	s.pollEvents = nil
+	return out
+}
+
+// notifyPollWaiters wakes long-poll handlers (job enqueued, event enqueued, etc.).
+func (s *session) notifyPollWaiters() {
+	s.mu.Lock()
+	waiters := append([]chan struct{}(nil), s.pollWaiters...)
+	s.mu.Unlock()
+	for _, ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *session) addPollWaiter(ch chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pollWaiters = append(s.pollWaiters, ch)
+}
+
+func (s *session) removePollWaiter(ch chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.pollWaiters[:0]
+	for _, w := range s.pollWaiters {
+		if w != ch {
+			out = append(out, w)
+		}
+	}
+	s.pollWaiters = out
 }
 
 func (s *session) markCreatedViaPOST() {
@@ -308,7 +377,8 @@ func buildHint(connected, supports bool) string {
 	return "Extension connected; browser-agent jobs are ready."
 }
 
-// computeSupportsBrowserAgent requires feature "browser-agent" and version ≥ 1.0.0.
+// computeSupportsBrowserAgent requires feature "browser-agent" and
+// version ≥ MinBrowserAgentVersion (0.0.0 after product/extension version unify).
 func computeSupportsBrowserAgent(version string, features []string) bool {
 	has := false
 	for _, f := range features {

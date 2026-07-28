@@ -1,0 +1,6 @@
+{
+  "name": "firefox-ext-browser-agent",
+  "version": "1.0.1",
+  "private": true,
+  "description": "Browser Agent Firefox extension shell (static public → build)"
+}

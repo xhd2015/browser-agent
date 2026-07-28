@@ -12,6 +12,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/xhd2015/browser-agent/browseragent"
@@ -38,6 +39,8 @@ Options:
   --fixture, --mini   Fixtures only (no vite / node)
   -h, --help          Show this help
 
+Always runs go run ./script/generate first (root VERSION.txt → sinks).
+
 Without --fixture:
   1. Copy Chrome-Ext-Browser-Agent/public → build → embed
   2. npm/pnpm install + vite build under react/ → embed
@@ -59,6 +62,11 @@ Also see: go run ./script/browser-agent/install
 		return fmt.Errorf("resolve working directory: %w", err)
 	}
 
+	// Stamp VERSION.txt into manifests / browseragent/VERSION.txt before staging.
+	if err := runGenerate(root); err != nil {
+		return err
+	}
+
 	res, err := browseragent.Bundle(browseragent.BundleOptions{
 		Root:       root,
 		UseFixture: useFixture,
@@ -78,6 +86,18 @@ Also see: go run ./script/browser-agent/install
 		fmt.Fprintln(os.Stderr, "hint: session-page is mini fixture; full SPA needs: go run ./script/browser-agent/install (node+vite in react/)")
 	} else if res.UsedFixture {
 		fmt.Fprintln(os.Stderr, "hint: extension used fixture; session-page is real SPA")
+	}
+	return nil
+}
+
+func runGenerate(root string) error {
+	fmt.Println("==> generate (sync VERSION.txt)")
+	cmd := exec.Command("go", "run", "./script/generate")
+	cmd.Dir = root
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("go run ./script/generate: %w", err)
 	}
 	return nil
 }

@@ -26,6 +26,7 @@ Commands:
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
   install-chrome-extension   Extract embedded Chrome extension
+  install-firefox-extension  Extract Firefox extension and print about:debugging help
   assets      Ensure/status hydrated session-page + extension assets
 
 Run 'browser-agent --help' for full help.
@@ -50,6 +51,7 @@ Commands:
                                        POST a raw CDP job (method + optional params JSON)
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
   install-chrome-extension   Extract embedded extension and print Load unpacked help
+  install-firefox-extension  Extract Firefox extension and print about:debugging help
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
                              Embedded agent skill (see: browser-agent skill --help)
@@ -78,7 +80,8 @@ session new flags:
   --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
   --host <host>              Control server host (default: 127.0.0.1)
   --server-port <port>       Control server port (default: 43761; reads server.json when omitted)
-  --no-open-chrome           Do not launch Chrome
+  --browser chrome|firefox   Browser to open (default: chrome)
+  --no-open-chrome           Do not launch the browser
   --no-wait                  Skip waiting for extension connection
 
 open-managed-chrome flags:
@@ -181,6 +184,8 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliSession(rest, env, stdout, stderr)
 	case "install-chrome-extension":
 		return cliInstallExt(rest, env, stdout, stderr)
+	case "install-firefox-extension":
+		return cliInstallFirefoxExt(rest, env, stdout, stderr)
 	case "open-managed-chrome":
 		return cliOpenManagedChrome(rest, env, stdout, stderr)
 	case "skill":
@@ -193,7 +198,7 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, skill, or assets", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
 	}
 }
 
@@ -297,24 +302,44 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	sessionID := flagString(args, "--session-id")
 	noOpenChrome := flagBool(args, "--no-open-chrome")
 	noWait := flagBool(args, "--no-wait")
+	browserFlag := flagString(args, "--browser")
 	addr := sessionNewAddrFromFlags(args)
 
 	if baseDir == "" {
 		baseDir = defaultCLIBaseDir()
 	}
 
+	browser := ""
+	if browserFlag != "" {
+		b, err := normalizeSessionNewBrowser(browserFlag)
+		if err != nil {
+			return fmt.Errorf("unknown browser %q", browserFlag)
+		}
+		browser = b
+	}
+
 	cfg := SessionNewConfig{
 		BaseDir:      baseDir,
 		Addr:         addr,
 		SessionID:    sessionID,
+		Browser:      browser,
 		NoOpenChrome: noOpenChrome,
 		NoWait:       noWait,
 		Stdout:       stdout,
 		Stderr:       stderr,
 	}
+	// Isolate ensure path when callers pass HOME via env (CLI doctests).
+	if env != nil {
+		if home := strings.TrimSpace(env["HOME"]); home != "" {
+			cfg.Home = home
+		}
+	}
 	// Snapshot CLI inject hooks onto cfg so SessionNew does not re-read globals.
 	if cfg.OpenChromeFn == nil {
 		cfg.OpenChromeFn = inj.SessionNewOpenChromeFn()
+	}
+	if cfg.OpenFirefoxFn == nil {
+		cfg.OpenFirefoxFn = inj.SessionNewOpenFirefoxFn()
 	}
 	return SessionNew(cfg)
 }
@@ -322,6 +347,66 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	baseDir := flagString(args, "--base-dir")
 	return InstallChromeExtension(stdout, baseDir)
+}
+
+func cliInstallFirefoxExt(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	opts, err := parseInstallFirefoxExtOptions(args)
+	if err != nil {
+		return err
+	}
+	if opts.forceColor && opts.noColor {
+		return fmt.Errorf("--color and --no-color cannot be specified together")
+	}
+
+	colors := newServeColor(stdout, env, opts.forceColor, opts.noColor)
+
+	// Prefer HOME from env for parallel-safe isolation (matches WithHome).
+	home := ""
+	if env != nil {
+		home = strings.TrimSpace(env["HOME"])
+	}
+	if home != "" {
+		return WithProcessEnv(map[string]string{"HOME": home}, func() error {
+			return installFirefoxExtensionBody(stdout, opts.baseDir, colors)
+		})
+	}
+
+	processEnvMu.Lock()
+	defer processEnvMu.Unlock()
+	return installFirefoxExtensionBody(stdout, opts.baseDir, colors)
+}
+
+type installFirefoxExtOptions struct {
+	baseDir    string
+	forceColor bool
+	noColor    bool
+}
+
+func parseInstallFirefoxExtOptions(args []string) (installFirefoxExtOptions, error) {
+	var opts installFirefoxExtOptions
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--base-dir":
+			if i+1 < len(args) {
+				opts.baseDir = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--base-dir="):
+			opts.baseDir = strings.TrimPrefix(a, "--base-dir=")
+		case a == "--color":
+			opts.forceColor = true
+		case a == "--no-color":
+			opts.noColor = true
+		case a == "-h" || a == "--help":
+			// no dedicated help; ignore (parent --help covers command list)
+		default:
+			if strings.HasPrefix(a, "-") {
+				return opts, fmt.Errorf("unrecognized flag %s\nRun 'browser-agent --help' for usage.", a)
+			}
+		}
+	}
+	return opts, nil
 }
 
 func cliOpenManagedChrome(args []string, env map[string]string, stdout, stderr io.Writer) error {

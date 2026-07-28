@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Agent Firefox",
+  "version": "0.3.1",
+  "description": "Browser Agent Firefox extension — temporary add-on for browser-agent control plane on port 43761",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "browser-agent@xhd2015"
+    }
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Browser Agent Firefox"
+  },
+  "permissions": [
+    "alarms",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "ws://127.0.0.1/*",
+    "ws://localhost/*",
+    "http://127.0.0.1:43761/*",
+    "http://localhost:43761/*",
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "js": [
+        "contentScript.js"
+      ],
+      "matches": [
+        "<all_urls>",
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

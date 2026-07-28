@@ -41,6 +41,11 @@ func handle(args []string) error {
 		return fmt.Errorf("resolve working directory: %w", err)
 	}
 
+	fmt.Println("==> generate (sync VERSION.txt)")
+	if err := cmd.Debug().Dir(root).Run("go", "run", "./script/generate"); err != nil {
+		return fmt.Errorf("generate failed: %w", err)
+	}
+
 	embedDir := filepath.Join(root, embedTargetRel)
 	if err := os.MkdirAll(embedDir, 0o755); err != nil {
 		return err

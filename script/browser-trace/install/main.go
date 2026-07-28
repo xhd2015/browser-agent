@@ -59,6 +59,11 @@ func handle(args []string) error {
 		return err
 	}
 
+	fmt.Println("==> generate (sync VERSION.txt)")
+	if err := cmd.Debug().Dir(root).Run("go", "run", "./script/generate"); err != nil {
+		return fmt.Errorf("generate failed: %w", err)
+	}
+
 	needBundle := forceBundle || fixture || diskEmbedIncomplete(root)
 	if needBundle {
 		if !forceBundle && !fixture {

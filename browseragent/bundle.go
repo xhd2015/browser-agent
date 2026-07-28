@@ -10,9 +10,23 @@ import (
 
 // Default embed destination paths relative to project Root.
 const (
-	DefaultEmbedExtensionRel = "browseragent/embedded/extension"
-	DefaultEmbedSessionRel   = "browseragent/embedded/session-page"
+	DefaultEmbedExtensionRel        = "browseragent/embedded/extension"
+	DefaultEmbedSessionRel          = "browseragent/embedded/session-page"
+	DefaultEmbedFirefoxExtensionRel = "browseragent/embedded/extension-firefox"
 )
+
+// FirefoxEmbedOptions configures staging of the Firefox extension embed tree.
+type FirefoxEmbedOptions struct {
+	Root       string // project root (tests use t.TempDir())
+	UseFixture bool   // prefer mini fixtures; no npm
+
+	// Optional absolute fixture source when UseFixture (tests set this).
+	// Empty → discover under Root (browseragent/fixtures/extension-firefox).
+	FixtureFirefoxExtensionDir string
+
+	// Dest relative to Root (default: DefaultEmbedFirefoxExtensionRel).
+	EmbedFirefoxExtensionRel string
+}
 
 // BundleOptions configures staging of extension + session-page embed trees.
 type BundleOptions struct {
@@ -101,6 +115,15 @@ func Bundle(opts BundleOptions) (*BundleResult, error) {
 	}
 	_ = normalizeSessionPageDist(sessDest)
 	_ = ensureCanonicalSessionAssets(sessDest)
+
+	// Dual-stage Firefox embed when sources/fixtures are available (Phase 1 E1).
+	if _, ferr := StageFirefoxExtensionEmbed(FirefoxEmbedOptions{
+		Root:                       absRoot,
+		UseFixture:                 true,
+		FixtureFirefoxExtensionDir: "", // resolve under Root
+	}); ferr != nil {
+		fmt.Fprintf(os.Stderr, "browser-agent bundle: firefox embed stage skipped: %v\n", ferr)
+	}
 
 	absExt, err := filepath.Abs(extDest)
 	if err != nil {
@@ -196,6 +219,14 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 		return nil, fmt.Errorf("staged session-page still looks like the mini fixture under %s; refuse to embed (rebuild react/)", sessDest)
 	}
 
+	// Dual-stage Firefox embed (public→build→extension-firefox) when available.
+	if _, ferr := StageFirefoxExtensionEmbed(FirefoxEmbedOptions{
+		Root:       absRoot,
+		UseFixture: false,
+	}); ferr != nil {
+		fmt.Fprintf(os.Stderr, "browser-agent bundle: firefox embed stage skipped: %v\n", ferr)
+	}
+
 	absExt, err := filepath.Abs(extDest)
 	if err != nil {
 		return nil, err
@@ -214,6 +245,114 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 		SessionPageFromFixture: sessFromFixture,
 		ExtensionFromFixture:   extFromFixture,
 	}, nil
+}
+
+// StageFirefoxExtensionEmbed stages the Firefox MV3 package into
+// {Root}/browseragent/embedded/extension-firefox (or EmbedFirefoxExtensionRel).
+//
+// Preference order:
+//  1. When UseFixture: fixtures/extension-firefox (or FixtureFirefoxExtensionDir)
+//  2. Real sources: BuildFirefoxExtensionShell(root) → stage build/
+//  3. Existing Firefox-Ext-Browser-Agent/build with manifest.json
+//  4. Fixture fallback under Root (even when UseFixture=false)
+//
+// Returns the absolute embed directory. Writes manifest.json on success.
+func StageFirefoxExtensionEmbed(opts FirefoxEmbedOptions) (embedDir string, err error) {
+	root := strings.TrimSpace(opts.Root)
+	if root == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve Root: %w", err)
+		}
+		root = cwd
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve Root: %w", err)
+	}
+
+	rel := strings.TrimSpace(opts.EmbedFirefoxExtensionRel)
+	if rel == "" {
+		rel = DefaultEmbedFirefoxExtensionRel
+	}
+	dest := filepath.Join(absRoot, filepath.FromSlash(rel))
+
+	src, fromFixture, serr := resolveFirefoxExtensionStageSource(absRoot, opts)
+	if serr != nil {
+		return "", serr
+	}
+	if err := stageDir(src, dest); err != nil {
+		return "", fmt.Errorf("stage firefox extension embed: %w", err)
+	}
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		return "", err
+	}
+	if st, err := os.Stat(filepath.Join(absDest, "manifest.json")); err != nil || st.IsDir() {
+		return "", fmt.Errorf("firefox embed missing manifest.json under %s", absDest)
+	}
+	if fromFixture {
+		fmt.Fprintln(os.Stderr, "browser-agent bundle: staged firefox embed from fixture")
+	} else {
+		fmt.Fprintln(os.Stderr, "browser-agent bundle: staged firefox embed from Firefox-Ext-Browser-Agent")
+	}
+	return absDest, nil
+}
+
+// resolveFirefoxExtensionStageSource picks the directory to copy into the firefox embed.
+func resolveFirefoxExtensionStageSource(absRoot string, opts FirefoxEmbedOptions) (src string, fromFixture bool, err error) {
+	if opts.UseFixture {
+		if s, rerr := resolveFixtureFirefoxExtensionDir(absRoot, opts.FixtureFirefoxExtensionDir); rerr == nil {
+			return s, true, nil
+		} else if strings.TrimSpace(opts.FixtureFirefoxExtensionDir) != "" {
+			return "", true, rerr
+		}
+		// Fall through: try real sources when fixture missing.
+	}
+
+	// Real sources: public → build, then stage build/.
+	if built, berr := BuildFirefoxExtensionShell(absRoot); berr == nil {
+		return built, false, nil
+	}
+	buildDir := filepath.Join(absRoot, "Firefox-Ext-Browser-Agent", "build")
+	if st, err2 := os.Stat(filepath.Join(buildDir, "manifest.json")); err2 == nil && !st.IsDir() {
+		abs, aerr := filepath.Abs(buildDir)
+		if aerr != nil {
+			return "", false, aerr
+		}
+		return abs, false, nil
+	}
+
+	// Fixture fallback (also when UseFixture and fixture was soft-missing above).
+	if s, rerr := resolveFixtureFirefoxExtensionDir(absRoot, opts.FixtureFirefoxExtensionDir); rerr == nil {
+		return s, true, nil
+	}
+	return "", false, fmt.Errorf("no firefox extension source under %s (tried public, build, fixtures/extension-firefox)", absRoot)
+}
+
+func resolveFixtureFirefoxExtensionDir(root, override string) (string, error) {
+	if strings.TrimSpace(override) != "" {
+		p := override
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		if st, err := os.Stat(filepath.Join(p, "manifest.json")); err == nil && !st.IsDir() {
+			return filepath.Abs(p)
+		}
+		return "", fmt.Errorf("fixture firefox extension missing manifest.json under %s", p)
+	}
+	candidates := []string{
+		filepath.Join(root, "browseragent", "fixtures", "extension-firefox"),
+		filepath.Join(root, "Firefox-Ext-Browser-Agent", "public"),
+		filepath.Join(root, "Firefox-Ext-Browser-Agent", "build"),
+		filepath.Join(root, "browseragent", "embedded", "extension-firefox"),
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(filepath.Join(c, "manifest.json")); err == nil && !st.IsDir() {
+			return filepath.Abs(c)
+		}
+	}
+	return "", fmt.Errorf("no fixture firefox extension found under %s (tried %v)", root, candidates)
 }
 
 func resolveFixtureExtensionDir(root, override string) (string, error) {

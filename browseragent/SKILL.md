@@ -22,6 +22,12 @@ Do not run `open-managed-chrome` unless the user explicitly asks for a separate 
 browser-agent session new
 ```
 
+Chrome is the default browser. For **Firefox**, pass `--browser firefox`:
+
+```bash
+browser-agent session new --browser firefox
+```
+
 Example stdout (ids differ):
 
 ```text
@@ -43,6 +49,31 @@ browser-agent session new
 Second `session new` only if the first session is gone/unusable after cleanup, or the user wants isolation.
 
 **Keep** the session page on `/go?session=<id>` — do not close it or navigate that tab away.
+
+### 1b. Extension install (Chrome vs Firefox)
+
+**Chrome** (default):
+
+```bash
+browser-agent install-chrome-extension
+```
+
+Then open `chrome://extensions` → enable Developer mode → Load unpacked → path printed by the CLI.
+
+**Firefox**:
+
+```bash
+browser-agent install-firefox-extension
+```
+
+Then load the temporary add-on:
+
+1. Open `about:debugging#/runtime/this-firefox` (or type `about:debugging` → This Firefox)
+2. Click **Load Temporary Add-on…**
+3. Open the folder under `…/browser-agent-firefox/<version>/`
+4. Select **manifest.json** (not the folder), then Open
+
+Temporary add-ons unload when Firefox restarts — re-run `install-firefox-extension` and Load Temporary Add-on after a restart.
 
 ### 2. Example commands (same session id)
 

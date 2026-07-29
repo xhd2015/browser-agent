@@ -22,6 +22,7 @@ import (
 var placeholders = []string{
 	"browseragent/embedded/extension/placeholder.txt",
 	"browseragent/embedded/session-page/placeholder.txt",
+	"browseragent/embedded/firefox-xpi/placeholder.txt",
 }
 
 func main() {

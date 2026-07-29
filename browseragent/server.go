@@ -76,10 +76,50 @@ func (c *controlServer) handler() http.Handler {
 	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
 	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
 	mux.HandleFunc("/v1/ws", c.handleWS)
+	mux.HandleFunc(FirefoxXPIHTTPPath, c.handleFirefoxXPI)
 	mux.HandleFunc("/go", c.handleGo)
 	mux.HandleFunc("/assets/", c.handleAssets)
 	mux.HandleFunc("/", c.handleRoot)
 	return mux
+}
+
+// handleFirefoxXPI serves the signed Firefox .xpi for permanent install.
+// Operators can open this URL in Firefox (from the session page) to get the
+// install prompt — more reliable than file:// navigation from http origins.
+func (c *controlServer) handleFirefoxXPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !EmbeddedFirefoxXPIAvailable() {
+		http.Error(w, "signed Firefox .xpi not embedded in this binary (reinstall with signed xpi staged)", http.StatusNotFound)
+		return
+	}
+	path, _, err := EnsureCanonicalFirefoxXPI()
+	if err != nil {
+		// Fall back to serving embed bytes directly.
+		data, rerr := embeddedFirefoxXPI.ReadFile(embeddedFirefoxXPIRoot + "/" + firefoxXPIFileName)
+		if rerr != nil {
+			http.Error(w, "firefox xpi unavailable: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-xpinstall")
+		w.Header().Set("Content-Disposition", `attachment; filename="browser-agent.xpi"`)
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-xpinstall")
+	w.Header().Set("Content-Disposition", `attachment; filename="browser-agent.xpi"`)
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
 }
 
 func (c *controlServer) writeSessionNotFound(w http.ResponseWriter) {
@@ -619,7 +659,16 @@ func sessionInstallPanelHTML(isFirefox bool) string {
 <details id="browser-agent-install" open data-browser-agent-install data-product="browser-agent" data-control-port="43761" data-install-browser="firefox">
   <summary>Install browser-agent Firefox extension</summary>
   <div>
-    <p>Load the temporary Firefox add-on that connects to <code>127.0.0.1:43761</code> (path segment <code>browser-agent-firefox</code>).</p>
+    <p><strong>Permanent install (recommended)</strong> — open the signed package:</p>
+    <p>
+      <a href="/v1/firefox-xpi" data-firefox-xpi-http>Download / open browser-agent.xpi</a>
+      (<code>/v1/firefox-xpi</code>) — Firefox should prompt to install.
+    </p>
+    <p class="muted" data-firefox-xpi-file>Also available as a <code>file://</code> path after
+      <code>browser-agent install-firefox-extension</code> (session status may show
+      <code>firefox_xpi_url</code>). Clicking <code>file://</code> from this page may be blocked;
+      paste into the address bar or use the download link above.</p>
+    <p>Or load a temporary add-on (unloads when Firefox restarts; path segment <code>browser-agent-firefox</code>):</p>
     <ol>
       <li>Open <strong>about:debugging#/runtime/this-firefox</strong> (or <strong>about:debugging</strong> → This Firefox)</li>
       <li>Click <strong>Load Temporary Add-on…</strong></li>
@@ -627,7 +676,7 @@ func sessionInstallPanelHTML(isFirefox bool) string {
       <li>Select <strong>manifest.json</strong> (not the folder), then Open</li>
       <li>Keep this page open so the extension can attach to the session</li>
     </ol>
-    <p class="muted">Temporary add-ons unload when Firefox restarts. Or run: <code>browser-agent install-firefox-extension</code></p>
+    <p class="muted">Or run: <code>browser-agent install-firefox-extension</code></p>
   </div>
 </details>
 `

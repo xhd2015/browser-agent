@@ -29,6 +29,16 @@ var embeddedFirefoxExtension embed.FS
 
 const embeddedFirefoxExtensionRoot = "embedded/extension-firefox"
 
+// embeddedFirefoxXPI holds the signed AMO .xpi (browser-agent.xpi) plus optional
+// VERSION.txt. Produced by script/browser-agent/firefox/sign and staged by
+// script/browser-agent/install. Git tracks placeholder.txt only; fat local
+// builds stage browser-agent.xpi (see StageFirefoxXPIEmbed).
+//
+//go:embed embedded/firefox-xpi/**
+var embeddedFirefoxXPI embed.FS
+
+const embeddedFirefoxXPIRoot = "embedded/firefox-xpi"
+
 // embeddedSessionPage is the staged session-page SPA under embedded/session-page/.
 // Same placeholder / bundle / hydrate rules as the extension embed.
 //

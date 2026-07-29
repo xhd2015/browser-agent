@@ -15,6 +15,9 @@ interface SessionSnap {
   phase?: string;
   hint?: string;
   extension_install_path?: string;
+  firefox_xpi_path?: string;
+  firefox_xpi_url?: string;
+  firefox_xpi_http_url?: string;
   extension_match?: string;
   browsers?: string[];
   browser?: string;
@@ -180,6 +183,9 @@ export function SessionPageApp({
   const loaded = snap?.extension;
   const installPath =
     snap?.extension_install_path || bundled?.path || "";
+  const xpiPath = snap?.firefox_xpi_path || "";
+  const xpiFileURL = snap?.firefox_xpi_url || "";
+  const xpiHttpURL = snap?.firefox_xpi_http_url || "/v1/firefox-xpi";
   const installBrowser = resolveInstallBrowser(browserProp, snap, installPath);
   const isFirefox = installBrowser === "firefox";
 
@@ -261,6 +267,26 @@ export function SessionPageApp({
             {installPath || "…"}
           </code>
         </p>
+        {isFirefox && (xpiFileURL || xpiPath) ? (
+          <p
+            className="muted"
+            style={{ fontSize: "0.85rem", wordBreak: "break-all" }}
+            data-browser-agent-firefox-xpi
+          >
+            Signed .xpi:{" "}
+            {xpiFileURL ? (
+              <a href={xpiFileURL} data-firefox-xpi-file>
+                {xpiFileURL}
+              </a>
+            ) : (
+              <code>{xpiPath}</code>
+            )}
+            {" · "}
+            <a href={xpiHttpURL} data-firefox-xpi-http>
+              {xpiHttpURL}
+            </a>
+          </p>
+        ) : null}
       </section>
 
       {!connected ? (
@@ -268,6 +294,9 @@ export function SessionPageApp({
           <InstallGuideline
             product={product}
             installPath={installPath}
+            xpiPath={xpiPath}
+            xpiFileURL={xpiFileURL}
+            xpiHttpURL={isFirefox ? xpiHttpURL : undefined}
             defaultOpen
             browser={installBrowser}
           />
@@ -285,7 +314,15 @@ export function SessionPageApp({
             {isFirefox ? (
               <>
                 <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
-                  Firefox temporary add-ons unload on restart. Open{" "}
+                  Prefer the signed <code>.xpi</code> (download link above /{" "}
+                  <a href={xpiHttpURL}>/v1/firefox-xpi</a>
+                  {xpiFileURL ? (
+                    <>
+                      {" "}
+                      or <code style={{ wordBreak: "break-all" }}>{xpiFileURL}</code>
+                    </>
+                  ) : null}
+                  ). Temporary add-ons unload on restart: open{" "}
                   <code>about:debugging#/runtime/this-firefox</code>, click{" "}
                   <strong>Load Temporary Add-on…</strong>, and select{" "}
                   <code>manifest.json</code> under the{" "}

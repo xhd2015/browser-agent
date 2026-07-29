@@ -78,18 +78,18 @@ func ensureCanonicalFirefoxExtensionBody() (path, version string, err error) {
 }
 
 // InstallFirefoxExtension extracts the embedded Firefox package to the canonical
-// install path and writes about:debugging / Load Temporary Add-on help to w.
+// install path and writes install help to w. Does not open Firefox (library API).
 // baseDir is ignored (canonical path is always under home). Output ends with a
 // trailing newline. Color is auto (off for non-TTY writers such as bytes.Buffer).
 func InstallFirefoxExtension(w io.Writer, baseDir string) error {
 	processEnvMu.Lock()
 	defer processEnvMu.Unlock()
 	colors := newServeColor(w, nil, false, false)
-	return installFirefoxExtensionBody(w, baseDir, colors)
+	return installFirefoxExtensionBody(w, baseDir, colors, false)
 }
 
 // InstallFirefoxExtensionWithHome isolates HOME for the install (parallel-safe).
-// Color is auto (off for non-TTY writers).
+// Color is auto (off for non-TTY writers). Does not open Firefox.
 func InstallFirefoxExtensionWithHome(w io.Writer, baseDir, home string) error {
 	env := map[string]string{}
 	if home != "" {
@@ -97,14 +97,16 @@ func InstallFirefoxExtensionWithHome(w io.Writer, baseDir, home string) error {
 	}
 	return WithProcessEnv(env, func() error {
 		colors := newServeColor(w, env, false, false)
-		return installFirefoxExtensionBody(w, baseDir, colors)
+		return installFirefoxExtensionBody(w, baseDir, colors, false)
 	})
 }
 
 // installFirefoxExtensionBody extracts and writes operator help. colors controls
 // ANSI styling (green success/path, orange critical step tokens, gray labels,
-// yellow warning:). Caller must hold processEnvMu (directly or via WithProcessEnv).
-func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor) error {
+// yellow warning:). When openXPI is true and a signed .xpi is available, opens
+// the .xpi in Firefox (install prompt). Caller must hold processEnvMu
+// (directly or via WithProcessEnv).
+func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor, openXPI bool) error {
 	if w == nil {
 		w = io.Discard
 	}
@@ -114,6 +116,20 @@ func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor)
 		return err
 	}
 
+	// Prefer permanent signed .xpi when embedded.
+	var xpiPath, xpiVersion string
+	if EmbeddedFirefoxXPIAvailable() {
+		xpiPath, xpiVersion, err = ensureCanonicalFirefoxXPIBody()
+		if err != nil {
+			// Soft: still print temporary path if xpi extract fails.
+			xpiPath = ""
+			colors.writeWarning(w, "signed .xpi extract failed: "+err.Error())
+		}
+		if xpiVersion != "" {
+			version = xpiVersion
+		}
+	}
+
 	// Success head (green when color on).
 	if _, err := fmt.Fprintln(w, colors.green("Firefox extension extracted for browser-agent.")); err != nil {
 		return err
@@ -121,7 +137,13 @@ func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor)
 	if _, err := fmt.Fprintln(w); err != nil {
 		return err
 	}
-	// Labels gray; path value highlighted (copy target).
+
+	if xpiPath != "" {
+		if _, err := fmt.Fprintf(w, "  %s      %s\n", colors.gray("xpi"), colors.green(xpiPath)); err != nil {
+			return err
+		}
+	}
+	// Unpacked package path (temporary add-on / development).
 	if _, err := fmt.Fprintf(w, "  %s     %s\n", colors.gray("path"), colors.green(path)); err != nil {
 		return err
 	}
@@ -129,13 +151,50 @@ func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor)
 		return err
 	}
 
-	// Steps with critical tokens highlighted (orange); path green under step 3.
-	// Step 3 = open folder only; step 4 = select manifest.json.
+	// Permanent install via signed .xpi (open file → Firefox install prompt).
+	if xpiPath != "" {
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w, colors.gray("Permanent install (recommended) — open the signed .xpi in Firefox:")); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "     %s\n", colors.green(xpiPath)); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return err
+		}
+		if openXPI {
+			if err := openFirefoxXPI(xpiPath); err != nil {
+				colors.writeWarning(w, "could not open .xpi in Firefox: "+err.Error()+" — open the path above manually")
+			} else {
+				if _, err := fmt.Fprintln(w, colors.green("Opened the .xpi in Firefox — confirm the install prompt.")); err != nil {
+					return err
+				}
+			}
+		} else {
+			if _, err := fmt.Fprintf(w, "  Open that file in Firefox (or re-run without %s) to install permanently.\n", colors.orange("--no-open")); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Temporary add-on steps (fallback / development; still required markers for CLI tests).
 	if _, err := fmt.Fprintln(w); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(w, colors.gray("Install / load the temporary add-on:")); err != nil {
-		return err
+	if xpiPath != "" {
+		if _, err := fmt.Fprintln(w, colors.gray("Or load a temporary add-on (unloads when Firefox restarts):")); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintln(w, colors.gray("Install / load the temporary add-on:")); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintln(w); err != nil {
 		return err
@@ -179,7 +238,11 @@ func installFirefoxExtensionBody(w io.Writer, baseDir string, colors serveColor)
 		return err
 	}
 	// Restart note with warning: prefix (yellow when color on).
-	colors.writeWarning(w, "temporary add-ons unload when Firefox restarts — re-run install-firefox-extension and Load Temporary Add-on after a restart.")
+	if xpiPath != "" {
+		colors.writeWarning(w, "temporary add-ons unload when Firefox restarts — prefer the signed .xpi for a permanent install.")
+	} else {
+		colors.writeWarning(w, "temporary add-ons unload when Firefox restarts — re-run install-firefox-extension and Load Temporary Add-on after a restart.")
+	}
 	return nil
 }
 

@@ -20,3 +20,21 @@ browseragent/embedded/session-page/**
 !browseragent/embedded/session-page/placeholder.txt
 browsertrace/embedded/extension/**
 !browsertrace/embedded/extension/placeholder.txt
+
+# Firefox AMO API secrets (typo filename is intentional)
+.firefox-secretes.txt
+
+# GitHub release upload token (script/github/release)
+.upload-credentials.json
+
+# Multi-platform binaries left by script/github/release (cwd build)
+/browser-agent-v*-darwin-*
+/browser-agent-v*-linux-*
+
+# Signed Firefox .xpi embed (staged by firefox/sign or install). Keep placeholder
+# so //go:embed compiles on clean clones without AMO credentials.
+browseragent/embedded/firefox-xpi/**
+!browseragent/embedded/firefox-xpi/placeholder.txt
+
+dist/
+

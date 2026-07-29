@@ -28,6 +28,9 @@ type session struct {
 	// extensionInstallPath is the extracted load-unpacked folder (absolute).
 	extensionInstallPath string
 
+	// firefoxXPIPath is the extracted signed .xpi (absolute), when available.
+	firefoxXPIPath string
+
 	queue *JobQueue
 
 	// Single extension WS writer (nil when disconnected).
@@ -109,6 +112,12 @@ func (s *session) setExtensionInstallPath(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.extensionInstallPath = path
+}
+
+func (s *session) setFirefoxXPIPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.firefoxXPIPath = strings.TrimSpace(path)
 }
 
 func (s *session) setEmbeddedIdentity(version, md5hex string) {
@@ -298,11 +307,19 @@ func (s *session) snapshot() sessionSnapshot {
 		lastSeen = s.lastSeenAt
 	}
 
+	xpiPath := s.firefoxXPIPath
+	var xpiFileURL string
+	if xpiPath != "" {
+		xpiFileURL = PathToFileURL(xpiPath)
+	}
+
 	return sessionSnapshot{
 		SessionID:            s.id,
 		Phase:                s.phase,
 		Hint:                 hint,
 		ExtensionInstallPath: s.extensionInstallPath,
+		FirefoxXPIPath:       xpiPath,
+		FirefoxXPIURL:        xpiFileURL,
 		ExtensionMatch:       match,
 		CreatedAt:            s.createdAt,
 		SessionPageCount:     s.sessionPageCount,
@@ -333,18 +350,24 @@ type sessionSnapshot struct {
 	Phase                string           `json:"phase"`
 	Hint                 string           `json:"hint,omitempty"`
 	ExtensionInstallPath string           `json:"extension_install_path,omitempty"`
-	BundledExtension     bundledExtension `json:"bundled_extension"`
-	Extension            sessionExtension `json:"extension"`
-	ExtensionMatch       string           `json:"extension_match"`
-	CreatedAt            time.Time        `json:"created_at"`
-	SessionPageCount     *int             `json:"session_page_count,omitempty"`
-	Browsers             []string         `json:"browsers,omitempty"`
-	Status               string           `json:"status"`
-	StatusLabel          string           `json:"status_label"`
-	InflightJobs         int              `json:"inflight_jobs,omitempty"`
-	SessionURL           string           `json:"session_url,omitempty"`
-	SessionPages         []sessionPageTab `json:"session_pages,omitempty"`
-	LastSeenAt           time.Time        `json:"last_seen_at,omitempty"`
+	// FirefoxXPIPath is the absolute filesystem path to the signed .xpi when available.
+	FirefoxXPIPath string `json:"firefox_xpi_path,omitempty"`
+	// FirefoxXPIURL is file:///… for the same path (copy/paste; click from http may be blocked).
+	FirefoxXPIURL string `json:"firefox_xpi_url,omitempty"`
+	// FirefoxXPIHTTPURL is the control-plane download (reliable click-to-install from session page).
+	FirefoxXPIHTTPURL string           `json:"firefox_xpi_http_url,omitempty"`
+	BundledExtension  bundledExtension `json:"bundled_extension"`
+	Extension         sessionExtension `json:"extension"`
+	ExtensionMatch    string           `json:"extension_match"`
+	CreatedAt         time.Time        `json:"created_at"`
+	SessionPageCount  *int             `json:"session_page_count,omitempty"`
+	Browsers          []string         `json:"browsers,omitempty"`
+	Status            string           `json:"status"`
+	StatusLabel       string           `json:"status_label"`
+	InflightJobs      int              `json:"inflight_jobs,omitempty"`
+	SessionURL        string           `json:"session_url,omitempty"`
+	SessionPages      []sessionPageTab `json:"session_pages,omitempty"`
+	LastSeenAt        time.Time        `json:"last_seen_at,omitempty"`
 }
 
 type bundledExtension struct {

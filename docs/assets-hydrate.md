@@ -101,8 +101,27 @@ for example for `v0.2.0`:
 
 ## Publishing release assets
 
-From the browser-agent module root, pack the three hydrate archives from on-disk
-embeds with **`script/github/release-assets`**:
+### Full ship (binaries + hydrate) — preferred
+
+From a **clean** worktree on a **`v*` tag**, with
+`.upload-credentials.json` (`token`, `owner`, `repo`):
+
+```bash
+go run ./script/github/release --dry-run
+go run ./script/github/release
+# builds browser-agent-{tag}-{os}-{arch} + hydrate .tar.gz and uploads
+```
+
+End users install the binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xhd2015/browser-agent/master/install.sh | bash
+```
+
+### Hydrate archives only
+
+Pack the three hydrate archives from on-disk embeds with
+**`script/github/release-assets`**:
 
 ```bash
 # Pack only (writes under --out; no network / no gh)
@@ -124,7 +143,8 @@ go run ./script/github/release-assets --out ./dist --version v0.2.0 --upload
 ```
 
 Default is pack-only; use `--upload` only when you intend to publish to GitHub
-(requires `gh` on `PATH` and an authenticated repo).
+(requires `gh` on `PATH` and an authenticated repo). Full binary+hydrate ship
+prefers `script/github/release` (credentials file + multi-platform go build).
 
 ## Summary
 
@@ -133,4 +153,6 @@ Default is pack-only; use `--upload` only when you intend to publish to GitHub
 | Fat release (complete embed) | Offline; serve from embed |
 | `go install` / incomplete embed | Download into `~/.cache/browser-agent` asset-cache on ensure or first use |
 | Explicit operator control | `browser-agent assets ensure` / `assets status` |
-| Publish hydrate archives | `go run ./script/github/release-assets` (pack); add `--upload` for `gh` create/clobber |
+| Publish fat binaries + hydrate | `go run ./script/github/release` (`--dry-run` first) |
+| Publish hydrate archives only | `go run ./script/github/release-assets` (pack); add `--upload` for `gh` create/clobber |
+| Install released binary | `curl …/install.sh \| bash` |

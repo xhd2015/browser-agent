@@ -66,14 +66,23 @@ Then open `chrome://extensions` → enable Developer mode → Load unpacked → 
 browser-agent install-firefox-extension
 ```
 
-Then load the temporary add-on:
+When a signed `.xpi` is embedded, the CLI prints the **xpi path** and (on a TTY)
+opens it in Firefox so you can confirm the permanent install prompt.
+
+On the **session page** (Firefox), also use:
+
+- **Download / open** `http://127.0.0.1:43761/v1/firefox-xpi` (reliable click-to-install)
+- The shown **`file:///…/browser-agent.xpi`** URL (paste into the address bar if
+  `file://` navigation from the session page is blocked)
+
+Fallback — temporary add-on (unloads on Firefox restart):
 
 1. Open `about:debugging#/runtime/this-firefox` (or type `about:debugging` → This Firefox)
 2. Click **Load Temporary Add-on…**
 3. Open the folder under `…/browser-agent-firefox/<version>/`
 4. Select **manifest.json** (not the folder), then Open
 
-Temporary add-ons unload when Firefox restarts — re-run `install-firefox-extension` and Load Temporary Add-on after a restart.
+Use `--no-open` to print paths only (no Firefox launch).
 
 ### 2. Example commands (same session id)
 

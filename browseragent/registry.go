@@ -116,8 +116,15 @@ func (r *SessionRegistry) CreateWithOpts(id string, opts CreateOpts) (*CreateSes
 
 	var extPath, extVer string
 	var extErr error
+	var xpiPath string
 	if browser == "firefox" {
 		extPath, extVer, extErr = EnsureCanonicalFirefoxExtension()
+		// Best-effort signed .xpi for permanent install (session page + /v1/firefox-xpi).
+		if EmbeddedFirefoxXPIAvailable() {
+			if p, _, xerr := EnsureCanonicalFirefoxXPI(); xerr == nil {
+				xpiPath = p
+			}
+		}
 	} else {
 		extPath, extVer, extErr = EnsureCanonicalExtension()
 	}
@@ -164,6 +171,10 @@ func (r *SessionRegistry) CreateWithOpts(id string, opts CreateOpts) (*CreateSes
 			meta["extension_md5"] = embeddedSum.MD5
 		}
 	}
+	if xpiPath != "" {
+		meta["firefox_xpi_path"] = xpiPath
+		meta["firefox_xpi_url"] = PathToFileURL(xpiPath)
+	}
 	metaBytes, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal meta.json: %w", err)
@@ -186,6 +197,9 @@ func (r *SessionRegistry) CreateWithOpts(id string, opts CreateOpts) (*CreateSes
 	if extPath != "" {
 		sess.setExtensionInstallPath(extPath)
 		sess.setEmbeddedIdentity(embeddedSum.Version, embeddedSum.MD5)
+	}
+	if xpiPath != "" {
+		sess.setFirefoxXPIPath(xpiPath)
 	}
 	if browser == "firefox" {
 		// Stamp preferred browser so live snap / injectSessionBoot agree before telemetry.
@@ -269,6 +283,21 @@ func (r *SessionRegistry) snapshot(sess *session) sessionSnapshot {
 	snap := sess.snapshot()
 	if !snap.Extension.Connected {
 		snap.Hint = buildDisconnectedHint(sess.id, r.BaseURL())
+	}
+	// Enrich Firefox XPI URLs when path is known (file:// + control-plane HTTP).
+	if snap.FirefoxXPIPath != "" {
+		if snap.FirefoxXPIURL == "" {
+			snap.FirefoxXPIURL = PathToFileURL(snap.FirefoxXPIPath)
+		}
+		snap.FirefoxXPIHTTPURL = strings.TrimRight(r.BaseURL(), "/") + FirefoxXPIHTTPPath
+	} else if sessionSnapIsFirefox(snap) && EmbeddedFirefoxXPIAvailable() {
+		// Lazy ensure so long-lived daemons still surface xpi after reinstall.
+		if p, _, err := EnsureCanonicalFirefoxXPI(); err == nil && p != "" {
+			sess.setFirefoxXPIPath(p)
+			snap.FirefoxXPIPath = p
+			snap.FirefoxXPIURL = PathToFileURL(p)
+			snap.FirefoxXPIHTTPURL = strings.TrimRight(r.BaseURL(), "/") + FirefoxXPIHTTPPath
+		}
 	}
 	return snap
 }

@@ -26,7 +26,7 @@ Commands:
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
   install-chrome-extension   Extract embedded Chrome extension
-  install-firefox-extension  Extract Firefox extension and print about:debugging help
+  install-firefox-extension  Extract signed .xpi (open in Firefox) + temporary add-on help
   assets      Ensure/status hydrated session-page + extension assets
 
 Run 'browser-agent --help' for full help.
@@ -51,7 +51,7 @@ Commands:
                                        POST a raw CDP job (method + optional params JSON)
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
   install-chrome-extension   Extract embedded extension and print Load unpacked help
-  install-firefox-extension  Extract Firefox extension and print about:debugging help
+  install-firefox-extension  Extract signed .xpi, print path, open in Firefox (install prompt)
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
                              Embedded agent skill (see: browser-agent skill --help)
@@ -121,6 +121,12 @@ logs flags:
 
 create-tab flags:
   --url <url>                Optional URL (positional [url] also accepted); omit for blank tab
+
+install-firefox-extension flags:
+  --open                     Force open the signed .xpi in Firefox (install prompt)
+  --no-open                  Do not open Firefox (print paths only; default for pipes)
+  --color / --no-color       Force / disable ANSI on install help stdout
+  (default: open .xpi when stdout is a TTY and a signed xpi is embedded)
 
 Session resolution: --session-id flag, else BROWSER_AGENT_SESSION_ID env.
 `
@@ -357,8 +363,23 @@ func cliInstallFirefoxExt(args []string, env map[string]string, stdout, stderr i
 	if opts.forceColor && opts.noColor {
 		return fmt.Errorf("--color and --no-color cannot be specified together")
 	}
+	if opts.open && opts.noOpen {
+		return fmt.Errorf("--open and --no-open cannot be specified together")
+	}
 
 	colors := newServeColor(stdout, env, opts.forceColor, opts.noColor)
+
+	// Open .xpi in Firefox by default for interactive TTY; off for pipes/tests.
+	// --open / --no-open override auto.
+	openXPI := false
+	switch {
+	case opts.noOpen:
+		openXPI = false
+	case opts.open:
+		openXPI = true
+	default:
+		openXPI = stderrIsTTY(stdout)
+	}
 
 	// Prefer HOME from env for parallel-safe isolation (matches WithHome).
 	home := ""
@@ -367,19 +388,21 @@ func cliInstallFirefoxExt(args []string, env map[string]string, stdout, stderr i
 	}
 	if home != "" {
 		return WithProcessEnv(map[string]string{"HOME": home}, func() error {
-			return installFirefoxExtensionBody(stdout, opts.baseDir, colors)
+			return installFirefoxExtensionBody(stdout, opts.baseDir, colors, openXPI)
 		})
 	}
 
 	processEnvMu.Lock()
 	defer processEnvMu.Unlock()
-	return installFirefoxExtensionBody(stdout, opts.baseDir, colors)
+	return installFirefoxExtensionBody(stdout, opts.baseDir, colors, openXPI)
 }
 
 type installFirefoxExtOptions struct {
 	baseDir    string
 	forceColor bool
 	noColor    bool
+	open       bool
+	noOpen     bool
 }
 
 func parseInstallFirefoxExtOptions(args []string) (installFirefoxExtOptions, error) {
@@ -398,6 +421,10 @@ func parseInstallFirefoxExtOptions(args []string) (installFirefoxExtOptions, err
 			opts.forceColor = true
 		case a == "--no-color":
 			opts.noColor = true
+		case a == "--open":
+			opts.open = true
+		case a == "--no-open":
+			opts.noOpen = true
 		case a == "-h" || a == "--help":
 			// no dedicated help; ignore (parent --help covers command list)
 		default:

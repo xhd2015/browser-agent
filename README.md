@@ -10,31 +10,48 @@ Installs the **latest** GitHub Release for your OS/arch (no version flag require
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xhd2015/browser-agent/master/install.sh | bash
+
+# or install via go
+go install github.com/xhd2015/browser-agent@latest
 ```
 
-This puts `browser-agent` on `$GOPATH/bin` (if that directory exists) or
-`/usr/local/bin`. Ensure that directory is on your `PATH`.
-
-Optional — pin an older release:
+Then install the skills:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/xhd2015/browser-agent/master/install.sh \
-  | INSTALL_TAG=v0.3.1 bash
+# install the skill to ~/.agents/skills/browser-agent/SKILL.md
+browser-agent skill --install --global
+```
+
+Then install browser extensions (details see below):
+```sh
+browser-agent install-chrome-extension
+browser-agent install-firefox-extension
 ```
 
 # Quick start
 
-Start a session (starts the control server on port **43761** if needed and opens
-the browser):
+After you've done all the installations, then in agents (after skill install, in `claude code`, `codex`, `grok`, `opencode` etc.):
+
+```md
+use browser-agent to check what's new on my github trends
+```
+
+Agent will auto create a new session, open the browser and operate on behalf of you.
+
+Or if you manually created a session:
 
 ```sh
-browser-agent session new                 # Chrome (default)
+# Chrome (default)
+browser-agent session new
+
+# or firefbox
 browser-agent session new --browser firefox
 ```
 
-Note the printed **`session-id`** (e.g. `sess-xxxxxx`). Reuse it on every later
-command. Keep the session page open (`/go?session=…`) so the extension can stay
-connected.
+Then  you can tell agent the session id, the agent will operate on that session:
+```md
+use browser-agent with session-id: sess-xxx to check what's new on my github trends
+```
 
 ## Chrome
 

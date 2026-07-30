@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/xhd2015/browser-agent/script/internal/clicolor"
 )
 
 // GeneratedVersionSinks is the allowlist of paths stamped from root VERSION.txt.
@@ -35,13 +37,19 @@ var GeneratedVersionSinks = []string{
 }
 
 func main() {
-	if err := handle(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	mode, remain, err := clicolor.ParseFlags(os.Args[1:])
+	c := clicolor.NewStyle(mode)
+	if err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	if err := handle(remain, c); err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
-func handle(args []string) error {
+func handle(args []string, c clicolor.Style) error {
 	checkOnly := false
 	gitAddGenerated := false
 	for _, a := range args {
@@ -73,7 +81,7 @@ func handle(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("generate: version %s\n", ver)
+	fmt.Printf("%s %s %s\n", c.Gray("generate:"), c.Gray("version"), c.Green(ver))
 
 	var dirty []string
 	// Paths that exist and are part of the sink set (for git-add allowlist).
@@ -99,13 +107,13 @@ func handle(args []string) error {
 			return fmt.Errorf("read %s: %w", rel, err)
 		}
 		if bytes.Equal(existing, content) {
-			fmt.Printf("  ok      %s\n", rel)
+			fmt.Printf("  %s  %s\n", c.Gray("ok"), c.Gray(rel))
 			noteSink(rel)
 			return nil
 		}
 		if checkOnly {
 			dirty = append(dirty, rel)
-			fmt.Printf("  dirty   %s\n", rel)
+			fmt.Printf("  %s  %s\n", c.Yellow("dirty"), rel)
 			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -114,7 +122,7 @@ func handle(args []string) error {
 		if err := os.WriteFile(path, content, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", rel, err)
 		}
-		fmt.Printf("  wrote   %s\n", rel)
+		fmt.Printf("  %s  %s\n", c.Green("wrote"), rel)
 		noteSink(rel)
 		return nil
 	}
@@ -132,7 +140,7 @@ func handle(args []string) error {
 	for _, rel := range manifests {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		if _, err := os.Stat(path); err != nil {
-			fmt.Printf("  skip    %s (missing)\n", rel)
+			fmt.Printf("  %s  %s %s\n", c.Gray("skip"), c.Gray(rel), c.Gray("(missing)"))
 			continue
 		}
 		updated, err := stampManifestVersion(path, ver)
@@ -157,7 +165,7 @@ func handle(args []string) error {
 	for _, jf := range jsFiles {
 		path := filepath.Join(root, filepath.FromSlash(jf.rel))
 		if _, err := os.Stat(path); err != nil {
-			fmt.Printf("  skip    %s (missing)\n", jf.rel)
+			fmt.Printf("  %s  %s %s\n", c.Gray("skip"), c.Gray(jf.rel), c.Gray("(missing)"))
 			continue
 		}
 		raw, err := os.ReadFile(path)
@@ -186,13 +194,13 @@ func handle(args []string) error {
 		// so unstaged but correct stamps still enter the index for the commit.
 		toAdd := existingGeneratedSinks(root)
 		if len(toAdd) == 0 {
-			fmt.Println("  git-add 0 generated path(s)")
+			fmt.Printf("  %s %s\n", c.Gray("git-add"), c.Gray("0 generated path(s)"))
 			return nil
 		}
 		if err := gitAdd(root, toAdd); err != nil {
 			return err
 		}
-		fmt.Printf("  git-add %d generated path(s)\n", len(toAdd))
+		fmt.Printf("  %s %s\n", c.Gray("git-add"), c.Green(fmt.Sprintf("%d generated path(s)", len(toAdd))))
 	}
 	return nil
 }
@@ -212,7 +220,9 @@ Sync root VERSION.txt into derived version sinks:
 Options:
   --check               Fail if any target differs from VERSION.txt (no writes)
   --git-add-generated   After sync, git add only the generated sink paths above
-  -h, --help            Show this help
+`)
+	b.WriteString(clicolor.FlagHelp)
+	b.WriteString(`  -h, --help            Show this help
 
 Run from the module root (or any subdirectory). Install/bundle scripts invoke
 generate without --git-add-generated so they do not touch the git index.

@@ -324,6 +324,107 @@ func IsRealFirefoxXPIFile(path string) bool {
 	return head[0] == 'P' && head[1] == 'K'
 }
 
+// FirefoxSignHint is the operator command to produce an AMO-signed .xpi.
+// Signing can take a long time (Mozilla queue/audit may take hours).
+const FirefoxSignHint = "go run ./script/browser-agent/firefox/sign"
+
+// IsAMOSignedXPI reports whether path is a zip that carries Mozilla AMO signing
+// artifacts (META-INF/mozilla.rsa and/or mozilla.sf). Filename *signed* alone is
+// not sufficient — unsigned local zips fail this check.
+func IsAMOSignedXPI(path string) bool {
+	if !IsRealFirefoxXPIFile(path) {
+		return false
+	}
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return false
+	}
+	defer zr.Close()
+	var hasRSA, hasSF bool
+	for _, f := range zr.File {
+		name := strings.ToLower(strings.TrimPrefix(f.Name, "./"))
+		name = strings.ReplaceAll(name, "\\", "/")
+		switch name {
+		case "meta-inf/mozilla.rsa":
+			hasRSA = true
+		case "meta-inf/mozilla.sf":
+			hasSF = true
+		}
+		if hasRSA && hasSF {
+			return true
+		}
+	}
+	// Prefer both; accept rsa alone (some packages still ship rsa without sf naming variants).
+	return hasRSA
+}
+
+// ValidateReleaseFirefoxXPI checks that path is a real zip, AMO-signed, and
+// package version equals wantVer. Returns a detailed error suitable for release.
+func ValidateReleaseFirefoxXPI(path, wantVer string) error {
+	wantVer = strings.TrimSpace(wantVer)
+	if wantVer == "" {
+		return fmt.Errorf("product version is empty (set VERSION.txt)")
+	}
+	if !IsRealFirefoxXPIFile(path) {
+		return fmt.Errorf("not a valid .xpi zip: %s", path)
+	}
+	if !IsAMOSignedXPI(path) {
+		return fmt.Errorf("Firefox .xpi exists but is not AMO-signed (missing META-INF/mozilla.rsa)\n  path: %s\n  run: %s\n  note: Mozilla signing/audit may take hours — do not start release until sign finishes",
+			path, FirefoxSignHint)
+	}
+	got, err := PeekSignedXPIVersion(path)
+	if err != nil {
+		return fmt.Errorf("read xpi version: %w\n  path: %s", err, path)
+	}
+	if strings.TrimSpace(got) != wantVer {
+		return fmt.Errorf("Firefox .xpi version %s != product VERSION.txt %s\n  path: %s\n  run: %s  # after VERSION.txt is %s (AMO may take hours)",
+			got, wantVer, path, FirefoxSignHint, wantVer)
+	}
+	return nil
+}
+
+// FindReleaseFirefoxXPI returns an absolute path to an AMO-signed .xpi whose
+// package version matches wantVer. Prefers dist/signed, then embed browser-agent.xpi.
+func FindReleaseFirefoxXPI(root, wantVer string) (string, error) {
+	wantVer = strings.TrimSpace(wantVer)
+	if wantVer == "" {
+		return "", fmt.Errorf("product version is empty (set VERSION.txt)")
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("root is required")
+	}
+
+	var tried []string
+	signedDir := filepath.Join(root, "dist", "signed")
+	if src, err := FindSignedXPIUnder(signedDir); err == nil {
+		tried = append(tried, src)
+		if err := ValidateReleaseFirefoxXPI(src, wantVer); err == nil {
+			abs, _ := filepath.Abs(src)
+			return abs, nil
+		}
+	}
+
+	embedXPI := filepath.Join(root, "browseragent", "embedded", "firefox-xpi", firefoxXPIFileName)
+	if IsRealFirefoxXPIFile(embedXPI) {
+		tried = append(tried, embedXPI)
+		if err := ValidateReleaseFirefoxXPI(embedXPI, wantVer); err == nil {
+			abs, _ := filepath.Abs(embedXPI)
+			return abs, nil
+		}
+	}
+
+	// Prefer the most specific error from the last candidate when possible.
+	if len(tried) > 0 {
+		last := tried[len(tried)-1]
+		if err := ValidateReleaseFirefoxXPI(last, wantVer); err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("release requires an AMO-signed Firefox .xpi for product version %s\n  not found under dist/signed/ or browseragent/embedded/firefox-xpi/\n  sign first (AMO can take a long time — hours):\n    %s\n  then re-run release",
+		wantVer, FirefoxSignHint)
+}
+
 // EmbedPlaceholderRels are tracked git placeholders under browseragent/embedded.
 // Fat staging must not delete these (//go:embed + clean-clone safety).
 var EmbedPlaceholderRels = []string{

@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +125,80 @@ func TestRemoveEmbeddedFirefoxXPIIfMismatch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(xpiDir, "placeholder.txt")); err != nil {
 		t.Fatalf("placeholder should exist: %v", err)
+	}
+}
+
+func TestIsAMOSignedXPI(t *testing.T) {
+	dir := t.TempDir()
+	// Unsigned: only manifest
+	unsigned := writeTestXPI(t, dir, "1.0.4", "unsigned.xpi")
+	if IsAMOSignedXPI(unsigned) {
+		t.Fatal("unsigned zip must not report AMO-signed")
+	}
+	// Signed-shaped: add META-INF/mozilla.rsa
+	signed := filepath.Join(dir, "signed.xpi")
+	f, err := os.Create(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("manifest.json")
+	_, _ = w.Write([]byte(`{"manifest_version":3,"name":"t","version":"1.0.4"}`))
+	w2, _ := zw.Create("META-INF/mozilla.rsa")
+	_, _ = w2.Write([]byte("fake-rsa"))
+	w3, _ := zw.Create("META-INF/mozilla.sf")
+	_, _ = w3.Write([]byte("fake-sf"))
+	_ = zw.Close()
+	_ = f.Close()
+	if !IsAMOSignedXPI(signed) {
+		t.Fatal("expected AMO-signed when mozilla.rsa present")
+	}
+	if err := ValidateReleaseFirefoxXPI(signed, "1.0.4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateReleaseFirefoxXPI(signed, "9.9.9"); err == nil {
+		t.Fatal("version mismatch must fail")
+	}
+	if err := ValidateReleaseFirefoxXPI(unsigned, "1.0.4"); err == nil {
+		t.Fatal("unsigned must fail validate")
+	}
+}
+
+func TestFindReleaseFirefoxXPI(t *testing.T) {
+	root := t.TempDir()
+	// no xpi
+	if _, err := FindReleaseFirefoxXPI(root, "1.0.4"); err == nil {
+		t.Fatal("expected missing error")
+	}
+	// signed matching under dist/signed
+	signedDir := filepath.Join(root, "dist", "signed")
+	if err := os.MkdirAll(signedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// write signed package
+	src := filepath.Join(t.TempDir(), "pkg.xpi")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, _ := zw.Create("manifest.json")
+	_, _ = w.Write([]byte(`{"manifest_version":3,"name":"t","version":"1.0.4"}`))
+	w2, _ := zw.Create("META-INF/mozilla.rsa")
+	_, _ = w2.Write([]byte("rsa"))
+	_ = zw.Close()
+	_ = f.Close()
+	data, _ := os.ReadFile(src)
+	dst := filepath.Join(signedDir, "browser-agent-1.0.4-signed.xpi")
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := FindReleaseFirefoxXPI(root, "1.0.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "browser-agent-1.0.4-signed.xpi") {
+		t.Fatalf("got %s", got)
 	}
 }
 

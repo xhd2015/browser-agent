@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/xhd2015/browser-agent/script/internal/clicolor"
 )
 
 func TestGeneratedVersionSinks_allowlist(t *testing.T) {
@@ -41,7 +43,7 @@ func TestGeneratedVersionSinks_allowlist(t *testing.T) {
 }
 
 func TestHandle_rejectsCheckWithGitAdd(t *testing.T) {
-	err := handle([]string{"--check", "--git-add-generated"})
+	err := handle([]string{"--check", "--git-add-generated"}, clicolor.Style{})
 	if err == nil {
 		t.Fatal("expected error combining --check and --git-add-generated")
 	}
@@ -86,6 +88,9 @@ func TestHelpText_documentsGitAdd(t *testing.T) {
 	}
 	if !strings.Contains(h, "--check") {
 		t.Fatal("help must document --check")
+	}
+	if !strings.Contains(h, "--color") || !strings.Contains(h, "--no-color") {
+		t.Fatal("help must document color flags")
 	}
 	for _, sink := range GeneratedVersionSinks {
 		if !strings.Contains(h, sink) {

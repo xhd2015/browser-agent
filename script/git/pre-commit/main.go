@@ -20,6 +20,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/xhd2015/browser-agent/script/internal/clicolor"
 )
 
 // Relative to repo root. Keep //go:embed dirs non-empty for clean clones.
@@ -30,13 +32,32 @@ var placeholders = []string{
 }
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	mode, remain, err := clicolor.ParseFlags(os.Args[1:])
+	c := clicolor.NewStyle(mode)
+	if err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	if err := run(remain, mode, c); err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(args []string, mode clicolor.ColorMode, c clicolor.Style) error {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			fmt.Print(helpText())
+			return nil
+		default:
+			if strings.HasPrefix(a, "-") {
+				return fmt.Errorf("unrecognized flag %s (try --help)", a)
+			}
+			return fmt.Errorf("unexpected argument %q (try --help)", a)
+		}
+	}
+
 	root, err := gitRoot()
 	if err != nil {
 		return err
@@ -52,8 +73,16 @@ func run() error {
 	}
 
 	// Stamp VERSION.txt → sinks and stage only generate's allowlisted paths.
-	fmt.Println("==> generate --git-add-generated")
-	gen := exec.Command("go", "run", "./script/generate", "--git-add-generated")
+	// Forward forced color flags so nested generate matches this process.
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("generate --git-add-generated"))
+	genArgs := []string{"run", "./script/generate", "--git-add-generated"}
+	switch mode {
+	case clicolor.ColorAlways:
+		genArgs = append(genArgs, "--color")
+	case clicolor.ColorNever:
+		genArgs = append(genArgs, "--no-color")
+	}
+	gen := exec.Command("go", genArgs...)
 	gen.Dir = root
 	gen.Stdout = os.Stdout
 	gen.Stderr = os.Stderr
@@ -61,7 +90,22 @@ func run() error {
 		return fmt.Errorf("go run ./script/generate --git-add-generated: %w", err)
 	}
 
-	return gitAdd(root, toAdd)
+	if err := gitAdd(root, toAdd); err != nil {
+		return err
+	}
+	fmt.Printf("%s %s\n", c.Gray("pre-commit:"), c.Green("placeholders staged"))
+	return nil
+}
+
+func helpText() string {
+	return `Usage: go run ./script/git/pre-commit [options]
+
+Ensure embed placeholders exist, run generate --git-add-generated, and stage
+placeholders. Does not git-add paths outside generate sinks + placeholders.
+
+Options:
+` + clicolor.FlagHelp + `  -h, --help              Show this help
+`
 }
 
 func gitRoot() (string, error) {

@@ -8,6 +8,8 @@
 //   - HEAD is a v* tag (git describe --tags HEAD)
 //   - .upload-credentials.json {token, owner, repo}
 //   - node/npm for full SPA bundle (unless --skip-prebuild with fat embeds)
+//   - AMO-signed Firefox .xpi matching VERSION.txt under dist/signed or embed
+//     (run go run ./script/browser-agent/firefox/sign first; AMO may take hours)
 package main
 
 import (
@@ -34,9 +36,18 @@ Asset names (binaries):
   browser-agent-{tag}-{os}-{arch}
   e.g. browser-agent-v0.3.1-darwin-arm64
 
+Firefox (required):
+  Prebuild requires an AMO-signed .xpi whose package version matches VERSION.txt
+  (under dist/signed/ or browseragent/embedded/firefox-xpi/). Sign offline first —
+  Mozilla can take a long time (hours):
+
+    go run ./script/browser-agent/firefox/sign
+
+  Release never auto-runs sign. --skip-prebuild still requires a matching signed xpi.
+
 Options:
-  --dry-run         print plan without building or uploading
-  --skip-prebuild   skip generate/bundle/xpi stage (use existing embeds)
+  --dry-run         print plan without building or uploading (still checks signed xpi)
+  --skip-prebuild   skip generate/bundle; still require matching AMO-signed xpi
   --skip-hydrate    do not pack/upload session-page/extension tar.gz archives
   -h, --help        show this help
 
@@ -50,7 +61,7 @@ Install published binaries:
 
 func main() {
 	if err := handle(); err != nil {
-		fmt.Fprintf(os.Stderr, "browser-agent release: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -104,12 +115,18 @@ func handle() error {
 		plannedHydrate = browseragent.AssetReleaseNames(tag)
 	}
 
+	// Always require matching AMO-signed Firefox xpi (including dry-run).
+	if err := githublib.CheckSignedFirefoxXPI(); err != nil {
+		return err
+	}
+	fmt.Println("ok: AMO-signed Firefox xpi matches VERSION.txt")
+
 	if dryRun {
 		fmt.Printf("[dry-run] tag: %s\n", tag)
 		if skipPrebuild {
-			fmt.Println("[dry-run] would skip prebuild (--skip-prebuild)")
+			fmt.Println("[dry-run] would skip generate/bundle (--skip-prebuild); still use existing signed xpi")
 		} else {
-			fmt.Println("[dry-run] would prebuild: generate + full bundle (+ firefox xpi if available)")
+			fmt.Println("[dry-run] would prebuild: generate + full bundle + stage matching signed Firefox xpi")
 		}
 		for _, name := range plannedBins {
 			fmt.Printf("[dry-run] would build: %s\n", name)

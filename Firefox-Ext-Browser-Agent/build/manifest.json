@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Agent",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "description": "Browser Agent extension for the browser-agent control plane (HTTP poll / temporary or signed install)",
   "browser_specific_settings": {
     "gecko": {

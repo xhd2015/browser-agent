@@ -12,7 +12,7 @@ const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.0";
+    : "1.0.1";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 const FEATURES = ["browser-agent"];
@@ -28,9 +28,21 @@ const RECONNECT_MAX_MS = 2000;
 const RECONNECT_BASE_MS = 100;
 /** Keepalive ping while connected (keeps MV3 SW + WS alive). */
 const KEEPALIVE_MS = 15000;
+/**
+ * Tabs with chrome.debugger currently attached (true CDP debuggees).
+ *
+ * Chrome UI note: while any tab is attached, Chrome may show a profile-wide
+ * notice like "Browser Agent started debugging this browser" on other windows
+ * and even blank New Tabs. That banner is not per-tab CDP attach; jobs still
+ * target only sessionAttachState[sessionId].attachedTabId (one tab per session).
+ * See README "Chrome debugger notice".
+ */
 /** @type {Map<number, true>} */
 const attachedTabs = new Map();
-/** Per-session debugger attach state (serialize attach; detach on tab switch). */
+/**
+ * Per-session debugger attach state (serialize attach; detach on tab switch).
+ * Sticky: after a job, attach stays on attachedTabId until switch / session leave.
+ */
 /** @type {Map<string, { attachedTabId: number|null, attachLock: Promise<void> }>} */
 const sessionAttachState = new Map();
 /** In-memory console log buffer for logs jobs. */
@@ -401,6 +413,8 @@ function connectSession(sessionId, reason) {
 function unregisterSession(sessionId) {
   const entry = sessions.get(sessionId);
   if (!entry) return;
+  // Tear down chrome.debugger held by this session (leave / last control tab gone).
+  detachSessionDebugger(sessionId);
   if (entry.reconnectTimer) {
     clearTimeout(entry.reconnectTimer);
     entry.reconnectTimer = null;
@@ -416,6 +430,7 @@ function unregisterSession(sessionId) {
     entry.ws = null;
   }
   sessions.delete(sessionId);
+  sessionAttachState.delete(sessionId);
 }
 
 function isSessionGoPageURL(url, sessionId) {
@@ -469,6 +484,85 @@ function maybeRegisterGoTab(tabId, url, tab) {
   );
 }
 
+/**
+ * List open /go?session=<sessionId> control tabs, optionally scoped to a window.
+ * Used by attach gate and leave recount (not hello telemetry).
+ */
+async function querySessionControlTabs(sessionId, windowId) {
+  if (!sessionId) return [];
+  const queryInfo = {};
+  if (windowId != null) queryInfo.windowId = windowId;
+  try {
+    const tabs = await chrome.tabs.query(queryInfo);
+    return (tabs || []).filter(
+      (t) => t && t.id != null && isSessionGoPageURL(t.url || "", sessionId),
+    );
+  } catch (e) {
+    return [];
+  }
+}
+
+async function countOpenSessionPages(sessionId, windowId) {
+  const tabs = await querySessionControlTabs(sessionId, windowId);
+  return tabs.length;
+}
+
+async function hasOpenSessionPage(sessionId, windowId) {
+  return (await countOpenSessionPages(sessionId, windowId)) > 0;
+}
+
+function rebindSessionTabId(sessionId, tab) {
+  const entry = sessions.get(sessionId);
+  if (!entry || !tab) return;
+  if (tab.id != null) entry.tabId = tab.id;
+  if (tab.windowId != null) entry.windowId = tab.windowId;
+}
+
+/**
+ * Detach chrome.debugger held by a session (last control tab leave / unregister).
+ * Serializes through attachLock so it does not race sticky attach reuse.
+ */
+function detachSessionDebugger(sessionId) {
+  let state = sessionAttachState.get(sessionId);
+  if (!state) {
+    return Promise.resolve();
+  }
+  const run = async () => {
+    const tabId = state.attachedTabId;
+    state.attachedTabId = null;
+    if (tabId != null) {
+      await detachDebugger(tabId);
+    }
+  };
+  state.attachLock = state.attachLock.then(run, run);
+  return state.attachLock;
+}
+
+/**
+ * Leave path: re-query remaining /go?session= control tabs.
+ * remaining == 0 → detach + unregister; remaining >= 1 → rebind, stay armed.
+ */
+async function handleSessionControlLeave(sessionId) {
+  const entry = sessions.get(sessionId);
+  if (!entry) return;
+  const windowId = entry.windowId != null ? entry.windowId : null;
+  const remaining = await querySessionControlTabs(sessionId, windowId);
+  if (remaining.length === 0) {
+    // Prefer awaiting detach before WS teardown so the banner is cleared promptly.
+    try {
+      await detachSessionDebugger(sessionId);
+    } catch (e) {
+      /* ignore */
+    }
+    unregisterSession(sessionId);
+    return;
+  }
+  const stillBound = remaining.some((t) => t.id === entry.tabId);
+  if (!stillBound) {
+    rebindSessionTabId(sessionId, remaining[0]);
+  }
+}
+
 function handleRegisterMessage(msg, sender) {
   const sessionId = msg.session_id || msg.sessionId || "";
   if (!sessionId) return;
@@ -498,16 +592,16 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  let shouldPush = false;
-  for (const [sessionId, entry] of sessions.entries()) {
-    if (entry.tabId === tabId) {
-      unregisterSession(sessionId);
-      shouldPush = true;
-    }
-  }
-  if (shouldPush) {
+  // Re-query remaining control tabs for every session (multi-tab safe).
+  // Do not trust entry.tabId alone — last register wins and would wrongly disarm.
+  const sessionIds = Array.from(sessions.keys());
+  Promise.all(
+    sessionIds.map((sessionId) =>
+      handleSessionControlLeave(sessionId).catch(() => {}),
+    ),
+  ).then(() => {
     pushStatusForConnectedSessions();
-  }
+  });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -516,13 +610,23 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (changeInfo.status === "loading" || changeInfo.status === "complete") {
       maybeRegisterGoTab(tabId, url, tab);
     }
+    // Navigate-away leave: when a bound control tab leaves /go?session=, recount.
+    const leaveIds = [];
     for (const [sessionId, entry] of sessions.entries()) {
       if (entry.tabId !== tabId) continue;
       if (!isSessionGoPageURL(url, sessionId)) {
-        unregisterSession(sessionId);
+        leaveIds.push(sessionId);
       }
     }
-    if (url.includes("/go")) {
+    if (leaveIds.length > 0) {
+      Promise.all(
+        leaveIds.map((sessionId) =>
+          handleSessionControlLeave(sessionId).catch(() => {}),
+        ),
+      ).then(() => {
+        pushStatusForConnectedSessions();
+      });
+    } else if (url.includes("/go")) {
       pushStatusForConnectedSessions();
     }
   }
@@ -1218,6 +1322,11 @@ function detachDebugger(tabId) {
   });
 }
 
+/**
+ * Attach chrome.debugger to a single tabId (CDP transport for jobs).
+ * Side effect: Chrome may show a browser-wide "debugging this browser" notice
+ * on unrelated tabs/windows while this attach remains live — not multi-tab CDP.
+ */
 function attachDebugger(tabId) {
   return new Promise((resolve, reject) => {
     if (attachedTabs.has(tabId)) {
@@ -1237,6 +1346,12 @@ function attachDebugger(tabId) {
   });
 }
 
+/**
+ * Session-scoped attach: gate on open /go?session= in the target tab's window,
+ * then sticky-attach one tab (detach previous on tab switch).
+ * Chrome's "debugging this browser" banner can still appear outside that window;
+ * only this tabId receives sendCommand / eval / screenshot.
+ */
 async function attachDebuggerForSession(sessionId, tabId) {
   let state = sessionAttachState.get(sessionId);
   if (!state) {
@@ -1244,6 +1359,29 @@ async function attachDebuggerForSession(sessionId, tabId) {
     sessionAttachState.set(sessionId, state);
   }
   const run = async () => {
+    // Attach gate: require ≥1 open /go?session=<id> control tab in the same window.
+    let windowId = null;
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t && t.windowId != null) windowId = t.windowId;
+    } catch (e) {
+      /* tab may be gone */
+    }
+    if (windowId == null) {
+      const entry = sessions.get(sessionId);
+      if (entry && entry.windowId != null) windowId = entry.windowId;
+    }
+    if (windowId == null || !(await hasOpenSessionPage(sessionId, windowId))) {
+      // Drop sticky leftover attach so jobs cannot reuse a orphaned debugger.
+      if (state.attachedTabId != null) {
+        await detachDebugger(state.attachedTabId);
+        state.attachedTabId = null;
+      }
+      throw new Error(
+        "no open session page for attach; session control tab required in the same window",
+      );
+    }
+
     if (state.attachedTabId != null && state.attachedTabId !== tabId) {
       await detachDebugger(state.attachedTabId);
       state.attachedTabId = null;

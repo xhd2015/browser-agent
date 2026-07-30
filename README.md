@@ -118,6 +118,21 @@ browser-agent skill --install --global   # if supported by your skill host
   disconnects the extension)
 - Long-running daemon only (optional): `browser-agent serve`
 
+### Chrome debugger notice (normal)
+
+Chrome jobs use `chrome.debugger` on **one tab at a time** (the job target). While
+that attach is live, Chrome often shows a security notice such as:
+
+> Browser Agent started debugging this **browser**
+
+That banner is **browser-wide UI** (it can appear on other windows, a Dock “New
+Window”, Google, or even a blank New Tab). It does **not** mean every tab is a
+CDP target, and it does **not** mean a window without a session page is being
+driven. CDP still runs only on the attached tab; the session page
+(`/go?session=…`) must stay open in the same window as the target for attach to
+be allowed. The notice goes away after detach (session page closed, Cancel on
+the bar, or sticky attach released).
+
 # License
 
 See [LICENSE](LICENSE).

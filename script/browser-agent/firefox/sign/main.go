@@ -1,9 +1,11 @@
 // Sign builds a Firefox extension package and submits it to AMO for signing
-// (unlisted channel). Secrets are read from .firefox-secretes.txt.
+// (unlisted channel), or reuses an already-signed version from AMO.
 //
 // Usage (from module root or worktree):
 //
 //	go run ./script/browser-agent/firefox/sign
+//	go run ./script/browser-agent/firefox/sign --status
+//	go run ./script/browser-agent/firefox/sign --force
 //
 // Secrets file (gitignored; often kept on the main clone):
 //
@@ -17,13 +19,14 @@
 //  3. {git-common-dir parent}/.firefox-secretes.txt  (main repo when in a worktree)
 //
 // Outputs:
-//  - dist/firefox-package/   staged unsigned sources
-//  - dist/signed/            AMO-signed .xpi (from web-ext)
+//  - dist/firefox-package/   staged unsigned sources (full sign only)
+//  - dist/signed/            AMO-signed .xpi (from web-ext or download)
 //  - browseragent/embedded/firefox-xpi/browser-agent.xpi  //go:embed payload
 package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -31,31 +34,49 @@ import (
 	"strings"
 
 	"github.com/xhd2015/browser-agent/browseragent"
+	"github.com/xhd2015/browser-agent/script/internal/clicolor"
 )
 
 const secretsFileName = ".firefox-secretes.txt"
 
 const amoAPIKeyURL = "https://addons.mozilla.org/en-US/developers/addon/api/key/"
 
+// defaultGeckoID matches Firefox-Ext-Browser-Agent/public/manifest.json when present.
+const defaultGeckoID = "browser-agent@xhd2015"
+
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	mode, remain, err := clicolor.ParseFlags(os.Args[1:])
+	c := clicolor.NewStyle(mode)
+	if err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	if err := run(remain, c); err != nil {
+		c.ErrorLine(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(args []string, c clicolor.Style) error {
+	var statusOnly, force bool
 	for _, a := range args {
 		switch a {
 		case "-h", "--help":
 			printHelp()
 			return nil
+		case "--status":
+			statusOnly = true
+		case "--force":
+			force = true
 		default:
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("unknown flag %s (try --help)", a)
 			}
 			return fmt.Errorf("unexpected argument %q (try --help)", a)
 		}
+	}
+	if statusOnly && force {
+		return fmt.Errorf("cannot combine --status and --force")
 	}
 
 	root, err := findModuleRoot()
@@ -72,7 +93,7 @@ func run(args []string) error {
 		printSecretsMissing(root)
 		return fmt.Errorf("missing %s — create AMO API credentials and save them, then re-run", secretsFileName)
 	}
-	fmt.Printf("Using secrets: %s\n", secretsPath)
+	fmt.Printf("%s %s\n", c.Gray("Using secrets:"), secretsPath)
 
 	issuer, secret, err := readSecrets(secretsPath)
 	if err != nil {
@@ -82,25 +103,130 @@ func run(args []string) error {
 		printSecretsMissing(root)
 		return fmt.Errorf("%s must set jwt_issuer and jwt_secret (see %s)", secretsFileName, amoAPIKeyURL)
 	}
-	fmt.Println("Secrets: jwt_issuer and jwt_secret present")
+	fmt.Printf("%s %s\n", c.Gray("Secrets:"), c.Green("jwt_issuer and jwt_secret present"))
 
+	wantVer := browseragent.ReadProductVersion(root)
+	if wantVer == "" {
+		// Light sync so VERSION sinks exist for full sign; status can still use file.
+		_ = runCmd(root, "go", "run", "./script/generate")
+		wantVer = browseragent.ReadProductVersion(root)
+	}
+	if wantVer == "" {
+		wantVer = strings.TrimSpace(browseragent.ClientVersion())
+	}
+	if wantVer == "" {
+		return fmt.Errorf("product version empty (set VERSION.txt)")
+	}
+	guid := readGeckoID(root)
+	fmt.Printf("%s %s\n", c.Gray("product VERSION.txt:"), c.Green(wantVer))
+	fmt.Printf("%s %s\n", c.Gray("addon:"), c.Gray(guid))
+
+	// 2) Query AMO (status mode or smart reuse)
+	fmt.Printf("%s %s %s\n", c.Gray("==>"), c.Gray("AMO lookup"), c.Gray(wantVer))
+	st, err := lookupAMOVersion(guid, wantVer, issuer, secret)
+	if err != nil {
+		return err
+	}
+
+	if statusOnly {
+		return printStatus(c, st)
+	}
+
+	if !force && st.State == "signed" && st.FileURL != "" {
+		return reuseSignedFromAMO(root, wantVer, st, issuer, secret, c)
+	}
+	if !force && st.State == "pending" {
+		return fmt.Errorf("AMO version %s is still pending (validation/approval)\n  re-run: go run ./script/browser-agent/firefox/sign --status\n  or wait and re-run sign to download when ready (AMO can take hours)", wantVer)
+	}
+	if force {
+		fmt.Printf("%s %s\n", c.Gray("==>"), c.Yellow("force full sign (--force)"))
+	} else if st.State == "not_found" {
+		fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("AMO has no signed "+wantVer+" — building and submitting"))
+	} else {
+		fmt.Printf("%s %s (%s)\n", c.Gray("==>"), c.Gray("AMO not reusable"), st.State)
+	}
+
+	return fullSign(root, wantVer, issuer, secret, c)
+}
+
+func printStatus(c clicolor.Style, st *AMOVersionStatus) error {
+	fmt.Printf("%s %s\n", c.Gray("AMO version"), c.Green(st.Version))
+	switch st.State {
+	case "signed":
+		fmt.Printf("  state: %s\n", c.Green("signed"))
+		if st.FileURL != "" {
+			fmt.Printf("  file:  %s\n", c.Gray(st.FileURL))
+		}
+		if st.Channel != "" {
+			fmt.Printf("  channel: %s\n", c.Gray(st.Channel))
+		}
+		fmt.Println(c.Gray("  hint: go run ./script/browser-agent/firefox/sign  # download + stage without rebuild"))
+		return nil
+	case "pending":
+		fmt.Printf("  state: %s\n", c.Yellow("pending"))
+		if st.FileStatus != "" {
+			fmt.Printf("  file_status: %s\n", c.Gray(st.FileStatus))
+		}
+		fmt.Println(c.Gray("  hint: wait for AMO (can take hours), then re-run --status or sign to download"))
+		return fmt.Errorf("version %s still pending on AMO", st.Version)
+	case "not_found":
+		fmt.Printf("  state: %s\n", c.Yellow("not found"))
+		fmt.Println(c.Gray("  hint: go run ./script/browser-agent/firefox/sign  # full build + web-ext sign"))
+		return fmt.Errorf("version %s not found on AMO", st.Version)
+	case "rejected":
+		fmt.Printf("  state: %s\n", c.Red("rejected/disabled"))
+		return fmt.Errorf("version %s rejected or disabled on AMO", st.Version)
+	default:
+		fmt.Printf("  state: %s\n", c.Yellow(st.State))
+		return fmt.Errorf("version %s state=%s", st.Version, st.State)
+	}
+}
+
+func reuseSignedFromAMO(root, wantVer string, st *AMOVersionStatus, issuer, secret string, c clicolor.Style) error {
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Green("AMO already has signed "+wantVer+" — downloading"))
+	outDir := filepath.Join(root, "dist", "signed")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	stable := filepath.Join(outDir, fmt.Sprintf("browser-agent-%s-signed.xpi", wantVer))
+	if err := downloadAMOFile(st.FileURL, stable, issuer, secret); err != nil {
+		return fmt.Errorf("download signed xpi: %w", err)
+	}
+	fmt.Printf("  wrote %s\n", stable)
+	if err := browseragent.ValidateReleaseFirefoxXPI(stable, wantVer); err != nil {
+		return fmt.Errorf("downloaded xpi failed validation: %w", err)
+	}
+	embedDir, err := browseragent.StageFirefoxXPIEmbed(root, stable, wantVer)
+	if err != nil {
+		return fmt.Errorf("stage firefox-xpi embed: %w", err)
+	}
+	fmt.Printf("  staged %s/browser-agent.xpi\n", embedDir)
+	fmt.Printf("%s %s\n", c.Green("ok:"), "reused AMO signed xpi (skipped build + web-ext sign)")
+	fmt.Println("Next: go install ./cmd/browser-agent   # or go run ./script/browser-agent/install --skip-firefox-sign")
+	return nil
+}
+
+func fullSign(root, wantVer, issuer, secret string, c clicolor.Style) error {
 	// 2) Generate version stamps
-	fmt.Println("==> generate (sync VERSION.txt)")
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("generate (sync VERSION.txt)"))
 	if err := runCmd(root, "go", "run", "./script/generate"); err != nil {
 		return fmt.Errorf("generate: %w", err)
 	}
+	// Prefer disk VERSION after generate
+	if v := browseragent.ReadProductVersion(root); v != "" {
+		wantVer = v
+	}
 
 	// 3) Build extension public → build + bundle-sum
-	fmt.Println("==> build Firefox extension shell + bundle-sum")
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("build Firefox extension shell + bundle-sum"))
 	buildDir, err := browseragent.BuildFirefoxExtensionShell(root)
 	if err != nil {
 		return fmt.Errorf("BuildFirefoxExtensionShell: %w", err)
 	}
-	ver := strings.TrimSpace(browseragent.ClientVersion())
-	if _, err := browseragent.EnsureExtensionBundleSum(buildDir, ver); err != nil {
+	if _, err := browseragent.EnsureExtensionBundleSum(buildDir, wantVer); err != nil {
 		return fmt.Errorf("EnsureExtensionBundleSum: %w", err)
 	}
-	fmt.Printf("Staged package: %s (version %s)\n", buildDir, ver)
+	fmt.Printf("Staged package: %s (version %s)\n", buildDir, wantVer)
 
 	// 4) Copy clean package into dist/firefox-package
 	stageDir := filepath.Join(root, "dist", "firefox-package")
@@ -110,11 +236,10 @@ func run(args []string) error {
 	if err := copyDir(buildDir, stageDir); err != nil {
 		return fmt.Errorf("stage package: %w", err)
 	}
-	// Ensure only extension files (no junk)
 	fmt.Printf("Unsigned sources: %s\n", stageDir)
 
 	// Also write a local unsigned .xpi for convenience
-	unsignedXPI := filepath.Join(root, "dist", fmt.Sprintf("browser-agent-firefox-%s.xpi", ver))
+	unsignedXPI := filepath.Join(root, "dist", fmt.Sprintf("browser-agent-firefox-%s.xpi", wantVer))
 	if err := zipDir(stageDir, unsignedXPI); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not write unsigned xpi: %v\n", err)
 	} else {
@@ -126,7 +251,7 @@ func run(args []string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	fmt.Println("==> web-ext sign (AMO unlisted channel)")
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("web-ext sign (AMO unlisted channel)"))
 	if err := runWebExtSign(root, stageDir, outDir, issuer, secret); err != nil {
 		return err
 	}
@@ -153,27 +278,62 @@ func run(args []string) error {
 		return fmt.Errorf("signed xpi not found after web-ext: %w", err)
 	}
 	// Prefer a stable name copy under dist/signed for operators.
-	stable := filepath.Join(outDir, fmt.Sprintf("browser-agent-%s-signed.xpi", ver))
+	stable := filepath.Join(outDir, fmt.Sprintf("browser-agent-%s-signed.xpi", wantVer))
 	if src != stable {
 		if data, rerr := os.ReadFile(src); rerr == nil {
 			_ = os.WriteFile(stable, data, 0o644)
 			src = stable
 		}
 	}
-	embedDir, err := browseragent.StageFirefoxXPIEmbed(root, src, ver)
+	if err := browseragent.ValidateReleaseFirefoxXPI(src, wantVer); err != nil {
+		return fmt.Errorf("signed xpi validation: %w", err)
+	}
+	embedDir, err := browseragent.StageFirefoxXPIEmbed(root, src, wantVer)
 	if err != nil {
 		return fmt.Errorf("stage firefox-xpi embed: %w", err)
 	}
 	fmt.Printf("Staged for //go:embed: %s/browser-agent.xpi\n", embedDir)
-	fmt.Println("Next: go install ./cmd/browser-agent   # or go run ./script/browser-agent/install")
+	fmt.Println("Next: go install ./cmd/browser-agent   # or go run ./script/browser-agent/install --skip-firefox-sign")
 	return nil
 }
 
-func printHelp() {
-	fmt.Print(`Usage: go run ./script/browser-agent/firefox/sign
+func readGeckoID(root string) string {
+	path := filepath.Join(root, "Firefox-Ext-Browser-Agent", "public", "manifest.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return defaultGeckoID
+	}
+	var m struct {
+		BrowserSpecificSettings struct {
+			Gecko struct {
+				ID string `json:"id"`
+			} `json:"gecko"`
+		} `json:"browser_specific_settings"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return defaultGeckoID
+	}
+	if id := strings.TrimSpace(m.BrowserSpecificSettings.Gecko.ID); id != "" {
+		return id
+	}
+	return defaultGeckoID
+}
 
-Bundle the Firefox extension, sign it with Mozilla AMO (unlisted), and write
-artifacts under dist/signed/.
+func printHelp() {
+	fmt.Print(`Usage: go run ./script/browser-agent/firefox/sign [options]
+
+Sign the Firefox extension with Mozilla AMO (unlisted), or reuse an already
+signed version from AMO for the current VERSION.txt.
+
+Default (smart):
+  1. Query AMO for browser-agent@xhd2015 + VERSION.txt
+  2. If already signed → download to dist/signed/ + stage embed (skip build)
+  3. Else generate, build, web-ext sign, stage
+
+Options:
+  --status     Query AMO only (no build/sign/stage); exit non-zero if not signed
+  --force      Always build + web-ext sign (do not reuse AMO download)
+` + clicolor.FlagHelp + `  -h, --help   Show this help
 
 Secrets file: .firefox-secretes.txt  (note spelling)
 
@@ -186,10 +346,14 @@ Search order:
   2. {module}/.firefox-secretes.txt
   3. {main-repo}/.firefox-secretes.txt (when running from a git worktree)
 
-Also writes:
+Also writes (full sign path):
   dist/firefox-package/                         unsigned sources used for signing
   dist/browser-agent-firefox-*.xpi              local unsigned zip (convenience)
+  dist/signed/browser-agent-*-signed.xpi        AMO-signed package
   browseragent/embedded/firefox-xpi/browser-agent.xpi  //go:embed payload
+
+Note: AMO signing/audit may take hours. Aborting the client does not cancel AMO;
+  re-run --status or sign later to download when ready.
 `)
 }
 
@@ -324,7 +488,7 @@ func runWebExtSign(root, sourceDir, artifactsDir, apiKey, apiSecret string) erro
 	// Do not leak secrets via verbose env dump; only pass what's needed.
 	cmd.Env = os.Environ()
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("npx web-ext sign failed: %w\n  hint: check jwt_issuer/jwt_secret at %s", err, amoAPIKeyURL)
+		return fmt.Errorf("npx web-ext sign failed: %w\n  hint: check jwt_issuer/jwt_secret and system clock at %s\n  if you aborted earlier, try: go run ./script/browser-agent/firefox/sign --status", err, amoAPIKeyURL)
 	}
 	return nil
 }

@@ -4,7 +4,7 @@
     window.__BROWSER_AGENT_EXT__ = {
       product: "browser-agent",
       controlPort: 43761,
-      version: "1.0.4",
+      version: "1.0.5",
       features: ["browser-agent"],
     };
   } catch (e) {

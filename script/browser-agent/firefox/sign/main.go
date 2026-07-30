@@ -272,18 +272,22 @@ func fullSign(root, wantVer, issuer, secret string, c clicolor.Style) error {
 		fmt.Printf("  %s  (%d bytes)\n", filepath.Join(outDir, e.Name()), size)
 	}
 
-	// Stage into //go:embed so `go install` / install-firefox-extension ship the xpi.
-	src, err := browseragent.FindSignedXPIUnder(outDir)
+	// Stage into //go:embed — pick the xpi that matches wantVer (not an older *signed* leftover).
+	src, err := browseragent.FindSignedXPIMatchingVersion(outDir, wantVer)
 	if err != nil {
-		return fmt.Errorf("signed xpi not found after web-ext: %w", err)
+		return fmt.Errorf("signed xpi not found after web-ext for version %s: %w", wantVer, err)
 	}
-	// Prefer a stable name copy under dist/signed for operators.
+	// Stable operator name for this version only (copy matching bytes; never clobber with another version).
 	stable := filepath.Join(outDir, fmt.Sprintf("browser-agent-%s-signed.xpi", wantVer))
 	if src != stable {
-		if data, rerr := os.ReadFile(src); rerr == nil {
-			_ = os.WriteFile(stable, data, 0o644)
-			src = stable
+		data, rerr := os.ReadFile(src)
+		if rerr != nil {
+			return fmt.Errorf("read signed xpi: %w", rerr)
 		}
+		if err := os.WriteFile(stable, data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", stable, err)
+		}
+		src = stable
 	}
 	if err := browseragent.ValidateReleaseFirefoxXPI(src, wantVer); err != nil {
 		return fmt.Errorf("signed xpi validation: %w", err)

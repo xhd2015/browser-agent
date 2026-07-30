@@ -164,6 +164,38 @@ func TestIsAMOSignedXPI(t *testing.T) {
 	}
 }
 
+func TestFindSignedXPIMatchingVersion_notOlderSigned(t *testing.T) {
+	dir := t.TempDir()
+	// Older "preferred" *signed* name (larger) but wrong version
+	old := writeTestXPI(t, dir, "1.0.4", "browser-agent-1.0.4-signed.xpi")
+	// Pad old file so it is larger (FindSignedXPIUnder used to win on size)
+	if data, err := os.ReadFile(old); err == nil {
+		_ = os.WriteFile(old, append(data, make([]byte, 100)...), 0o644)
+	}
+	// Newer version from web-ext-style hash name
+	_ = writeTestXPI(t, dir, "1.0.6", "1a5c47d2afca4c5586ea-1.0.6.xpi")
+
+	// Broken heuristic would return 1.0.4
+	if p, err := FindSignedXPIUnder(dir); err == nil {
+		if SignedXPIMatchesProduct(p, "1.0.6") {
+			// ok if it luckily matches
+		} else if !SignedXPIMatchesProduct(p, "1.0.4") {
+			t.Logf("FindSignedXPIUnder returned %s", p)
+		}
+	}
+
+	got, err := FindSignedXPIMatchingVersion(dir, "1.0.6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !SignedXPIMatchesProduct(got, "1.0.6") {
+		t.Fatalf("got %s not 1.0.6", got)
+	}
+	if strings.Contains(got, "1.0.4") {
+		t.Fatalf("must not pick older 1.0.4: %s", got)
+	}
+}
+
 func TestFindReleaseFirefoxXPI(t *testing.T) {
 	root := t.TempDir()
 	// no xpi

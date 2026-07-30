@@ -397,7 +397,7 @@ func FindReleaseFirefoxXPI(root, wantVer string) (string, error) {
 
 	var tried []string
 	signedDir := filepath.Join(root, "dist", "signed")
-	if src, err := FindSignedXPIUnder(signedDir); err == nil {
+	if src, err := FindSignedXPIMatchingVersion(signedDir, wantVer); err == nil {
 		tried = append(tried, src)
 		if err := ValidateReleaseFirefoxXPI(src, wantVer); err == nil {
 			abs, _ := filepath.Abs(src)
@@ -502,6 +502,10 @@ func inferVersionFromXPIName(name string) string {
 
 // FindSignedXPIUnder looks for a preferred signed .xpi under dir (e.g. dist/signed).
 // Prefers *signed*.xpi, then any .xpi (largest wins if multiple).
+//
+// Warning: when multiple versions sit in the same directory, "largest *signed*"
+// may pick an older package. Prefer FindSignedXPIMatchingVersion when a product
+// version is known.
 func FindSignedXPIUnder(dir string) (string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -542,6 +546,71 @@ func FindSignedXPIUnder(dir string) (string, error) {
 		return any, nil
 	}
 	return "", fmt.Errorf("no .xpi under %s", dir)
+}
+
+// FindSignedXPIMatchingVersion returns an .xpi under dir whose package version
+// (manifest.json inside the zip) equals wantVer. Among matches, prefers names
+// containing "signed", then newest ModTime, then largest size.
+//
+// This avoids picking an older browser-agent-1.0.4-signed.xpi after a successful
+// web-ext download of …-1.0.6.xpi in the same directory.
+func FindSignedXPIMatchingVersion(dir, wantVer string) (string, error) {
+	wantVer = strings.TrimSpace(wantVer)
+	if wantVer == "" {
+		return "", fmt.Errorf("wantVer is empty")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	type cand struct {
+		path   string
+		signed bool
+		mtime  int64
+		size   int64
+	}
+	var matches []cand
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".xpi") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if !IsRealFirefoxXPIFile(path) {
+			continue
+		}
+		if !SignedXPIMatchesProduct(path, wantVer) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		matches = append(matches, cand{
+			path:   path,
+			signed: strings.Contains(strings.ToLower(name), "signed") || IsAMOSignedXPI(path),
+			mtime:  info.ModTime().UnixNano(),
+			size:   info.Size(),
+		})
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no .xpi with version %s under %s", wantVer, dir)
+	}
+	best := matches[0]
+	for _, m := range matches[1:] {
+		switch {
+		case m.signed && !best.signed:
+			best = m
+		case m.signed == best.signed && m.mtime > best.mtime:
+			best = m
+		case m.signed == best.signed && m.mtime == best.mtime && m.size > best.size:
+			best = m
+		}
+	}
+	return best.path, nil
 }
 
 // EnsureFirefoxXPIPlaceholder writes a compile-safe placeholder when no signed

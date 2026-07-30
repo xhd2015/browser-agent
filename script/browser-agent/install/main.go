@@ -231,8 +231,8 @@ func stageFirefoxXPIForInstall(root string, skipSign bool) error {
 		return true, nil
 	}
 
-	// 1) dist/signed preferred artifact when version matches
-	if src, err := browseragent.FindSignedXPIUnder(signedDir); err == nil {
+	// 1) dist/signed artifact that matches product version (not an older *signed* leftover)
+	if src, err := browseragent.FindSignedXPIMatchingVersion(signedDir, wantVer); err == nil {
 		ok, err := tryStageMatching(src, "dist/signed")
 		if err != nil {
 			return err
@@ -279,7 +279,7 @@ func stageFirefoxXPIForInstall(root string, skipSign bool) error {
 		fmt.Println("==> Signing Firefox extension (AMO unlisted) → embed")
 		if err := cmd.Debug().Dir(root).Run("go", "run", "./script/browser-agent/firefox/sign"); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: firefox sign failed: %v\n", err)
-		} else if src, err := browseragent.FindSignedXPIUnder(signedDir); err == nil {
+		} else if src, err := browseragent.FindSignedXPIMatchingVersion(signedDir, wantVer); err == nil {
 			ok, err := tryStageMatching(src, "dist/signed (after sign)")
 			if err != nil {
 				return err

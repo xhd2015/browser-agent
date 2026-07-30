@@ -2,19 +2,37 @@
 // places (browseragent embed version, extension manifests, JS fallbacks).
 //
 //	go run ./script/generate
-//	go run ./script/generate --check   # fail if any target would change
+//	go run ./script/generate --check              # fail if any target would change
+//	go run ./script/generate --git-add-generated  # after sync, git add only sinks
 //
 // Root VERSION.txt is the single source of truth. Run this before install/bundle.
+// Install/bundle must call plain generate (no --git-add-generated) so they do not
+// mutate the git index.
 package main
 
 import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 )
+
+// GeneratedVersionSinks is the allowlist of paths stamped from root VERSION.txt.
+// --git-add-generated only stages these (when present). Not SSoT VERSION.txt,
+// not build/, not embedded fat assets.
+var GeneratedVersionSinks = []string{
+	"browseragent/VERSION.txt",
+	"Chrome-Ext-Browser-Agent/public/manifest.json",
+	"Chrome-Ext-Browser-Agent/public/contentScript.js",
+	"Chrome-Ext-Browser-Agent/public/background.js",
+	"Firefox-Ext-Browser-Agent/public/manifest.json",
+	"Firefox-Ext-Browser-Agent/public/contentScript.js",
+	"Firefox-Ext-Browser-Agent/public/background.js",
+	"Chrome-Ext-Capture-API/public/manifest.json",
+}
 
 func main() {
 	if err := handle(os.Args[1:]); err != nil {
@@ -25,33 +43,25 @@ func main() {
 
 func handle(args []string) error {
 	checkOnly := false
+	gitAddGenerated := false
 	for _, a := range args {
 		switch a {
 		case "-h", "--help":
-			fmt.Print(`Usage: go run ./script/generate [options]
-
-Sync root VERSION.txt into derived version sinks:
-  browseragent/VERSION.txt
-  Chrome-Ext-Browser-Agent/public/manifest.json (+ contentScript/background fallbacks)
-  Firefox-Ext-Browser-Agent/public/manifest.json (+ contentScript/background fallbacks)
-  Chrome-Ext-Capture-API/public/manifest.json
-
-Options:
-  --check     Fail if any target differs from VERSION.txt (no writes)
-  -h, --help  Show this help
-
-Run from the module root (or any subdirectory). Install/bundle scripts invoke
-generate automatically before other steps.
-`)
+			fmt.Print(helpText())
 			return nil
 		case "--check":
 			checkOnly = true
+		case "--git-add-generated":
+			gitAddGenerated = true
 		default:
 			if strings.HasPrefix(a, "-") {
 				return fmt.Errorf("unrecognized flag %s (try --help)", a)
 			}
 			return fmt.Errorf("unexpected argument %q (try --help)", a)
 		}
+	}
+	if checkOnly && gitAddGenerated {
+		return fmt.Errorf("cannot combine --check and --git-add-generated")
 	}
 
 	root, err := findModuleRoot()
@@ -66,6 +76,22 @@ generate automatically before other steps.
 	fmt.Printf("generate: version %s\n", ver)
 
 	var dirty []string
+	// Paths that exist and are part of the sink set (for git-add allowlist).
+	var existingSinks []string
+	seen := map[string]bool{}
+
+	noteSink := func(rel string) {
+		if seen[rel] {
+			return
+		}
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if st, err := os.Stat(path); err != nil || st.IsDir() {
+			return
+		}
+		seen[rel] = true
+		existingSinks = append(existingSinks, rel)
+	}
+
 	writeOrCheck := func(rel string, content []byte) error {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		existing, err := os.ReadFile(path)
@@ -74,6 +100,7 @@ generate automatically before other steps.
 		}
 		if bytes.Equal(existing, content) {
 			fmt.Printf("  ok      %s\n", rel)
+			noteSink(rel)
 			return nil
 		}
 		if checkOnly {
@@ -88,6 +115,7 @@ generate automatically before other steps.
 			return fmt.Errorf("write %s: %w", rel, err)
 		}
 		fmt.Printf("  wrote   %s\n", rel)
+		noteSink(rel)
 		return nil
 	}
 
@@ -151,6 +179,77 @@ generate automatically before other steps.
 	if checkOnly && len(dirty) > 0 {
 		return fmt.Errorf("generate --check: %d file(s) out of date (run: go run ./script/generate):\n  %s",
 			len(dirty), strings.Join(dirty, "\n  "))
+	}
+
+	if gitAddGenerated {
+		// Always stage the full allowlist of existing sinks (even if already "ok"),
+		// so unstaged but correct stamps still enter the index for the commit.
+		toAdd := existingGeneratedSinks(root)
+		if len(toAdd) == 0 {
+			fmt.Println("  git-add 0 generated path(s)")
+			return nil
+		}
+		if err := gitAdd(root, toAdd); err != nil {
+			return err
+		}
+		fmt.Printf("  git-add %d generated path(s)\n", len(toAdd))
+	}
+	return nil
+}
+
+func helpText() string {
+	var b strings.Builder
+	b.WriteString(`Usage: go run ./script/generate [options]
+
+Sync root VERSION.txt into derived version sinks:
+`)
+	for _, p := range GeneratedVersionSinks {
+		b.WriteString("  ")
+		b.WriteString(p)
+		b.WriteByte('\n')
+	}
+	b.WriteString(`
+Options:
+  --check               Fail if any target differs from VERSION.txt (no writes)
+  --git-add-generated   After sync, git add only the generated sink paths above
+  -h, --help            Show this help
+
+Run from the module root (or any subdirectory). Install/bundle scripts invoke
+generate without --git-add-generated so they do not touch the git index.
+Pre-commit uses --git-add-generated so version sinks stay in sync on commit.
+`)
+	return b.String()
+}
+
+// existingGeneratedSinks returns allowlisted sink rel paths that exist as files.
+func existingGeneratedSinks(root string) []string {
+	var out []string
+	for _, rel := range GeneratedVersionSinks {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		st, err := os.Stat(path)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		out = append(out, rel)
+	}
+	return out
+}
+
+// gitAdd runs `git add -- <paths>` at root. Paths must be allowlisted by the caller.
+func gitAdd(root string, relPaths []string) error {
+	if len(relPaths) == 0 {
+		return nil
+	}
+	args := append([]string{"add", "--"}, relPaths...)
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("git add: %s", msg)
+		}
+		return fmt.Errorf("git add: %w", err)
 	}
 	return nil
 }

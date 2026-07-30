@@ -1,4 +1,4 @@
-// Pre-commit helper: ensure go:embed placeholder files exist and are staged.
+// Pre-commit helper: ensure go:embed placeholders, sync version sinks, stage both.
 //
 //	go run ./script/git/pre-commit
 //
@@ -6,8 +6,12 @@
 //
 //	git-hooks pre-commit add 'script.git.pre-commit' go run ./script/git/pre-commit
 //
-// Silent on success. Creates empty placeholder.txt under browseragent/embedded
-// trees when missing, then git-adds them.
+// Steps:
+//  1. Create empty placeholder.txt under browseragent/embedded/* when missing
+//  2. go run ./script/generate --git-add-generated  (version sinks only)
+//  3. git add placeholders
+//
+// Never git-adds paths outside generate's allowlist + the three placeholders.
 package main
 
 import (
@@ -45,6 +49,16 @@ func run() error {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
 		toAdd = append(toAdd, rel)
+	}
+
+	// Stamp VERSION.txt → sinks and stage only generate's allowlisted paths.
+	fmt.Println("==> generate --git-add-generated")
+	gen := exec.Command("go", "run", "./script/generate", "--git-add-generated")
+	gen.Dir = root
+	gen.Stdout = os.Stdout
+	gen.Stderr = os.Stderr
+	if err := gen.Run(); err != nil {
+		return fmt.Errorf("go run ./script/generate --git-add-generated: %w", err)
 	}
 
 	return gitAdd(root, toAdd)

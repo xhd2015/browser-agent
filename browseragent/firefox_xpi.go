@@ -1,6 +1,7 @@
 package browseragent
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -180,8 +181,7 @@ func StageFirefoxXPIEmbed(root, xpiSrc, version string) (embedDir string, err er
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return "", err
 	}
-	// Drop placeholder so embed is unambiguously complete.
-	_ = os.Remove(filepath.Join(destDir, "placeholder.txt"))
+	// Keep placeholder.txt for git/embed safety (do not delete when staging fat xpi).
 
 	destXPI := filepath.Join(destDir, firefoxXPIFileName)
 	data, err := os.ReadFile(absSrc)
@@ -194,18 +194,195 @@ func StageFirefoxXPIEmbed(root, xpiSrc, version string) (embedDir string, err er
 
 	version = strings.TrimSpace(version)
 	if version == "" {
-		version = inferVersionFromXPIName(filepath.Base(absSrc))
+		if v, perr := PeekSignedXPIVersion(absSrc); perr == nil && v != "" {
+			version = v
+		} else {
+			version = inferVersionFromXPIName(filepath.Base(absSrc))
+		}
 	}
 	if version != "" {
 		if err := os.WriteFile(filepath.Join(destDir, firefoxXPIVersionFile), []byte(version+"\n"), 0o644); err != nil {
 			return "", err
 		}
 	}
+	// Always re-ensure placeholders so install/bundle never leaves tracked files deleted.
+	if err := EnsureEmbedPlaceholders(absRoot); err != nil {
+		return "", err
+	}
 	absDest, err := filepath.Abs(destDir)
 	if err != nil {
 		return "", err
 	}
 	return absDest, nil
+}
+
+// ReadProductVersion reads root VERSION.txt (product SSoT). Empty/missing → "".
+func ReadProductVersion(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(root, "VERSION.txt"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// PeekSignedXPIVersion returns the extension version for a signed/unsigned .xpi.
+// Prefers manifest.json inside the zip; falls back to the file name.
+func PeekSignedXPIVersion(xpiPath string) (string, error) {
+	xpiPath = strings.TrimSpace(xpiPath)
+	if xpiPath == "" {
+		return "", fmt.Errorf("xpi path is empty")
+	}
+	zr, err := zip.OpenReader(xpiPath)
+	if err != nil {
+		// Still try filename (e.g. corrupt zip).
+		if v := inferVersionFromXPIName(filepath.Base(xpiPath)); v != "" {
+			return v, nil
+		}
+		return "", fmt.Errorf("open xpi: %w", err)
+	}
+	defer zr.Close()
+
+	var topLevel, nested string
+	for _, f := range zr.File {
+		name := strings.TrimPrefix(f.Name, "./")
+		base := filepath.Base(name)
+		if base != "manifest.json" {
+			continue
+		}
+		rc, oerr := f.Open()
+		if oerr != nil {
+			continue
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(rc, 1<<20))
+		_ = rc.Close()
+		if rerr != nil {
+			continue
+		}
+		var mani struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(raw, &mani) != nil {
+			continue
+		}
+		v := strings.TrimSpace(mani.Version)
+		if v == "" {
+			continue
+		}
+		// Prefer package-root manifest.json over nested paths.
+		if name == "manifest.json" || !strings.Contains(name, "/") {
+			topLevel = v
+			break
+		}
+		if nested == "" {
+			nested = v
+		}
+	}
+	if topLevel != "" {
+		return topLevel, nil
+	}
+	if nested != "" {
+		return nested, nil
+	}
+	if v := inferVersionFromXPIName(filepath.Base(xpiPath)); v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("no version in xpi %s", xpiPath)
+}
+
+// SignedXPIMatchesProduct reports whether xpiPath's version equals wantVer.
+func SignedXPIMatchesProduct(xpiPath, wantVer string) bool {
+	wantVer = strings.TrimSpace(wantVer)
+	if wantVer == "" {
+		return false
+	}
+	got, err := PeekSignedXPIVersion(xpiPath)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(got) == wantVer
+}
+
+// IsRealFirefoxXPIFile reports whether path is a non-empty ZIP (.xpi) file.
+func IsRealFirefoxXPIFile(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() || st.Size() < 4 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var head [2]byte
+	if _, err := io.ReadFull(f, head[:]); err != nil {
+		return false
+	}
+	return head[0] == 'P' && head[1] == 'K'
+}
+
+// EmbedPlaceholderRels are tracked git placeholders under browseragent/embedded.
+// Fat staging must not delete these (//go:embed + clean-clone safety).
+var EmbedPlaceholderRels = []string{
+	"browseragent/embedded/extension/placeholder.txt",
+	"browseragent/embedded/session-page/placeholder.txt",
+	"browseragent/embedded/firefox-xpi/placeholder.txt",
+}
+
+// EnsureEmbedPlaceholders creates empty placeholder.txt files under the three
+// //go:embed roots if missing. Safe to call after bundle/stage (does not remove
+// fat assets). Prefer keeping placeholders even when real payloads exist.
+func EnsureEmbedPlaceholders(root string) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return fmt.Errorf("root is required")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	for _, rel := range EmbedPlaceholderRels {
+		abs := filepath.Join(absRoot, filepath.FromSlash(rel))
+		if st, err := os.Stat(abs); err == nil {
+			if st.IsDir() {
+				return fmt.Errorf("%s: is a directory", rel)
+			}
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return err
+		}
+		// Empty file matches pre-commit helper; content is irrelevant to runtime.
+		if err := os.WriteFile(abs, nil, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// RemoveEmbeddedFirefoxXPIIfMismatch deletes embed browser-agent.xpi when its
+// package version != wantVer so go install does not ship a stale AMO build.
+// Always re-ensures placeholders. No-op if no real xpi or versions match.
+func RemoveEmbeddedFirefoxXPIIfMismatch(root, wantVer string) error {
+	wantVer = strings.TrimSpace(wantVer)
+	embedXPI := filepath.Join(root, "browseragent", "embedded", "firefox-xpi", firefoxXPIFileName)
+	if !IsRealFirefoxXPIFile(embedXPI) {
+		return EnsureEmbedPlaceholders(root)
+	}
+	if wantVer != "" && SignedXPIMatchesProduct(embedXPI, wantVer) {
+		return EnsureEmbedPlaceholders(root)
+	}
+	_ = os.Remove(embedXPI)
+	_ = os.Remove(filepath.Join(root, "browseragent", "embedded", "firefox-xpi", firefoxXPIVersionFile))
+	if err := EnsureEmbedPlaceholders(root); err != nil {
+		return err
+	}
+	return EnsureFirefoxXPIPlaceholder(root)
 }
 
 func inferVersionFromXPIName(name string) string {
@@ -268,22 +445,18 @@ func FindSignedXPIUnder(dir string) (string, error) {
 
 // EnsureFirefoxXPIPlaceholder writes a compile-safe placeholder when no signed
 // xpi is staged (clean clone / --fixture). //go:embed needs at least one file.
+// Always keeps/creates placeholder.txt even when a real xpi is present.
 func EnsureFirefoxXPIPlaceholder(root string) error {
+	if err := EnsureEmbedPlaceholders(root); err != nil {
+		return err
+	}
 	dir := filepath.Join(root, "browseragent", "embedded", "firefox-xpi")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	xpi := filepath.Join(dir, firefoxXPIFileName)
-	if st, err := os.Stat(xpi); err == nil && !st.IsDir() && st.Size() >= 4 {
-		f, oerr := os.Open(xpi)
-		if oerr == nil {
-			var head [2]byte
-			_, _ = io.ReadFull(f, head[:])
-			_ = f.Close()
-			if head[0] == 'P' && head[1] == 'K' {
-				return nil
-			}
-		}
+	if IsRealFirefoxXPIFile(xpi) {
+		return nil
 	}
 	ph := filepath.Join(dir, "placeholder.txt")
 	if _, err := os.Stat(ph); err == nil {

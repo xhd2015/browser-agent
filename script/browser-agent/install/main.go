@@ -15,12 +15,13 @@
 // already sits under browseragent/embedded/session-page/.
 //
 // Firefox signed .xpi: after bundle, install stages
-// browseragent/embedded/firefox-xpi/browser-agent.xpi from dist/signed/ when
-// present, or runs script/browser-agent/firefox/sign when AMO secrets are
-// available (unless --skip-firefox-sign / --fixture).
+// browseragent/embedded/firefox-xpi/browser-agent.xpi only when the package
+// version matches root VERSION.txt. On mismatch, prompts (TTY) or skips AMO
+// sign with warnings (non-TTY / --skip-firefox-sign). Never stages a wrong-version xpi.
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/xhd2015/browser-agent/browseragent"
 	"github.com/xhd2015/xgo/support/cmd"
+	"golang.org/x/term"
 )
 
 const (
@@ -102,9 +104,12 @@ func handle(args []string) error {
 		fmt.Printf("Staged fixture extension → %s\n", res.ExtensionDir)
 		fmt.Printf("Staged fixture session-page → %s\n", res.SessionPageDir)
 		fmt.Fprintln(os.Stderr, "warning: --fixture embeds the mini session-page (no React SPA)")
-		// Ensure //go:embed firefox-xpi root is non-empty.
+		// Ensure //go:embed firefox-xpi root is non-empty + tracked placeholders.
 		if err := browseragent.EnsureFirefoxXPIPlaceholder(root); err != nil {
 			return fmt.Errorf("firefox-xpi placeholder: %w", err)
+		}
+		if err := browseragent.EnsureEmbedPlaceholders(root); err != nil {
+			return fmt.Errorf("embed placeholders: %w", err)
 		}
 
 	case skipBundle:
@@ -138,6 +143,11 @@ func handle(args []string) error {
 		}
 	}
 
+	// Always keep tracked placeholders (bundle may wipe dirs; never leave D placeholder.txt).
+	if err := browseragent.EnsureEmbedPlaceholders(root); err != nil {
+		return fmt.Errorf("embed placeholders: %w", err)
+	}
+
 	// 1b) Stage signed Firefox .xpi into //go:embed (permanent install path).
 	if !fixture {
 		if err := stageFirefoxXPIForInstall(root, skipFirefoxSign); err != nil {
@@ -146,6 +156,9 @@ func handle(args []string) error {
 				return fmt.Errorf("firefox-xpi placeholder: %w", err)
 			}
 		}
+	}
+	if err := browseragent.EnsureEmbedPlaceholders(root); err != nil {
+		return fmt.Errorf("embed placeholders: %w", err)
 	}
 
 	// 2) go install into GOBIN / GOPATH/bin (embeds browseragent/embedded/**).
@@ -183,59 +196,121 @@ func handle(args []string) error {
 // stageFirefoxXPIForInstall stages a signed .xpi into
 // browseragent/embedded/firefox-xpi/ for //go:embed.
 //
-// Order:
-//  1. If dist/signed has an .xpi, stage it (fast path after a prior sign).
-//  2. Else if !skipSign and secrets look available, run firefox/sign then stage.
-//  3. Else if embed already has a real browser-agent.xpi, keep it.
-//  4. Else error (caller may fall back to placeholder).
+// Only stages when package version matches product VERSION.txt.
+// On mismatch / missing:
+//   - --skip-firefox-sign → no AMO; clear mismatched embed; error for placeholder path
+//   - stdin TTY → ask Sign? [y/N]
+//   - non-TTY → auto-skip with warnings
 func stageFirefoxXPIForInstall(root string, skipSign bool) error {
-	signedDir := filepath.Join(root, "dist", "signed")
-	ver := strings.TrimSpace(browseragent.ClientVersion())
+	wantVer := browseragent.ReadProductVersion(root)
+	if wantVer == "" {
+		wantVer = strings.TrimSpace(browseragent.ClientVersion())
+	}
+	if wantVer == "" {
+		return fmt.Errorf("product version empty (set VERSION.txt)")
+	}
 
-	tryStage := func(src string) error {
-		embedDir, err := browseragent.StageFirefoxXPIEmbed(root, src, ver)
+	signedDir := filepath.Join(root, "dist", "signed")
+	embedXPI := filepath.Join(root, "browseragent", "embedded", "firefox-xpi", "browser-agent.xpi")
+
+	tryStageMatching := func(src, label string) (bool, error) {
+		got, _ := browseragent.PeekSignedXPIVersion(src)
+		got = strings.TrimSpace(got)
+		if !browseragent.SignedXPIMatchesProduct(src, wantVer) {
+			if got == "" {
+				got = "(unknown)"
+			}
+			fmt.Fprintf(os.Stderr, "warning: %s xpi version %s != product %s — will not stage\n", label, got, wantVer)
+			return false, nil
+		}
+		embedDir, err := browseragent.StageFirefoxXPIEmbed(root, src, wantVer)
+		if err != nil {
+			return false, err
+		}
+		fmt.Printf("Staged Firefox signed xpi → %s/browser-agent.xpi (version %s matches product; from %s)\n", embedDir, wantVer, src)
+		return true, nil
+	}
+
+	// 1) dist/signed preferred artifact when version matches
+	if src, err := browseragent.FindSignedXPIUnder(signedDir); err == nil {
+		ok, err := tryStageMatching(src, "dist/signed")
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Staged Firefox signed xpi → %s/browser-agent.xpi (from %s)\n", embedDir, src)
-		return nil
+		if ok {
+			return nil
+		}
 	}
 
-	// 1) Existing signed artifact
-	if src, err := browseragent.FindSignedXPIUnder(signedDir); err == nil {
-		fmt.Println("==> Staging Firefox signed .xpi from dist/signed")
-		return tryStage(src)
+	// 2) Existing embed xpi when version matches
+	if browseragent.IsRealFirefoxXPIFile(embedXPI) {
+		ok, err := tryStageMatching(embedXPI, "embedded")
+		if err != nil {
+			return err
+		}
+		if ok {
+			fmt.Printf("Using existing embedded Firefox xpi → %s (version %s)\n", embedXPI, wantVer)
+			return nil
+		}
 	}
 
-	// 2) Sign via AMO when allowed
-	if !skipSign {
+	// No matching signed package for wantVer.
+	doSign := false
+	switch {
+	case skipSign:
+		fmt.Println("==> Skipping Firefox AMO sign (--skip-firefox-sign)")
+		fmt.Fprintf(os.Stderr, "warning: no Firefox xpi for product %s; AMO sign skipped by flag\n", wantVer)
+	case stdinIsTTY():
+		fmt.Fprintf(os.Stderr, "warning: firefox signed xpi missing or version mismatch (want %s)\n", wantVer)
+		fmt.Fprintf(os.Stderr, "Sign Firefox extension with AMO for %s now? [y/N] ", wantVer)
+		answer, _ := readLine(os.Stdin)
+		ans := strings.ToLower(strings.TrimSpace(answer))
+		if ans == "y" || ans == "yes" {
+			doSign = true
+		} else {
+			fmt.Fprintln(os.Stderr, "warning: skipped Firefox AMO sign; permanent Firefox .xpi not updated")
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "warning: firefox xpi missing or version != %s; non-interactive stdin — skipping AMO sign\n", wantVer)
+		fmt.Fprintln(os.Stderr, "warning: run: go run ./script/browser-agent/firefox/sign  then re-install (or answer y on a TTY)")
+	}
+
+	if doSign {
 		fmt.Println("==> Signing Firefox extension (AMO unlisted) → embed")
 		if err := cmd.Debug().Dir(root).Run("go", "run", "./script/browser-agent/firefox/sign"); err != nil {
-			// Fall through to existing embed / error
 			fmt.Fprintf(os.Stderr, "warning: firefox sign failed: %v\n", err)
 		} else if src, err := browseragent.FindSignedXPIUnder(signedDir); err == nil {
-			return tryStage(src)
-		}
-	} else {
-		fmt.Println("==> Skipping Firefox AMO sign (--skip-firefox-sign)")
-	}
-
-	// 3) Keep already-staged real xpi under embed
-	embedXPI := filepath.Join(root, "browseragent", "embedded", "firefox-xpi", "browser-agent.xpi")
-	if st, err := os.Stat(embedXPI); err == nil && !st.IsDir() && st.Size() >= 4 {
-		f, oerr := os.Open(embedXPI)
-		if oerr == nil {
-			var head [2]byte
-			_, _ = f.Read(head[:])
-			_ = f.Close()
-			if head[0] == 'P' && head[1] == 'K' {
-				fmt.Printf("Using existing embedded Firefox xpi → %s\n", embedXPI)
+			ok, err := tryStageMatching(src, "dist/signed (after sign)")
+			if err != nil {
+				return err
+			}
+			if ok {
 				return nil
 			}
+			fmt.Fprintf(os.Stderr, "warning: signed xpi still does not match product %s\n", wantVer)
 		}
 	}
 
-	return fmt.Errorf("no signed .xpi in dist/signed and embed incomplete (sign with: go run ./script/browser-agent/firefox/sign)")
+	// Do not leave a wrong-version xpi embedded under a new product version.
+	if err := browseragent.RemoveEmbeddedFirefoxXPIIfMismatch(root, wantVer); err != nil {
+		return err
+	}
+	return fmt.Errorf("no signed .xpi for product %s (sign with: go run ./script/browser-agent/firefox/sign)", wantVer)
+}
+
+func stdinIsTTY() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+func readLine(r *os.File) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+	sc := bufio.NewScanner(r)
+	if sc.Scan() {
+		return sc.Text(), nil
+	}
+	return "", sc.Err()
 }
 
 // diskEmbedsIncomplete reports whether browseragent/embedded trees lack outstanding files.
@@ -259,18 +334,19 @@ so the binary //go:embed includes a fresh SPA + Firefox xpi — not a leftover m
 Options:
   --fixture, --mini        Stage mini fixtures only (no vite / no AMO sign).
   --skip-bundle            Skip rebuild; require an existing non-fixture SPA on disk.
-  --skip-firefox-sign      Do not call AMO web-ext sign; reuse dist/signed or embed.
+  --skip-firefox-sign      Do not call AMO web-ext sign; only stage xpi if version matches VERSION.txt.
   --force-bundle           Accepted for compatibility (full mode always bundles).
   -h, --help               Show this help
 
 Default (recommended):
   1. vite build react/ → browseragent/embedded/session-page
   2. stage Chrome + Firefox extensions → browseragent/embedded/
-  3. sign/stage Firefox .xpi → browseragent/embedded/firefox-xpi/browser-agent.xpi
+  3. stage Firefox .xpi only when package version == VERSION.txt
+     (TTY: prompt to AMO-sign on mismatch; non-TTY: skip with warnings)
   4. go install ./cmd/browser-agent
 
-Firefox sign needs .firefox-secretes.txt (AMO JWT). Without secrets, install
-reuses dist/signed/*.xpi or an already-staged embed xpi when present.
+Firefox sign needs .firefox-secretes.txt (AMO JWT). Install never reuses a
+dist/signed or embed .xpi whose version differs from VERSION.txt.
 
 If vite/node is missing, install fails (does not silently embed the fixture SPA).
 `)

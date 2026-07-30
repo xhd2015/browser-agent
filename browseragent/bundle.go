@@ -137,6 +137,10 @@ func Bundle(opts BundleOptions) (*BundleResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Never leave tracked embed placeholders deleted after fat stage.
+	if err := EnsureEmbedPlaceholders(absRoot); err != nil {
+		return nil, fmt.Errorf("ensure embed placeholders: %w", err)
+	}
 
 	return &BundleResult{
 		ExtensionDir:           absExt,
@@ -237,6 +241,10 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 	absSess, err := filepath.Abs(sessDest)
 	if err != nil {
 		return nil, err
+	}
+	// Never leave tracked embed placeholders deleted after fat stage.
+	if err := EnsureEmbedPlaceholders(absRoot); err != nil {
+		return nil, fmt.Errorf("ensure embed placeholders: %w", err)
 	}
 	return &BundleResult{
 		ExtensionDir:           absExt,

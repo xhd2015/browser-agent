@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Agent",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Browser Agent extension — connects to browser-agent control server on port 43761; CDP jobs on open tabs",
   "background": {
     "service_worker": "background.js"

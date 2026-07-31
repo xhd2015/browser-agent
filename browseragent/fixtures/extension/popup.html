@@ -54,7 +54,15 @@
 
     <div class="row" style="margin-top: 0.75rem">
       <strong>Control server (HTTP)</strong>
-      <span id="ctrl-status" class="muted">checking…</span>
+      <span id="ctrl-status" data-phase="control" class="muted">checking…</span>
+    </div>
+    <div class="row">
+      <strong>Session / WS</strong>
+      <span id="status-session" data-phase="session" class="muted">…</span>
+    </div>
+    <div class="row">
+      <strong>Debugger</strong>
+      <span id="status-debugger" data-phase="debugger" class="muted">…</span>
     </div>
     <p class="muted" data-connection-status id="conn-hint">
       Open a /go?session= page so the extension can attach via WebSocket.

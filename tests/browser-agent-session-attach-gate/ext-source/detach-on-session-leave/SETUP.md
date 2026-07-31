@@ -1,12 +1,12 @@
 # Scenario
 
-**Feature**: last session-page leave detaches session debugger (banner gone)
+**Feature**: last session-page leave detaches every tab in the session attach set
 
 ```
 Last /go?session=S leaves window
   -> unregisterSession / leave path
-  -> detachDebugger for sessionAttachState.attachedTabId
-  -> chrome.debugger no longer attached
+  -> detachDebugger for every tabId in session attach set
+  -> chrome.debugger no longer attached to any session tab
 ```
 
 ## Preconditions
@@ -19,8 +19,11 @@ Last /go?session=S leaves window
 
 ## Context
 
-- Current master: `unregisterSession` closes WS only — **no** `chrome.debugger.detach`.
-- Detach-on-tab-switch inside `attachDebuggerForSession` does **not** satisfy this leaf.
+- Policy B: leave must clear the **whole** attach set, not only a sticky singular
+  `attachedTabId`.
+- Detach-on-tab-switch inside `attachDebuggerForSession` does **not** satisfy this leaf
+  (and switch-detach is obsolete).
+- Sticky single-id one-shot detach **fails** this leaf until multi-set detach-all lands.
 
 ```go
 import (

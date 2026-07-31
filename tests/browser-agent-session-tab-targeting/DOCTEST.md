@@ -7,7 +7,7 @@ Classic TDD for first-class **tab targeting** on session job commands (`eval`, `
 | Surface | What is under test |
 |---------|-------------------|
 | CLI flags | `--tab-id` posts `tab_id` in job JSON; `--tab-id` + `--tab-index` mutual exclusion |
-| Extension source | Explicit `tab_id` window validation; 1-based `tab_index` order; attach reuse + detach on switch |
+| Extension source | Explicit `tab_id` window validation; 1-based `tab_index` order; attach reuse + serialize (multi-attach peers kept) |
 | session info | Human columns Idx/ID/Role; `--json` `tabs[].index` + `job_target.tab_index` |
 | E2E (playwright-debug) | `--tab-id` hits background tab without focus; eval + screenshot same tab |
 
@@ -42,7 +42,8 @@ Mutual exclusion: both `--tab-id` and `--tab-index` → exit 1 before job POST.
 
 **Background Worker** validates `tab_id` belongs to session window, resolves
 1-based index over capturable tabs, reuses `chrome.debugger` attach on same tab,
-detaches when switching `tab_id`, serializes attach per session.
+keeps peer attaches when targeting a different tab (policy B multi-attach set;
+switch-detach obsolete), serializes attach per session.
 
 **session info** — human table (Idx | ID | Active | Role | Title) + footer job
 target line; `--json` adds `tabs[].index`, `job_target.tab_index`, `recommended_cli`.
@@ -74,7 +75,7 @@ browser-agent-session-tab-targeting
 ├── ext-source/                       [extension background.js contract]
 │   ├── resolve-tab-id-window/            tab_id + entry.windowId validation
 │   ├── resolve-tab-index-order/          1-based capturable tab index in window
-│   └── attach-reuse-same-tab/            reuse attach; detach on tab switch
+│   └── attach-reuse-same-tab/            reuse attach + serialize; multi-attach peers kept
 ├── info/                             [session info human + json]
 │   ├── json-tab-index-field/             --json tabs[].index + job_target.tab_index
 │   └── human-table-columns/              human full table + job_target/recommended/hint footer
@@ -99,7 +100,7 @@ browser-agent-session-tab-targeting
 | `cli/tab-id-index-conflict` | Both `--tab-id` and `--tab-index` → exit 1 + conflict message |
 | `ext-source/resolve-tab-id-window` | background validates `tab_id` in `entry.windowId` |
 | `ext-source/resolve-tab-index-order` | 1-based index over capturable tabs in session window |
-| `ext-source/attach-reuse-same-tab` | reuse attach same tab; detach when switching `tab_id` |
+| `ext-source/attach-reuse-same-tab` | reuse attach same tab + serialize; no switch-detach demand (policy B) |
 | `info/json-tab-index-field` | `--json` includes `tabs[].index` and `job_target.tab_index` |
 | `info/human-table-columns` | human output lists both tab rows + Job target idx/tab/reason + Recommended + session-page hint |
 | `e2e/eval-tab-id-background` | eval with `tab_id` hits background tab without focus |

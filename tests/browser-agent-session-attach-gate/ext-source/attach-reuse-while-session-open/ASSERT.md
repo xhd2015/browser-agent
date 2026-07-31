@@ -1,9 +1,9 @@
 ## Expected
 
 - `background.js` reuses `chrome.debugger` attach when already attached to the same
-  `tabId` (`attachedTabs.has` / `attachedTabId` match).
-- **Detaches** when switching to a different tab between jobs.
+  `tabId` (`attachedTabs.has` / set `.has` / equivalent early return).
 - **Serializes** attach per session (`attachLock` or equivalent).
+- Does **not** require switch-detach of a different previously attached tab.
 
 ## Side Effects
 
@@ -33,8 +33,8 @@ func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err 
 			req.ModuleRoot, resp.ErrText, resp.FoundPaths)
 	}
 	text := resp.CombinedText
-	if !hasAttachReuseWhileSessionOpen(text) {
-		t.Fatalf("background must reuse attach for same tab while session open, detach on switch, and serialize attach; text=%s",
+	if !hasSameTabReuseAndLock(text) {
+		t.Fatalf("background must reuse attach for same tab while session open and serialize attach (attachLock); text=%s",
 			truncate(text, 900))
 	}
 }

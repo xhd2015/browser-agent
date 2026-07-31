@@ -1,20 +1,24 @@
-# browser-agent session attach gate
+# browser-agent session attach gate + multi-tab attach (policy B)
 
-Classic TDD for the **session attach gate**: `chrome.debugger` may attach only while
-at least one open session control tab (`…/go?session=<id>`) remains in the **same
-Chrome window** as the target. Sticky attach while the session page is open;
-**detach when the last session page leaves**; refuse attach (clear error) after
-that. Multi-session-tab recount so closing one of two control tabs does not
-disarm the session.
+Classic TDD for the **session attach gate** and **policy B multi-tab attach set**:
+`chrome.debugger` may attach only while at least one open session control tab
+(`…/go?session=<id>`) remains in the **same Chrome window** as the target.
+A session holds a **set** of simultaneous attaches; attaching tab B while A is
+attached **keeps A** (no sticky switch-detach). Detach **every** tab in the set
+when the last session page leaves. Multi-session-tab recount so closing one of
+two control tabs does not disarm the session.
 
 | Surface | What is under test |
 |---------|-------------------|
-| Extension source | Detach on last session-page leave; attach gate; multi-tab recount; reuse-while-open regression |
+| Extension source | Multi-attach keep peers; same-tab reuse + lock; detach-all on leave; attach gate; multi-tab recount |
 | E2E (playwright-debug) | Eval succeeds with session open; fails after last page close/navigate-away; stays armed with two pages minus one |
 
 **No real Chrome** for `ext-source` leaves. E2e uses `playwright-debug --extension`
 + embedded extension (same harness as `browser-agent-active-tab-routing` /
 `browser-agent-session-tab-targeting` / `browser-agent-e2e-playwright`).
+
+**Policy note:** sticky single `attachedTabId` + switch-detach (policy A) is
+**obsolete**. This tree encodes **policy B** only.
 
 ## Version
 
@@ -25,9 +29,14 @@ disarm the session.
 **Session Control Tab** — tab on the control host at `/go?session=<sessionId>` that
 registers the extension WebSocket (`sessions` map: `{ ws, tabId, windowId, … }`).
 
-**Session Attach State** — per-session debugger hold (`sessionAttachState` /
-`attachedTabs`): sticky while at least one control tab remains for that session
-in the target window.
+**Session Attach State** — per-session debugger hold: a **set of attached tab IDs**
+(`attachedTabIds` / equivalent), not a single sticky id. Peers stay attached across
+jobs until session leave or explicit release.
+
+**Multi-tab Attach (policy B)** — `attachDebuggerForSession(sessionId, tabB)` while
+tab A is already in the set **keeps A attached** and adds B. Same-tab second attach
+**reuses** (`attachedTabs.has` / set `.has`) without re-attach error. Attach work is
+**serialized** per session (`attachLock` or equivalent).
 
 **Attach Gate** — before `chrome.debugger.attach`, require ≥1 open control tab for
 the session in the same window as the job target; otherwise refuse with a clear
@@ -35,11 +44,12 @@ error (no attach).
 
 **Leave / Recount** — on control-tab close or navigate-away, **re-query** open
 `/go?session=<id>` tabs (do not trust `entry.tabId` alone). If remaining count is
-0 → detach session’s debugger and tear down session registration; if count ≥ 1 →
-stay armed (rebind `entry.tabId` if needed).
+0 → **detach every tab** in the session’s attach set and tear down session
+registration; if count ≥ 1 → stay armed (rebind `entry.tabId` if needed).
 
 **Background Worker** owns attach/detach via `withDebuggerForSession` /
-`attachDebuggerForSession` / `detachDebugger` (or equivalent helpers).
+`attachDebuggerForSession` / `detachDebugger` / `detachSessionDebugger` (or
+equivalent helpers).
 
 **Daemon Host** (`RunDaemon`) binds loopback, serves `/v1/sessions`, `/v1/jobs`,
 `/v1/session`, `/go`. **Test Client** creates sessions via `POST /v1/sessions`
@@ -51,12 +61,15 @@ parses stdout JSON assert lines.
 
 ```text
 Session open in window W
-  -> job eval on user tab in W
-  -> attach allowed (sticky while control tab open)
+  -> job eval on user tab A in W
+  -> attach A; set = {A}
+
+Job eval on tab B in W (session still open)
+  -> attach B; set = {A,B}  (A stays attached — no switch-detach)
 
 Last /go?session=S leaves W (close or navigate away)
   -> recount remaining control tabs == 0
-  -> detach debugger for S  (banner gone)
+  -> detach every tab in set  (banner gone)
   -> subsequent attach/job refused
 
 Two control tabs for S; close one
@@ -69,10 +82,11 @@ Two control tabs for S; close one
 ```
 browser-agent-session-attach-gate
 ├── ext-source/                              [static contract on background.js]
-│   ├── detach-on-session-leave/               last leave path detaches session debugger
+│   ├── detach-on-session-leave/               leave detaches ALL tabs in session attach set
 │   ├── attach-gate-requires-session-page/     attach refused without open control tab
 │   ├── multi-session-tab-recount/             leave re-queries; not only entry.tabId
-│   └── attach-reuse-while-session-open/       reuse + detach-on-switch still present
+│   ├── multi-attach-keep-peers/               attach B keeps A; set state; no switch-detach
+│   └── attach-reuse-while-session-open/       same-tab reuse + per-session attachLock
 └── e2e/                                     [playwright-debug real browser]
     ├── session-open-eval-succeeds/            control tab open → eval ok
     ├── close-last-session-page-eval-fails/    close last control tab → eval fails
@@ -83,23 +97,24 @@ browser-agent-session-attach-gate
 ### Parameter significance (high → low)
 
 1. **Test surface** — static extension source vs real-browser E2E.
-2. **Within ext-source** — leave detach → attach gate → multi-tab recount → reuse regression.
+2. **Within ext-source** — leave detach-all → attach gate → multi-tab recount → multi-attach set → same-tab reuse/lock.
 3. **Within e2e** — armed happy path → last-page close → last-page navigate-away → multi-page partial close.
 
 ## Test Index
 
 | Leaf | Scenario |
 |------|----------|
-| `ext-source/detach-on-session-leave` | Session leave / unregister path detaches debugger held by that session |
+| `ext-source/detach-on-session-leave` | Session leave / unregister detaches **every** tab in the session attach set |
 | `ext-source/attach-gate-requires-session-page` | Attach path gates on open same-window session control tab |
 | `ext-source/multi-session-tab-recount` | Leave handler re-queries remaining `/go?session=` tabs (not only `entry.tabId`) |
-| `ext-source/attach-reuse-while-session-open` | Sticky reuse for same tab + detach on tab switch still present |
+| `ext-source/multi-attach-keep-peers` | Attach different tab keeps peers; per-session set; **no** switch-detach |
+| `ext-source/attach-reuse-while-session-open` | Same-tab reuse (`attachedTabs.has` / set `.has`) + serialize attach (`attachLock`) |
 | `e2e/session-open-eval-succeeds` | Session open + user tab → eval job succeeds |
 | `e2e/close-last-session-page-eval-fails` | After last control tab closed, subsequent eval does not succeed |
 | `e2e/navigate-away-last-session-page-eval-fails` | After last control tab navigates away, subsequent eval does not succeed |
 | `e2e/two-session-pages-close-one-stays-armed` | Two control tabs; close one; eval on user tab still succeeds |
 
-**Leaf count: 8**
+**Leaf count: 9**
 
 ## How to Run
 
@@ -111,11 +126,11 @@ doctest test --label 'e2e' ./tests/browser-agent-session-attach-gate
 # or: doctest test --label 'slow && ui-automation' ./tests/browser-agent-session-attach-gate
 ```
 
-Static `ext-source` leaves are **RED** until implementer lands detach-on-leave,
-attach gate, and multi-tab recount (reuse regression may already be GREEN).
-E2e leaves skip when `playwright-debug` is absent; when present, expect **RED**
-on implementation-sensitive paths (especially multi-tab partial close and any
-path that still allows sticky attach without a control tab).
+Static `ext-source` multi-attach / detach-all leaves are **RED** under sticky
+single-`attachedTabId` switch-detach code. Attach gate, multi-tab recount, and
+same-tab reuse+lock may already be **GREEN**. E2e leaves skip when
+`playwright-debug` is absent; when present, expect implementation-sensitive
+results on multi-tab partial close and gate paths.
 
 ```go
 import (
@@ -147,18 +162,19 @@ const (
 
 // ExtSourceTarget for ModeExtSource.
 const (
-	ExtSrcDetachOnSessionLeave           = "detach-on-session-leave"
-	ExtSrcAttachGateRequiresSessionPage  = "attach-gate-requires-session-page"
-	ExtSrcMultiSessionTabRecount         = "multi-session-tab-recount"
-	ExtSrcAttachReuseWhileSessionOpen    = "attach-reuse-while-session-open"
+	ExtSrcDetachOnSessionLeave          = "detach-on-session-leave"
+	ExtSrcAttachGateRequiresSessionPage = "attach-gate-requires-session-page"
+	ExtSrcMultiSessionTabRecount        = "multi-session-tab-recount"
+	ExtSrcMultiAttachKeepPeers          = "multi-attach-keep-peers"
+	ExtSrcAttachReuseWhileSessionOpen   = "attach-reuse-while-session-open"
 )
 
 // PlaywrightOp for ModeE2E.
 const (
-	PlaywrightOpSessionOpenEvalSucceeds             = "session-open-eval-succeeds"
-	PlaywrightOpCloseLastSessionPageEvalFails       = "close-last-session-page-eval-fails"
+	PlaywrightOpSessionOpenEvalSucceeds              = "session-open-eval-succeeds"
+	PlaywrightOpCloseLastSessionPageEvalFails        = "close-last-session-page-eval-fails"
 	PlaywrightOpNavigateAwayLastSessionPageEvalFails = "navigate-away-last-session-page-eval-fails"
-	PlaywrightOpTwoSessionPagesCloseOneStaysArmed   = "two-session-pages-close-one-stays-armed"
+	PlaywrightOpTwoSessionPagesCloseOneStaysArmed    = "two-session-pages-close-one-stays-armed"
 )
 
 // Request is narrowed root→leaf by Setup functions.

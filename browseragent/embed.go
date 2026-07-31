@@ -62,16 +62,26 @@ func FormatSessionBootJSON(sessionID string) string {
 // FormatSessionBootJSONWithBrowser returns boot config JSON including the
 // operator browser ("chrome" or "firefox") so the SPA can pick install UX.
 func FormatSessionBootJSONWithBrowser(sessionID, browser string) string {
+	return FormatSessionBootJSONWithBrowserAndExtID(sessionID, browser, "")
+}
+
+// FormatSessionBootJSONWithBrowserAndExtID includes optional chrome extension_id
+// for session-page externally_connectable register (cold-start fallback).
+func FormatSessionBootJSONWithBrowserAndExtID(sessionID, browser, extensionID string) string {
 	b := strings.ToLower(strings.TrimSpace(browser))
 	if b != "firefox" {
 		b = "chrome"
 	}
-	raw, err := json.Marshal(map[string]any{
+	m := map[string]any{
 		"session_id":   sessionID,
 		"product":      ProductName,
 		"control_port": 43761,
 		"browser":      b,
-	})
+	}
+	if id := strings.TrimSpace(extensionID); id != "" {
+		m["extension_id"] = id
+	}
+	raw, err := json.Marshal(m)
 	if err != nil {
 		// Unreachable for string/int map values; keep a stable fallback.
 		return fmt.Sprintf(`{"session_id":%q,"product":%q,"control_port":43761,"browser":%q}`, sessionID, ProductName, b)

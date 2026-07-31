@@ -1,10 +1,11 @@
 ## Expected
 
 - `background.js` found under `Chrome-Ext-Browser-Agent` (public, build, or src).
-- Session leave / `unregisterSession` path **detaches** debugger held by that session
-  (`detachDebugger` / `chrome.debugger.detach`, or a named session-detach helper).
+- Session leave / `unregisterSession` path **detaches every tab** held in that session’s
+  attach set (`attachedTabIds` / equivalent — iterate + detach, not only one sticky id).
 - Leave detach is **not** satisfied only by tab-switch detach inside
   `attachDebuggerForSession`.
+- Pure sticky `attachedTabId` one-shot detach does **not** pass (policy B).
 
 ## Side Effects
 
@@ -14,6 +15,7 @@
 
 - Missing leave-detach leaves the Chrome “started debugging this page” banner after
   the last session control tab is gone.
+- Detaching only one sticky id while peers remain attached leaves orphaned debuggees.
 
 ## Exit Code
 
@@ -35,8 +37,8 @@ func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err 
 			req.ModuleRoot, resp.ErrText, resp.FoundPaths)
 	}
 	text := resp.CombinedText
-	if !hasDetachOnSessionLeave(text) {
-		t.Fatalf("background must detach session debugger on last session-page leave / unregisterSession (not only WS teardown or tab-switch detach); text=%s",
+	if !hasDetachAllOnSessionLeave(text) {
+		t.Fatalf("background must detach ALL tabs in session attach set on last session-page leave / unregisterSession (not only sticky single attachedTabId); text=%s",
 			truncate(text, 900))
 	}
 }

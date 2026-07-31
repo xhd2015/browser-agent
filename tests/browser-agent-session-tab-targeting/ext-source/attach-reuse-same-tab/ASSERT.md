@@ -2,9 +2,9 @@
 
 - `background.js` reuses `chrome.debugger` attach when already attached to same `tabId`
   (`attachedTabs.has` or equivalent early return).
-- **Detaches** when switching to a different `tab_id` between jobs
-  (`chrome.debugger.detach` or wrapper).
 - **Serializes** attach per session (lock/mutex/queue — no concurrent double-attach race).
+- Does **not** require detach-on-switch of a different previously attached tab
+  (policy B multi-attach; peers kept).
 
 ## Side Effects
 
@@ -12,7 +12,7 @@
 
 ## Errors
 
-- Missing detach-on-switch causes screenshot/eval on wrong tab or attach failures.
+- Missing reuse/serialize causes screenshot/eval attach failures or races.
 
 ## Exit Code
 
@@ -34,8 +34,8 @@ func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err 
 			req.ModuleRoot, resp.ErrText, resp.FoundPaths)
 	}
 	text := resp.CombinedText
-	if !hasAttachReuseAndDetach(text) {
-		t.Fatalf("background must reuse attach for same tab_id and detach on switch with serialized attach; text=%s",
+	if !hasAttachReuseAndSerialize(text) {
+		t.Fatalf("background must reuse attach for same tab_id and serialize attach (no switch-detach demand); text=%s",
 			truncate(text, 900))
 	}
 }

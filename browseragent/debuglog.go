@@ -122,7 +122,8 @@ func debugEnabled() bool {
 // BROWSER_AGENT_DEBUG.
 func shouldAlwaysLogJob(jobType string, params map[string]any) bool {
 	switch jobType {
-	case "create_tab":
+	case "create_tab", "eval", "run", "screenshot":
+		// Always log attach-heavy jobs for cold-path latency digs.
 		return true
 	case "cdp":
 		m, _ := stringParam(params, "method", "cdp_method", "cdpMethod")

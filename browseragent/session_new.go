@@ -430,7 +430,9 @@ func SessionNew(cfg SessionNewConfig) error {
 				if err := openFn(result.SessionURL, extPath); err != nil {
 					fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
 				}
-			} else if err := openChrome(result.SessionURL, ""); err != nil {
+			} else if err := openChrome(result.SessionURL, extPath); err != nil {
+				// Pass extPath for older Chrome --load-extension; Chrome 137+ ignores it
+				// but macOS openChromeDarwin relies on Load-unpacked in the default profile.
 				fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
 			}
 		}

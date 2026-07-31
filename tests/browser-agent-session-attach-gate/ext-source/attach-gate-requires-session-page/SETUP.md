@@ -18,7 +18,7 @@ withDebuggerForSession / attachDebuggerForSession
 
 ## Context
 
-- Current master: attach is sticky with no open-control-tab gate — **RED**.
+- Regression: attach gate must remain (`hasOpenSessionPage` / refuse without control tab).
 - Routing errors like “session page not bound (windowId missing)” are **not** the attach gate.
 
 ```go

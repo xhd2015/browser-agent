@@ -12,11 +12,13 @@ const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.7";
+    : "1.0.8";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 const FEATURES = ["browser-agent"];
 const CDP_PROTOCOL_VERSION = "1.3";
+/** Max wait for chrome.debugger.attach + Runtime.enable (and attachLock-held work). */
+const ATTACH_TIMEOUT_MS = 10000;
 
 /** @type {Map<string, {ws: WebSocket|null, tabId: number|null, windowId: number|null, controlPort: number, reconnectTimer: ReturnType<typeof setTimeout>|null, reconnectAttempt: number, connectTimeoutTimer: ReturnType<typeof setTimeout>|null, keepaliveTimer: ReturnType<typeof setInterval>|null}>} */
 const sessions = new Map();
@@ -34,16 +36,17 @@ const KEEPALIVE_MS = 15000;
  * Chrome UI note: while any tab is attached, Chrome may show a profile-wide
  * notice like "Browser Agent started debugging this browser" on other windows
  * and even blank New Tabs. That banner is not per-tab CDP attach; jobs still
- * target only sessionAttachState[sessionId].attachedTabId (one tab per session).
- * See README "Chrome debugger notice".
+ * target only tabs in sessionAttachState[sessionId].attachedTabIds (multi-tab
+ * attach set per session — policy B). See README "Chrome debugger notice".
  */
 /** @type {Map<number, true>} */
 const attachedTabs = new Map();
 /**
- * Per-session debugger attach state (serialize attach; detach on tab switch).
- * Sticky: after a job, attach stays on attachedTabId until switch / session leave.
+ * Per-session debugger attach state (serialize attach via attachLock).
+ * Policy B multi-tab set: jobs may attach multiple tabIds; peers stay attached
+ * until explicit detach or session leave (no switch-detach).
  */
-/** @type {Map<string, { attachedTabId: number|null, attachLock: Promise<void> }>} */
+/** @type {Map<string, { attachedTabIds: Set<number>, attachLock: Promise<void> }>} */
 const sessionAttachState = new Map();
 /** In-memory console log buffer for logs jobs. */
 const consoleLogBuffer = [];
@@ -94,13 +97,52 @@ function baDebugEnabled() {
 
 function baShouldLogJob(jobType, params) {
   if (baDebugEnabled()) return true;
-  if (jobType === "create_tab") return true;
+  // Always log attach-heavy jobs so cold-path latency is visible without DEBUG.
+  if (
+    jobType === "create_tab" ||
+    jobType === "eval" ||
+    jobType === "run" ||
+    jobType === "screenshot"
+  ) {
+    return true;
+  }
   if (jobType === "cdp") {
     const method =
       (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
     return method === "Page.navigate" || String(method).startsWith("Target.");
   }
   return false;
+}
+
+/** High-res phase timing helper for attach/eval dig. */
+function baNow() {
+  return typeof performance !== "undefined" && performance.now
+    ? performance.now()
+    : Date.now();
+}
+
+/**
+ * Race a promise against a timeout so attachLock cannot strand forever.
+ * onTimeout is optional cleanup (sync or async); errors from it are ignored.
+ */
+function baWithTimeout(promise, ms, label, onTimeout) {
+  let timer = null;
+  const p = Promise.resolve(promise);
+  // Prevent unhandled rejection if timeout wins and p settles later.
+  p.catch(() => {});
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const msg = (label || "operation") + " timed out after " + ms + "ms";
+      Promise.resolve(typeof onTimeout === "function" ? onTimeout() : null)
+        .catch(() => {})
+        .finally(() => {
+          reject(new Error(msg));
+        });
+    }, ms);
+  });
+  return Promise.race([p, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function baSummarizeParams(jobType, params) {
@@ -264,6 +306,129 @@ function pushStatusForConnectedSessions() {
       sendSessionStatus(sessionId, entry).catch(() => {});
     }
   }
+  // Also refresh last-known for the toolbar popup (session + debugger).
+  writeLastKnownStatus().catch(() => {});
+}
+
+/** Storage key for popup last-known progressive status. */
+const LAST_KNOWN_STATUS_KEY = "browserAgentLastKnownStatus";
+
+/**
+ * Build popup status payload: sessions connected + attach set size / armed.
+ * Used by onMessage getStatus/popupStatus and chrome.storage last-known write.
+ */
+function buildPopupStatus() {
+  let sessionsConnected = 0;
+  const sessionList = [];
+  for (const [sessionId, entry] of sessions.entries()) {
+    const wsOpen =
+      entry && entry.ws && entry.ws.readyState === WebSocket.OPEN;
+    const wsConnecting =
+      entry && entry.ws && entry.ws.readyState === WebSocket.CONNECTING;
+    if (wsOpen) sessionsConnected += 1;
+    const state = sessionAttachState.get(sessionId);
+    const attachCount =
+      state && state.attachedTabIds ? state.attachedTabIds.size : 0;
+    sessionList.push({
+      sessionId: sessionId,
+      connected: !!wsOpen,
+      connecting: !!wsConnecting,
+      attachCount: attachCount,
+      armed: attachCount > 0 || entry.tabId != null,
+      tabId: entry.tabId,
+      windowId: entry.windowId,
+    });
+  }
+  let attachCount = 0;
+  for (const state of sessionAttachState.values()) {
+    if (state && state.attachedTabIds) {
+      attachCount += state.attachedTabIds.size;
+    }
+  }
+  // Global attachedTabs map is the true CDP attach set.
+  const attachedTabCount = attachedTabs.size;
+  const totalAttached = Math.max(attachCount, attachedTabCount);
+  const armed = totalAttached > 0 || sessionsConnected > 0;
+  return {
+    ok: true,
+    type: "popupStatus",
+    sessionsConnected: sessionsConnected,
+    session_count: sessions.size,
+    sessionCount: sessions.size,
+    sessions: sessionList,
+    attachCount: totalAttached,
+    attach_count: totalAttached,
+    attachedTabCount: attachedTabCount,
+    armed: armed,
+    ws: sessionsConnected > 0 ? "connected" : sessions.size > 0 ? "waiting" : "none",
+    debugger: totalAttached > 0 ? "armed" : "idle",
+    updatedAt: Date.now(),
+  };
+}
+
+function getPopupStatus() {
+  return buildPopupStatus();
+}
+
+/**
+ * Persist last-known status for the popup (chrome.storage.session preferred).
+ */
+async function writeLastKnownStatus() {
+  const payload = buildPopupStatus();
+  try {
+    const area =
+      (chrome.storage && chrome.storage.session) ||
+      (chrome.storage && chrome.storage.local);
+    if (!area || typeof area.set !== "function") return payload;
+    await new Promise((resolve) => {
+      try {
+        area.set({ [LAST_KNOWN_STATUS_KEY]: payload }, () => resolve());
+      } catch (e) {
+        resolve();
+      }
+    });
+  } catch (e) {
+    /* storage optional in tests */
+  }
+  return payload;
+}
+
+function persistStatus() {
+  return writeLastKnownStatus();
+}
+
+/**
+ * Handle popup status queries (getStatus / popupStatus / status).
+ * Returns true if handled (caller may return true for async sendResponse).
+ *
+ * Popup open can still feel slow on cold Chrome start (intermittent SW wake).
+ * We avoid debugger attach on the popup path for that reason; residual delay is
+ * often Chrome/SW cold start, not progressive status JS. Later opens are usually quick.
+ */
+function handleGetStatus(msg, sendResponse) {
+  // Popup is opening: answer status immediately (sync), then release debugger
+  // so Chrome is not stuck in "extension is debugging" (that makes the *next*
+  // toolbar popup open take tens of seconds).
+  const payload = buildPopupStatus();
+  writeLastKnownStatus().catch(() => {});
+  if (typeof sendResponse === "function") {
+    sendResponse({ ok: true, type: "status", payload: payload, ...payload });
+  }
+  setTimeout(() => {
+    const sessionIds = Array.from(sessionAttachState.keys());
+    if (sessionIds.length === 0 && attachedTabs.size === 0) return;
+    baLog("log", "detach debugger after popup status (popup UX)", {
+      sessions: sessionIds.length,
+      attached_tabs: attachedTabs.size,
+    });
+    Promise.all(
+      sessionIds.map((id) => detachSessionDebugger(id).catch(() => {})),
+    ).then(() => {
+      const leftovers = Array.from(attachedTabs.keys());
+      return Promise.all(leftovers.map((tid) => detachDebugger(tid).catch(() => {})));
+    });
+  }, 0);
+  return true;
 }
 
 function scheduleReconnect(sessionId) {
@@ -519,8 +684,9 @@ function rebindSessionTabId(sessionId, tab) {
 }
 
 /**
- * Detach chrome.debugger held by a session (last control tab leave / unregister).
- * Serializes through attachLock so it does not race sticky attach reuse.
+ * Detach chrome.debugger for every tab in a session's attach set
+ * (last control tab leave / unregister). Serializes through attachLock so it
+ * does not race multi-tab attach reuse.
  */
 function detachSessionDebugger(sessionId) {
   let state = sessionAttachState.get(sessionId);
@@ -528,9 +694,9 @@ function detachSessionDebugger(sessionId) {
     return Promise.resolve();
   }
   const run = async () => {
-    const tabId = state.attachedTabId;
-    state.attachedTabId = null;
-    if (tabId != null) {
+    const tabIds = Array.from(state.attachedTabIds || []);
+    state.attachedTabIds.clear();
+    for (const tabId of tabIds) {
       await detachDebugger(tabId);
     }
   };
@@ -581,15 +747,60 @@ function handleRegisterMessage(msg, sender) {
   if (controlPort != null && !Number.isNaN(controlPort) && controlPort > 0) {
     entry.controlPort = controlPort;
   }
+  // WS only on register — never chrome.debugger.attach here.
+  // Attaching on /go register (and on every SW wake heal) freezes Chrome's UI and
+  // delays/blocks the toolbar default_popup for tens of seconds. Content tabs still
+  // eager-attach on create_tab / navigate (P2); jobs attach on demand.
   connectSession(sessionId, "register");
 }
 
-chrome.runtime.onMessage.addListener((msg, sender) => {
+function handleRegisterFromMessage(msg, sender, sendResponse) {
+  handleRegisterMessage(msg, sender);
+  // Ack so content-script / page burst retries can stop early after SW is live.
+  try {
+    sendResponse({ ok: true, type: "register_ack" });
+  } catch (e) {
+    /* channel closed */
+  }
+  return true;
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "register") {
-    handleRegisterMessage(msg, sender);
+    return handleRegisterFromMessage(msg, sender, sendResponse);
+  }
+  // Popup progressive status API: status / getStatus / popupStatus.
+  if (
+    msg.type === "status" ||
+    msg.type === "getStatus" ||
+    msg.type === "get_status" ||
+    msg.type === "popupStatus" ||
+    msg.type === "popup_status" ||
+    msg.type === "getPopupStatus" ||
+    msg.type === "lastKnown" ||
+    msg.type === "last_known"
+  ) {
+    // Cheap WS rediscover when operator opens the toolbar popup (Map may be empty).
+    scheduleHealSessionsFromTabs("popup-status", 0);
+    handleGetStatus(msg, sendResponse);
+    return true; // keep channel open for sendResponse
   }
 });
+
+// Session page (http://127.0.0.1:43761/go) externally_connectable register.
+// Survives cold-start when content scripts miss the first navigation.
+try {
+  chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "register") {
+      // Prefer sender.tab when the page is a real tab.
+      return handleRegisterFromMessage(msg, sender, sendResponse);
+    }
+  });
+} catch (e) {
+  /* onMessageExternal unavailable in some fixtures */
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   // Re-query remaining control tabs for every session (multi-tab safe).
@@ -630,25 +841,130 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       pushStatusForConnectedSessions();
     }
   }
+  // P2 eager arm: attach on navigation *complete* only (not loading) to avoid
+  // double attach storms that freeze Chrome UI and block the toolbar popup.
+  if (changeInfo && changeInfo.status === "complete") {
+    const tabWindowId = tab && tab.windowId;
+    const tabUrl = url || (tab && tab.url) || "";
+    if (tabWindowId != null && tabUrl) {
+      for (const [sessionId, entry] of sessions.entries()) {
+        if (entry.windowId == null || entry.windowId !== tabWindowId) continue;
+        maybeEagerAttach(sessionId, tabId, tabUrl, tabWindowId);
+      }
+    }
+  }
 });
+
+chrome.tabs.onCreated.addListener((tab) => {
+  // P2 eager arm: auto-attach newly opened capturable tabs in armed session windows.
+  if (!tab || tab.id == null || tab.windowId == null) return;
+  const tabUrl = tab.url || tab.pendingUrl || "";
+  for (const [sessionId, entry] of sessions.entries()) {
+    if (entry.windowId == null || entry.windowId !== tab.windowId) continue;
+    maybeEagerAttach(sessionId, tab.id, tabUrl, tab.windowId);
+  }
+});
+
+/**
+ * P3 self-heal: rediscover open /go?session= tabs and reconnect **WebSocket only**.
+ *
+ * NEVER call chrome.debugger.attach from heal or SW top-level. Debugger attach
+ * freezes Chrome UI and blocks toolbar default_popup (often 10–30s). Multi-tab
+ * attach stays on create_tab / navigate / jobs only.
+ */
+async function healSessionsFromTabs(reason) {
+  baLog("log", "healSessionsFromTabs start", { reason: reason || "" });
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (e) {
+    baLog("warn", "healSessionsFromTabs tabs.query failed", {
+      reason: reason || "",
+      error: String(e && e.message ? e.message : e),
+    });
+    return;
+  }
+  let found = 0;
+  for (const tab of tabs || []) {
+    if (!tab || tab.id == null) continue;
+    const url = tab.url || "";
+    const parsed = parseGoSessionFromURL(url);
+    if (!parsed) continue;
+    found += 1;
+    // Bind + WS only — no maybeEagerAttach.
+    maybeRegisterGoTab(tab.id, url, tab);
+  }
+  baLog("log", "healSessionsFromTabs done", {
+    reason: reason || "",
+    control_tabs: found,
+    attach: "skipped_for_popup_ux",
+  });
+}
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log("Browser Agent installed; control port", CONTROL_PORT);
-  for (const sessionId of sessions.keys()) {
-    connectSession(sessionId, "onInstalled");
-  }
+  // Defer WS rediscover; never run debugger work on the install critical path.
+  setTimeout(() => {
+    healSessionsFromTabs("onInstalled").catch(() => {});
+  }, 1000);
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  for (const sessionId of sessions.keys()) {
-    connectSession(sessionId, "onStartup");
-  }
+  setTimeout(() => {
+    healSessionsFromTabs("onStartup").catch(() => {});
+  }, 1000);
 });
 
+// WS-only rediscover after SW death / daemon restart.
+//
+// Do NOT call chrome.debugger.attach here (or from healSessionsFromTabs). A
+// previous boot-time attach storm made default_popup take tens of seconds.
+// healSessionsFromTabs is WS+register only — cheap tabs.query + connectSession.
+//
+// Why this is required: MV3 SW is memoryless after idle kill. Alarm used to
+// only loop sessions.keys() → no-op when the Map is empty, so open /go tabs
+// never re-bound until a full page reload. Content-script register also
+// retries; alarm heal is the SW-side safety net.
+
+/**
+ * Schedule WS-only heal. delayMS=0 runs ASAP (coalesced). Positive delays are
+ * independent timers so staggered boot heals (250ms / 1s / 3s / 8s) all fire.
+ */
+let healKickZeroTimer = null;
+function scheduleHealSessionsFromTabs(reason, delayMS) {
+  const ms = delayMS != null && delayMS >= 0 ? delayMS : 0;
+  const run = () => {
+    healSessionsFromTabs(reason || "schedule").catch(() => {});
+  };
+  if (ms === 0) {
+    if (healKickZeroTimer) return;
+    healKickZeroTimer = setTimeout(() => {
+      healKickZeroTimer = null;
+      run();
+    }, 0);
+    return;
+  }
+  setTimeout(run, ms);
+}
+
+// Deferred SW-boot rediscover: empty sessions Map after cold start; open /go
+// tabs must be rebound. Staggered delays cover Chrome cold start where the
+// /go tab exists before the SW is first evaluated (session-new race).
+// First delay stays short so toolbar popup getStatus can paint first.
+scheduleHealSessionsFromTabs("sw-boot", 250);
+scheduleHealSessionsFromTabs("sw-boot-1s", 1000);
+scheduleHealSessionsFromTabs("sw-boot-3s", 3000);
+scheduleHealSessionsFromTabs("sw-boot-8s", 8000);
+
 try {
+  // periodInMinutes min is 1 in Chrome; rely on sw-boot stagger + content retry
+  // for the session-new 30s window.
   chrome.alarms.create("browser-agent-reconnect", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm && alarm.name === "browser-agent-reconnect") {
+      // Always rediscover open /go tabs first (Map may be empty after SW kill).
+      healSessionsFromTabs("alarm").catch(() => {});
+      // Also reconnect any known sessions whose socket died (daemon restart).
       for (const [sessionId, entry] of sessions.entries()) {
         if (!isSocketLive(entry) || (entry.ws && entry.ws.readyState !== WebSocket.OPEN)) {
           connectSession(sessionId, "alarm");
@@ -996,6 +1312,11 @@ async function createTabInSession(sessionId, opts) {
     pendingUrl: tab && tab.pendingUrl,
     status: tab && tab.status,
   });
+  // P2 eager arm: attach new capturable tab in the session window immediately.
+  if (tab && tab.id != null) {
+    const createdUrl = (tab && tab.url) || url || (tab && tab.pendingUrl) || "";
+    maybeEagerAttach(sessionId, tab.id, createdUrl, entry.windowId);
+  }
   return {
     type: "create_tab",
     tab_id: tab && tab.id != null ? tab.id : null,
@@ -1100,17 +1421,17 @@ async function polyfillTargetMethod(method, params, sessionId, targetOpts) {
       try {
         tabId = resolveTabIdFromParams(params);
       } catch (e) {
-        // If no tab id, detach current session attach if any.
+        // If no tab id, detach one tab from the session attach set if any.
         const state = sessionAttachState.get(sessionId);
-        if (state && state.attachedTabId != null) {
-          tabId = state.attachedTabId;
+        if (state && state.attachedTabIds && state.attachedTabIds.size > 0) {
+          tabId = state.attachedTabIds.values().next().value;
         }
       }
       if (tabId != null) {
         await detachDebugger(tabId);
         const state = sessionAttachState.get(sessionId);
-        if (state && state.attachedTabId === tabId) {
-          state.attachedTabId = null;
+        if (state && state.attachedTabIds) {
+          state.attachedTabIds.delete(tabId);
         }
       }
       return { tab_id: tabId, polyfilled: true };
@@ -1328,67 +1649,255 @@ function detachDebugger(tabId) {
  * on unrelated tabs/windows while this attach remains live — not multi-tab CDP.
  */
 function attachDebugger(tabId) {
-  return new Promise((resolve, reject) => {
-    if (attachedTabs.has(tabId)) {
-      resolve(true);
-      return;
-    }
+  if (attachedTabs.has(tabId)) {
+    baLog("log", "attachDebugger reuse", { tab_id: tabId, already_attached: true });
+    return Promise.resolve(true);
+  }
+  const t0 = baNow();
+  let cancelled = false;
+  baLog("log", "attachDebugger start", {
+    tab_id: tabId,
+    protocol: CDP_PROTOCOL_VERSION,
+    timeout_ms: ATTACH_TIMEOUT_MS,
+  });
+  const attachPromise = new Promise((resolve, reject) => {
     chrome.debugger.attach({ tabId: tabId }, CDP_PROTOCOL_VERSION, () => {
+      if (cancelled) {
+        // Late attach after timeout: drop it so we do not leave a stuck debugger.
+        chrome.debugger.detach({ tabId: tabId }, () => {
+          attachedTabs.delete(tabId);
+        });
+        return;
+      }
+      const attachMs = Math.round(baNow() - t0);
       if (chrome.runtime.lastError) {
+        baLog("error", "attachDebugger attach fail", {
+          tab_id: tabId,
+          attach_ms: attachMs,
+          error: chrome.runtime.lastError.message,
+        });
         reject(new Error(chrome.runtime.lastError.message || "chrome.debugger.attach failed"));
         return;
       }
       attachedTabs.set(tabId, true);
+      const t1 = baNow();
       chrome.debugger.sendCommand({ tabId: tabId }, "Runtime.enable", {}, () => {
+        if (cancelled) {
+          chrome.debugger.detach({ tabId: tabId }, () => {
+            attachedTabs.delete(tabId);
+          });
+          return;
+        }
+        const enableMs = Math.round(baNow() - t1);
+        const totalMs = Math.round(baNow() - t0);
+        const enableErr =
+          chrome.runtime.lastError && chrome.runtime.lastError.message
+            ? chrome.runtime.lastError.message
+            : "";
+        baLog("log", "attachDebugger done", {
+          tab_id: tabId,
+          attach_ms: attachMs,
+          runtime_enable_ms: enableMs,
+          total_ms: totalMs,
+          runtime_enable_error: enableErr || null,
+        });
+        // Still resolve so a non-fatal Runtime.enable glitch does not strand attachLock.
         resolve(true);
       });
     });
   });
+  return baWithTimeout(attachPromise, ATTACH_TIMEOUT_MS, "chrome.debugger.attach", () => {
+    cancelled = true;
+    baLog("error", "attachDebugger timeout cleanup", {
+      tab_id: tabId,
+      timeout_ms: ATTACH_TIMEOUT_MS,
+      had_partial_attach: attachedTabs.has(tabId),
+    });
+    // Best-effort detach if attach partially succeeded but Runtime.enable hung.
+    return detachDebugger(tabId);
+  });
+}
+
+/** Tabs with eager/job attach already in-flight (dedupe stampede). */
+const eagerAttachInFlight = new Set();
+/** Idle detach: holding chrome.debugger makes toolbar popup extremely slow. */
+const DEBUGGER_IDLE_DETACH_MS = 3000;
+/** @type {ReturnType<typeof setTimeout>|null} */
+let debuggerIdleDetachTimer = null;
+
+function scheduleDebuggerIdleDetach() {
+  if (debuggerIdleDetachTimer) {
+    clearTimeout(debuggerIdleDetachTimer);
+  }
+  debuggerIdleDetachTimer = setTimeout(() => {
+    debuggerIdleDetachTimer = null;
+    // Detach all session debuggers so toolbar default_popup is instant again.
+    // WS sessions stay; next job/create_tab re-attaches.
+    const sessionIds = Array.from(sessionAttachState.keys());
+    if (sessionIds.length === 0 && attachedTabs.size === 0) return;
+    baLog("log", "idle detach debugger (popup UX)", {
+      sessions: sessionIds.length,
+      attached_tabs: attachedTabs.size,
+    });
+    Promise.all(
+      sessionIds.map((id) => detachSessionDebugger(id).catch(() => {})),
+    ).then(() => {
+      // Safety: clear any orphans not tracked in session state.
+      const leftovers = Array.from(attachedTabs.keys());
+      return Promise.all(leftovers.map((tid) => detachDebugger(tid).catch(() => {})));
+    });
+  }, DEBUGGER_IDLE_DETACH_MS);
+}
+
+function touchDebuggerActivity() {
+  scheduleDebuggerIdleDetach();
+}
+
+/**
+ * P2 eager arm helper: auto-attach a capturable **content** tab in an armed window.
+ * Never attaches the /go session control page (attach there freezes popup UX).
+ * Skips non-capturable URLs and other windows. Dedupe in-flight/already attached.
+ */
+function maybeEagerAttach(sessionId, tabId, url, windowId) {
+  if (!sessionId || tabId == null) return Promise.resolve();
+  // Never debugger-attach the session control page.
+  if (typeof url === "string" && url.length > 0 && isSessionGoPageURL(url, sessionId)) {
+    return Promise.resolve();
+  }
+  // Skip non-capturable when URL is known (chrome://, chrome-extension://, etc.).
+  if (typeof url === "string" && url.length > 0 && !isCapturableTabURL(url)) {
+    return Promise.resolve();
+  }
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.windowId == null) return Promise.resolve();
+  // Scope to session window — never auto-attach tabs in other windows.
+  if (windowId != null && entry.windowId !== windowId) {
+    return Promise.resolve();
+  }
+  // Already a live CDP debuggee — nothing to do.
+  if (attachedTabs.has(tabId)) {
+    const state = sessionAttachState.get(sessionId);
+    if (state && state.attachedTabIds) state.attachedTabIds.add(tabId);
+    touchDebuggerActivity();
+    return Promise.resolve();
+  }
+  if (eagerAttachInFlight.has(tabId)) {
+    return Promise.resolve();
+  }
+  eagerAttachInFlight.add(tabId);
+  touchDebuggerActivity();
+  return attachDebuggerForSession(sessionId, tabId)
+    .catch(() => {})
+    .finally(() => {
+      eagerAttachInFlight.delete(tabId);
+      touchDebuggerActivity();
+    });
 }
 
 /**
  * Session-scoped attach: gate on open /go?session= in the target tab's window,
- * then sticky-attach one tab (detach previous on tab switch).
+ * then add tabId to the multi-tab attach set (policy B — keep peer attaches).
  * Chrome's "debugging this browser" banner can still appear outside that window;
- * only this tabId receives sendCommand / eval / screenshot.
+ * only tabs in the session attach set receive sendCommand / eval / screenshot.
  */
 async function attachDebuggerForSession(sessionId, tabId) {
   let state = sessionAttachState.get(sessionId);
   if (!state) {
-    state = { attachedTabId: null, attachLock: Promise.resolve() };
+    state = { attachedTabIds: new Set(), attachLock: Promise.resolve() };
     sessionAttachState.set(sessionId, state);
   }
+  if (!state.attachedTabIds) {
+    state.attachedTabIds = new Set();
+  }
+  const queuedAt = baNow();
+  baLog("log", "attachDebuggerForSession enqueue", {
+    session_id: sessionId,
+    tab_id: tabId,
+    attach_set_size: state.attachedTabIds.size,
+    will_wait_lock: true,
+    timeout_ms: ATTACH_TIMEOUT_MS,
+  });
   const run = async () => {
-    // Attach gate: require ≥1 open /go?session=<id> control tab in the same window.
-    let windowId = null;
-    try {
-      const t = await chrome.tabs.get(tabId);
-      if (t && t.windowId != null) windowId = t.windowId;
-    } catch (e) {
-      /* tab may be gone */
-    }
-    if (windowId == null) {
-      const entry = sessions.get(sessionId);
-      if (entry && entry.windowId != null) windowId = entry.windowId;
-    }
-    if (windowId == null || !(await hasOpenSessionPage(sessionId, windowId))) {
-      // Drop sticky leftover attach so jobs cannot reuse a orphaned debugger.
-      if (state.attachedTabId != null) {
-        await detachDebugger(state.attachedTabId);
-        state.attachedTabId = null;
+    const lockWaitMs = Math.round(baNow() - queuedAt);
+    // Cap lock-hold work so a stuck attach cannot block the session forever.
+    const work = async () => {
+      // Attach gate: require ≥1 open /go?session=<id> control tab in the same window.
+      let windowId = null;
+      let tabUrl = "";
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t && t.windowId != null) windowId = t.windowId;
+        tabUrl = (t && t.url) || "";
+      } catch (e) {
+        /* tab may be gone */
       }
-      throw new Error(
-        "no open session page for attach; session control tab required in the same window",
-      );
-    }
+      if (windowId == null) {
+        const entry = sessions.get(sessionId);
+        if (entry && entry.windowId != null) windowId = entry.windowId;
+      }
+      if (windowId == null || !(await hasOpenSessionPage(sessionId, windowId))) {
+        // Drop all leftover attaches so jobs cannot reuse orphaned debuggers.
+        const leftover = Array.from(state.attachedTabIds);
+        state.attachedTabIds.clear();
+        for (const id of leftover) {
+          await detachDebugger(id);
+        }
+        baLog("error", "attachDebuggerForSession gate fail", {
+          session_id: sessionId,
+          tab_id: tabId,
+          lock_wait_ms: lockWaitMs,
+          window_id: windowId,
+        });
+        throw new Error(
+          "no open session page for attach; session control tab required in the same window",
+        );
+      }
 
-    if (state.attachedTabId != null && state.attachedTabId !== tabId) {
-      await detachDebugger(state.attachedTabId);
-      state.attachedTabId = null;
+      // Policy B: keep peer tabs attached; only attach/add the requested tabId.
+      // Same tab already attached → attachDebugger reuses via attachedTabs.has.
+      const tAttach = baNow();
+      await attachDebugger(tabId);
+      state.attachedTabIds.add(tabId);
+      baLog("log", "attachDebuggerForSession done", {
+        session_id: sessionId,
+        tab_id: tabId,
+        tab_url: String(tabUrl).slice(0, 120),
+        lock_wait_ms: lockWaitMs,
+        attach_call_ms: Math.round(baNow() - tAttach),
+        attach_set_size: state.attachedTabIds.size,
+        total_ms: Math.round(baNow() - queuedAt),
+      });
+    };
+
+    try {
+      await baWithTimeout(work(), ATTACH_TIMEOUT_MS + 2000, "attachDebuggerForSession", async () => {
+        baLog("error", "attachDebuggerForSession work timeout cleanup", {
+          session_id: sessionId,
+          tab_id: tabId,
+          attach_set_size: state.attachedTabIds ? state.attachedTabIds.size : 0,
+        });
+        // Only drop the tab that timed out; keep peer attaches (policy B).
+        if (state.attachedTabIds) {
+          state.attachedTabIds.delete(tabId);
+        }
+        if (attachedTabs.has(tabId)) {
+          await detachDebugger(tabId);
+        }
+      });
+    } catch (e) {
+      if (state.attachedTabIds && state.attachedTabIds.has(tabId) && !attachedTabs.has(tabId)) {
+        state.attachedTabIds.delete(tabId);
+      }
+      baLog("error", "attachDebuggerForSession fail", {
+        session_id: sessionId,
+        tab_id: tabId,
+        lock_wait_ms: lockWaitMs,
+        error: e && e.message ? e.message : String(e),
+      });
+      throw e;
     }
-    await attachDebugger(tabId);
-    state.attachedTabId = tabId;
   };
+  // Chain must always settle so the next waiter is not stranded.
   state.attachLock = state.attachLock.then(run, run);
   return state.attachLock;
 }
@@ -1407,6 +1916,7 @@ function sendDebuggerCommand(tabId, method, params) {
 
 async function withDebuggerForSession(sessionId, fn, opts) {
   const tabId = await pickTargetTabIdForSession(sessionId, opts || {});
+  touchDebuggerActivity();
   if (baDebugEnabled() || (opts && (opts.tabId != null || opts.tab_id != null))) {
     let tabUrl = "";
     try {
@@ -1426,7 +1936,12 @@ async function withDebuggerForSession(sessionId, fn, opts) {
     });
   }
   await attachDebuggerForSession(sessionId, tabId);
-  return await fn(tabId);
+  touchDebuggerActivity();
+  try {
+    return await fn(tabId);
+  } finally {
+    touchDebuggerActivity();
+  }
 }
 
 try {
@@ -1459,6 +1974,11 @@ try {
   chrome.debugger.onDetach.addListener((source) => {
     if (source && source.tabId != null) {
       attachedTabs.delete(source.tabId);
+      for (const state of sessionAttachState.values()) {
+        if (state && state.attachedTabIds) {
+          state.attachedTabIds.delete(source.tabId);
+        }
+      }
     }
   });
 } catch (e) {

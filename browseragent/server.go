@@ -708,9 +708,84 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
 	if isFirefox {
 		bootBrowser = "firefox"
 	}
-	bootJSON := FormatSessionBootJSONWithBrowser(sessionID, bootBrowser)
+	extID := ChromeUnpackedExtensionID(snap.ExtensionInstallPath)
+	bootJSON := FormatSessionBootJSONWithBrowserAndExtID(sessionID, bootBrowser, extID)
 	// Escape </script> in JSON if session id ever contained that sequence.
 	bootJSONSafe := strings.ReplaceAll(bootJSON, "</", "<\\/")
+
+	// Session-page attach loop: this document retries register until the daemon
+	// reports extension.connected (or the tab is closed). Do not re-open tabs
+	// from the CLI — retries live here + content script + SW.
+	extRegisterScript := ""
+	if bootBrowser == "chrome" {
+		extRegisterScript = fmt.Sprintf(`
+<script>
+(function () {
+  var EXT_ID = %q;
+  var SESSION_ID = %q;
+  var PORT = 43761;
+  var connected = false;
+  var burstTimer = null;
+  var slowTimer = null;
+
+  function sendRegister() {
+    if (connected) return;
+    try {
+      if (!chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") return;
+      if (!EXT_ID) return;
+      chrome.runtime.sendMessage(EXT_ID, {
+        type: "register",
+        session_id: SESSION_ID,
+        control_port: PORT
+      }, function () {
+        void (chrome.runtime && chrome.runtime.lastError);
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  function pollConnected() {
+    try {
+      fetch("/v1/session?session=" + encodeURIComponent(SESSION_ID), { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (!data) return;
+          var ext = data.extension || {};
+          if (ext.connected || data.phase === "extension_connected") {
+            connected = true;
+            if (burstTimer) { clearInterval(burstTimer); burstTimer = null; }
+            if (slowTimer) { clearInterval(slowTimer); slowTimer = null; }
+          }
+        })
+        .catch(function () { /* daemon down; keep retrying register */ });
+    } catch (e) { /* ignore */ }
+  }
+
+  function kick() {
+    if (connected) return;
+    sendRegister();
+    pollConnected();
+  }
+
+  kick();
+  var n = 0;
+  burstTimer = setInterval(function () {
+    if (connected) { clearInterval(burstTimer); burstTimer = null; return; }
+    n++;
+    kick();
+    if (n >= 40) { clearInterval(burstTimer); burstTimer = null; }
+  }, 500);
+  // Slow heartbeat while the page stays open (daemon/SW restart).
+  slowTimer = setInterval(kick, 10000);
+  try { window.addEventListener("pageshow", kick); } catch (e) {}
+  try {
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) kick();
+    });
+  } catch (e) {}
+})();
+</script>
+`, extID, sessionID)
+	}
 
 	bootBlock := fmt.Sprintf(`<script type="application/json" id="browser-agent-boot">%s</script>
 <script>
@@ -719,10 +794,12 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
     controlPort: 43761,
     defaultAddr: "127.0.0.1:43761",
     sessionId: %q,
-    browser: %q
+    browser: %q,
+    extensionId: %q
   };
 </script>
-`, bootJSONSafe, sessionID, bootBrowser)
+%s
+`, bootJSONSafe, sessionID, bootBrowser, extID, extRegisterScript)
 
 	out := htmlBody
 	// Page title: {sessionId} - Browser Agent (rewrite existing <title> or insert).

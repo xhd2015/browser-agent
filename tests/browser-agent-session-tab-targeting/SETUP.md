@@ -91,13 +91,19 @@ func hasTabIndexOrderResolution(text string) bool {
 	return hasIndex && (hasCapturable || hasWindowTabs) && hasOneBased
 }
 
-func hasAttachReuseAndDetach(text string) bool {
+// hasAttachReuseAndSerialize — same-tab reuse + per-session attach lock.
+// Policy B: does NOT require switch-detach of peer tabs (multi-attach set owned by
+// browser-agent-session-attach-gate/ext-source/multi-attach-keep-peers).
+func hasAttachReuseAndSerialize(text string) bool {
 	low := strings.ToLower(text)
-	hasReuse := strings.Contains(low, "attachedtabs.has") || strings.Contains(low, "already attached")
-	hasDetach := strings.Contains(low, "debugger.detach") || strings.Contains(low, "chrome.debugger.detach")
-	hasSwitch := strings.Contains(low, "tab_id") && (strings.Contains(low, "switch") || strings.Contains(low, "different"))
-	hasSerialize := strings.Contains(low, "attachlock") || strings.Contains(low, "attachmutex") ||
-		strings.Contains(low, "attachqueue") || strings.Contains(low, "serializ")
-	return hasReuse && hasDetach && (hasSwitch || hasSerialize)
+	hasReuse := strings.Contains(low, "attachedtabs.has") ||
+		strings.Contains(low, "already attached") ||
+		(strings.Contains(low, "attachedtabids") && strings.Contains(low, ".has(")) ||
+		(strings.Contains(low, "attachedtabid") && strings.Contains(low, "=== tabid"))
+	hasSerialize := strings.Contains(low, "attachlock") ||
+		strings.Contains(low, "attachmutex") ||
+		strings.Contains(low, "attachqueue") ||
+		strings.Contains(low, "serializ")
+	return hasReuse && hasSerialize
 }
 ```

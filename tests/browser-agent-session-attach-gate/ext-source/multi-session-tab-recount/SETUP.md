@@ -20,9 +20,8 @@ Last control tab leaves
 
 ## Context
 
-- Current master: `tabs.onRemoved` / navigate-away only match `entry.tabId` (last
-  register wins) — closing the registered tab disarms even if another control tab
-  remains. Telemetry `collectSessionPageTelemetry` is **not** leave recount.
+- Regression: leave path must re-query remaining `/go?session=` tabs (not only
+  `entry.tabId`). Telemetry `collectSessionPageTelemetry` is **not** leave recount.
 
 ```go
 import (

@@ -66,6 +66,15 @@ use browser-agent with session-id: sess-xxx to check what's new on my github tre
 
 3. Keep the session page open so the extension can connect.
 
+### Toolbar popup (optional)
+
+The extension toolbar popup is only for status. CLI jobs do not require it.
+
+**Note:** After Chrome has just started, the **first** open of the Browser Agent
+popup can sometimes be slow (MV3 service worker cold start). This is intermittent;
+later opens are usually quick. Prefer `browser-agent session info` for connection
+status if the popup is slow.
+
 ## Firefox
 
 1. Install the extension (on a terminal this also opens the signed `.xpi` in

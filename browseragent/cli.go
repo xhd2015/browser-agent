@@ -111,6 +111,8 @@ session delete / eval / run / logs / screenshot / cdp / create-tab flags:
   --server-port <port>       Control server port (default: from server.json or 43761)
   --tab-id <id>              Chrome tab id for job target (strongly recommended for agents)
   --tab-index <n>            1-based index of capturable tab in session window (unstable; prefer --tab-id)
+  --timeout <ms|duration>    Job wait timeout (e.g. 60000, 60s, 1m). Defaults: eval 60s,
+                             run/cdp 60s, logs/create-tab 30s, screenshot 30s
 
 screenshot flags:
   -o, --output <file.png>    Write decoded PNG (from result base64) to path
@@ -705,7 +707,7 @@ func cliEval(args []string, env map[string]string, stdout, stderr io.Writer) err
 	return postJobAndPrint(args, sessionID, JobTypeEval, map[string]any{
 		"expression": expr,
 		"expr":       expr,
-	}, 15000, stdout, stderr, nil)
+	}, jobTimeoutMS(args, 60000), stdout, stderr, nil)
 }
 
 func cliRun(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -740,7 +742,7 @@ func cliRun(args []string, env map[string]string, stdout, stderr io.Writer) erro
 		"source":     source,
 		"expression": source,
 		"path":       path,
-	}, 30000, stdout, stderr, nil)
+	}, jobTimeoutMS(args, 60000), stdout, stderr, nil)
 }
 
 func cliLogs(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -763,7 +765,7 @@ func cliLogs(args []string, env map[string]string, stdout, stderr io.Writer) err
 	if level := flagString(args, "--level"); level != "" {
 		params["level"] = level
 	}
-	return postJobAndPrint(args, sessionID, JobTypeLogs, params, 15000, stdout, stderr, nil)
+	return postJobAndPrint(args, sessionID, JobTypeLogs, params, jobTimeoutMS(args, 30000), stdout, stderr, nil)
 }
 
 func cliScreenshot(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -783,7 +785,7 @@ func cliScreenshot(args []string, env map[string]string, stdout, stderr io.Write
 	if outPath == "" {
 		outPath = flagString(args, "--output")
 	}
-	return postJobAndPrint(args, sessionID, JobTypeScreenshot, params, 20000, stdout, stderr, func(result map[string]any) error {
+	return postJobAndPrint(args, sessionID, JobTypeScreenshot, params, jobTimeoutMS(args, 30000), stdout, stderr, func(result map[string]any) error {
 		if outPath == "" {
 			return nil
 		}
@@ -834,7 +836,7 @@ func cliCDP(args []string, env map[string]string, stdout, stderr io.Writer) erro
 		}
 		params["params"] = nested
 	}
-	return postJobAndPrint(args, sessionID, JobTypeCDP, params, 30000, stdout, stderr, nil)
+	return postJobAndPrint(args, sessionID, JobTypeCDP, params, jobTimeoutMS(args, 60000), stdout, stderr, nil)
 }
 
 func cliCreateTab(args []string, env map[string]string, stdout, stderr io.Writer) error {
@@ -855,7 +857,7 @@ func cliCreateTab(args []string, env map[string]string, stdout, stderr io.Writer
 		params["url"] = strings.TrimSpace(url)
 	}
 	// Extension defaults active:true when unspecified.
-	return postJobAndPrint(args, sessionID, JobTypeCreateTab, params, 15000, stdout, stderr, nil)
+	return postJobAndPrint(args, sessionID, JobTypeCreateTab, params, jobTimeoutMS(args, 30000), stdout, stderr, nil)
 }
 
 // resolveCLITabTarget parses --tab-id / --tab-index (mutually exclusive).
@@ -1074,6 +1076,28 @@ func normalizeAddr(addr string) string {
 	return "http://" + addr
 }
 
+// jobTimeoutMS returns --timeout when set, otherwise defaultMS.
+// Accepts integer milliseconds ("60000") or Go-style durations ("60s", "1m", "500ms").
+func jobTimeoutMS(args []string, defaultMS int64) int64 {
+	raw := strings.TrimSpace(flagString(args, "--timeout"))
+	if raw == "" {
+		return defaultMS
+	}
+	// Pure integer → milliseconds.
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if n <= 0 {
+			return defaultMS
+		}
+		return n
+	}
+	// Duration string (must include unit for time.ParseDuration).
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultMS
+	}
+	return d.Milliseconds()
+}
+
 func flagString(args []string, name string) string {
 	v, _ := flagStringSet(args, name)
 	return v
@@ -1131,7 +1155,7 @@ func takePositional(args []string, n int) string {
 			a == "--base-dir" || a == "--root" ||
 			a == "--tab-id" || a == "--tab-index" ||
 			a == "--limit" || a == "--level" || a == "--output" || a == "-o" ||
-			a == "--url" {
+			a == "--url" || a == "--timeout" {
 			skipNext = true
 			continue
 		}

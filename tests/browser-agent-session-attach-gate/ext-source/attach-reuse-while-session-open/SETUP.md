@@ -1,10 +1,10 @@
 # Scenario
 
-**Feature**: sticky attach reuse while session open + detach on tab switch (regression)
+**Feature**: same-tab attach reuse + per-session attach serialization (policy B)
 
 ```
-Same tab_id between jobs while control tab open -> reuse attach
-Different tab_id -> detach previous; serialize attach per session
+Same tab_id between jobs while control tab open -> reuse attach (no double attach)
+Concurrent attach work for one session -> serialize via attachLock
 ```
 
 ## Preconditions
@@ -17,9 +17,11 @@ Different tab_id -> detach previous; serialize attach per session
 
 ## Context
 
-- Regression-friendly: policy keeps sticky attach **while** session control tab is open.
-- Overlaps `browser-agent-session-tab-targeting/ext-source/attach-reuse-same-tab`;
-  included so attach-gate work does not regress reuse/switch.
+- Policy B: reuse + lock only. **Does not** require (or allow as success criterion)
+  switch-detach of peer tabs — multi-attach keep peers is
+  `ext-source/multi-attach-keep-peers`.
+- Overlaps `browser-agent-session-tab-targeting/ext-source/attach-reuse-same-tab`
+  (also revised away from switch-detach).
 
 ```go
 import (

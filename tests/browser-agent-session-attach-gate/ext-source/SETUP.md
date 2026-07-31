@@ -1,11 +1,12 @@
 # Scenario
 
-**Feature**: Extension background.js session attach-gate contract
+**Feature**: Extension background.js session attach-gate + multi-tab attach (policy B)
 
 ```
 # no Chrome
 Test Client -> read Chrome-Ext-Browser-Agent/public/background.js
-Test Client -> assert detach-on-leave, attach gate, multi-tab recount, reuse-while-open
+Test Client -> assert multi-attach keep peers, same-tab reuse+lock,
+               detach-all on leave, attach gate, multi-tab recount
 ```
 
 ## Preconditions
@@ -21,8 +22,9 @@ Test Client -> assert detach-on-leave, attach gate, multi-tab recount, reuse-whi
 
 ## Context
 
-- Complements tab-targeting attach reuse with **session-page lifecycle** attach policy.
-- Classic TDD: three policy leaves RED until implement; reuse leaf is regression-friendly.
+- Complements tab-targeting with **session-page lifecycle** + **multi-tab attach set**.
+- Classic TDD: multi-attach keep peers + detach-all **RED** under sticky switch-detach;
+  gate / recount / same-tab reuse+lock may already be GREEN.
 
 ```go
 import (

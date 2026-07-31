@@ -31,6 +31,7 @@ func BuildExtensionShell(root string) (buildDir string, err error) {
 // BuildFirefoxExtensionShell copies Firefox-Ext-Browser-Agent/public → build/.
 // No npm required when public/ exists (shell is static MV3 files).
 // Returns absolute path to build/ on success.
+// Prefer PrepareFirefoxExtensionBuild when you also need bundle-sum + version.
 func BuildFirefoxExtensionShell(root string) (buildDir string, err error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -45,6 +46,30 @@ func BuildFirefoxExtensionShell(root string) (buildDir string, err error) {
 		return "", fmt.Errorf("stage firefox extension public→build: %w", err)
 	}
 	return filepath.Abs(buildDir)
+}
+
+// PrepareFirefoxExtensionBuild builds the Firefox MV3 shell (public→build) and
+// writes bundle-sum.js. Shared by StageFirefoxExtensionEmbed (//go:embed tree)
+// and script/browser-agent/firefox/bundle (dist/ unsigned package).
+//
+// Returns absolute buildDir and product version (VERSION.txt / ClientVersion).
+func PrepareFirefoxExtensionBuild(root string) (buildDir, version string, err error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", "", err
+	}
+	version = strings.TrimSpace(ReadProductVersion(absRoot))
+	if version == "" {
+		version = strings.TrimSpace(ClientVersion())
+	}
+	buildDir, err = BuildFirefoxExtensionShell(absRoot)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := EnsureExtensionBundleSum(buildDir, version); err != nil {
+		return "", "", fmt.Errorf("EnsureExtensionBundleSum: %w", err)
+	}
+	return buildDir, version, nil
 }
 
 // BuildSessionPage runs package manager install (if needed) and vite build under react/.

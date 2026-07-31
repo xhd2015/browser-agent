@@ -1,5 +1,5 @@
-// Sign builds a Firefox extension package and submits it to AMO for signing
-// (unlisted channel), or reuses an already-signed version from AMO.
+// Sign submits the Firefox extension to AMO (unlisted channel), or reuses an
+// already-signed version from AMO. Full sign builds via firefox/bundle first.
 //
 // Usage (from module root or worktree):
 //
@@ -19,9 +19,11 @@
 //  3. {git-common-dir parent}/.firefox-secretes.txt  (main repo when in a worktree)
 //
 // Outputs:
-//  - dist/firefox-package/   staged unsigned sources (full sign only)
-//  - dist/signed/            AMO-signed .xpi (from web-ext or download)
-//  - browseragent/embedded/firefox-xpi/browser-agent.xpi  //go:embed payload
+//   - dist/firefox-package/   staged unsigned sources (via firefox/bundle on full sign)
+//   - dist/signed/            AMO-signed .xpi (from web-ext or download)
+//   - browseragent/embedded/firefox-xpi/browser-agent.xpi  //go:embed payload
+//
+// Full sign reuses: go run ./script/browser-agent/firefox/bundle
 package main
 
 import (
@@ -207,43 +209,18 @@ func reuseSignedFromAMO(root, wantVer string, st *AMOVersionStatus, issuer, secr
 }
 
 func fullSign(root, wantVer, issuer, secret string, c clicolor.Style) error {
-	// 2) Generate version stamps
-	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("generate (sync VERSION.txt)"))
-	if err := runCmd(root, "go", "run", "./script/generate"); err != nil {
-		return fmt.Errorf("generate: %w", err)
+	// 2–4) Unsigned package (generate + shell + dist/firefox-package + unsigned xpi)
+	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("firefox/bundle (unsigned package)"))
+	if err := runCmd(root, "go", "run", "./script/browser-agent/firefox/bundle"); err != nil {
+		return fmt.Errorf("firefox/bundle: %w", err)
 	}
-	// Prefer disk VERSION after generate
+	// Prefer disk VERSION after bundle/generate
 	if v := browseragent.ReadProductVersion(root); v != "" {
 		wantVer = v
 	}
-
-	// 3) Build extension public → build + bundle-sum
-	fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("build Firefox extension shell + bundle-sum"))
-	buildDir, err := browseragent.BuildFirefoxExtensionShell(root)
-	if err != nil {
-		return fmt.Errorf("BuildFirefoxExtensionShell: %w", err)
-	}
-	if _, err := browseragent.EnsureExtensionBundleSum(buildDir, wantVer); err != nil {
-		return fmt.Errorf("EnsureExtensionBundleSum: %w", err)
-	}
-	fmt.Printf("Staged package: %s (version %s)\n", buildDir, wantVer)
-
-	// 4) Copy clean package into dist/firefox-package
 	stageDir := filepath.Join(root, "dist", "firefox-package")
-	if err := os.RemoveAll(stageDir); err != nil {
-		return err
-	}
-	if err := copyDir(buildDir, stageDir); err != nil {
-		return fmt.Errorf("stage package: %w", err)
-	}
-	fmt.Printf("Unsigned sources: %s\n", stageDir)
-
-	// Also write a local unsigned .xpi for convenience
-	unsignedXPI := filepath.Join(root, "dist", fmt.Sprintf("browser-agent-firefox-%s.xpi", wantVer))
-	if err := zipDir(stageDir, unsignedXPI); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write unsigned xpi: %v\n", err)
-	} else {
-		fmt.Printf("Unsigned xpi: %s\n", unsignedXPI)
+	if st, err := os.Stat(stageDir); err != nil || !st.IsDir() {
+		return fmt.Errorf("firefox/bundle did not produce %s", stageDir)
 	}
 
 	// 5) web-ext sign → dist/signed
@@ -332,11 +309,11 @@ signed version from AMO for the current VERSION.txt.
 Default (smart):
   1. Query AMO for browser-agent@xhd2015 + VERSION.txt
   2. If already signed → download to dist/signed/ + stage embed (skip build)
-  3. Else generate, build, web-ext sign, stage
+  3. Else: go run ./script/browser-agent/firefox/bundle, then web-ext sign, stage
 
 Options:
   --status     Query AMO only (no build/sign/stage); exit non-zero if not signed
-  --force      Always build + web-ext sign (do not reuse AMO download)
+  --force      Always bundle + web-ext sign (do not reuse AMO download)
 ` + clicolor.FlagHelp + `  -h, --help   Show this help
 
 Secrets file: .firefox-secretes.txt  (note spelling)
@@ -350,9 +327,12 @@ Search order:
   2. {module}/.firefox-secretes.txt
   3. {main-repo}/.firefox-secretes.txt (when running from a git worktree)
 
-Also writes (full sign path):
+Unsigned package only (no AMO):
+  go run ./script/browser-agent/firefox/bundle
+
+Also writes (full sign path, after bundle):
   dist/firefox-package/                         unsigned sources used for signing
-  dist/browser-agent-firefox-*.xpi              local unsigned zip (convenience)
+  dist/browser-agent-firefox-*.xpi              local unsigned zip (from bundle)
   dist/signed/browser-agent-*-signed.xpi        AMO-signed package
   browseragent/embedded/firefox-xpi/browser-agent.xpi  //go:embed payload
 
@@ -524,50 +504,4 @@ func findModuleRoot() (string, error) {
 		}
 		dir = parent
 	}
-}
-
-func copyDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return os.MkdirAll(dst, 0o755)
-		}
-		// skip junk
-		base := filepath.Base(path)
-		if base == ".DS_Store" || strings.HasSuffix(base, "~") {
-			return nil
-		}
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		return os.WriteFile(target, data, 0o644)
-	})
-}
-
-func zipDir(srcDir, zipPath string) error {
-	// Use system zip for simplicity (same as manual packaging).
-	absZip, err := filepath.Abs(zipPath)
-	if err != nil {
-		return err
-	}
-	_ = os.Remove(absZip)
-	cmd := exec.Command("zip", "-r", "-FS", absZip, ".")
-	cmd.Dir = srcDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }

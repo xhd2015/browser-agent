@@ -260,11 +260,12 @@ func stageRealOrFixture(absRoot string, opts BundleOptions, extDest, sessDest st
 //
 // Preference order:
 //  1. When UseFixture: fixtures/extension-firefox (or FixtureFirefoxExtensionDir)
-//  2. Real sources: BuildFirefoxExtensionShell(root) → stage build/
+//  2. Real sources: PrepareFirefoxExtensionBuild(root) → stage build/
 //  3. Existing Firefox-Ext-Browser-Agent/build with manifest.json
 //  4. Fixture fallback under Root (even when UseFixture=false)
 //
 // Returns the absolute embed directory. Writes manifest.json on success.
+// Does not write dist/firefox-package (see BundleFirefoxUnsignedPackage / firefox/bundle).
 func StageFirefoxExtensionEmbed(opts FirefoxEmbedOptions) (embedDir string, err error) {
 	root := strings.TrimSpace(opts.Root)
 	if root == "" {
@@ -318,8 +319,8 @@ func resolveFirefoxExtensionStageSource(absRoot string, opts FirefoxEmbedOptions
 		// Fall through: try real sources when fixture missing.
 	}
 
-	// Real sources: public → build, then stage build/.
-	if built, berr := BuildFirefoxExtensionShell(absRoot); berr == nil {
+	// Real sources: public → build + bundle-sum (shared with firefox/bundle).
+	if built, _, berr := PrepareFirefoxExtensionBuild(absRoot); berr == nil {
 		return built, false, nil
 	}
 	buildDir := filepath.Join(absRoot, "Firefox-Ext-Browser-Agent", "build")

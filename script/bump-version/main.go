@@ -1,11 +1,11 @@
-// Bump root VERSION.txt, then run generate + browser-agent bundle.
+// Bump root VERSION.txt, then run generate + browser-agent bundle + firefox/bundle.
 //
 //	go run ./script/bump-version              # patch +1
 //	go run ./script/bump-version --minor
 //	go run ./script/bump-version --major
 //	go run ./script/bump-version --dry-run
 //
-// Does not sign Firefox, go install, or create git commits/tags.
+// Does not sign Firefox (AMO), go install, or create git commits/tags.
 package main
 
 import (
@@ -108,16 +108,20 @@ func run(args []string, c clicolor.Style) error {
 		if err := runCmd(root, "go", "run", "./script/browser-agent/bundle"); err != nil {
 			return fmt.Errorf("bundle: %w", err)
 		}
+		fmt.Printf("%s %s\n", c.Gray("==>"), c.Gray("firefox/bundle (unsigned package)"))
+		if err := runCmd(root, "go", "run", "./script/browser-agent/firefox/bundle"); err != nil {
+			return fmt.Errorf("firefox/bundle: %w", err)
+		}
 	}
 
 	fmt.Printf("%s VERSION.txt is %s", c.Green("ok:"), c.Green(newVer))
 	if skipBundle {
 		fmt.Printf(" %s\n", c.Gray("(generate done; bundle skipped)"))
 	} else {
-		fmt.Printf(" %s\n", c.Gray("(generate + bundle done)"))
+		fmt.Printf(" %s\n", c.Gray("(generate + chrome bundle + firefox/bundle done)"))
 	}
 	fmt.Println(c.Gray("Next:"))
-	fmt.Println(c.Gray("  go run ./script/browser-agent/firefox/sign   # if you need AMO-signed xpi"))
+	fmt.Println(c.Gray("  go run ./script/browser-agent/firefox/sign    # AMO-signed xpi (reuses firefox/bundle)"))
 	fmt.Println(c.Gray("  go run ./script/browser-agent/install --skip-firefox-sign"))
 	return nil
 }
@@ -125,16 +129,16 @@ func run(args []string, c clicolor.Style) error {
 func helpText() string {
 	return `Usage: go run ./script/bump-version [options]
 
-Bump root VERSION.txt, then run generate and browser-agent bundle.
+Bump root VERSION.txt, then run generate, browser-agent bundle, and firefox/bundle.
 
-Default bumps patch (1.0.6 → 1.0.7). Does not sign Firefox, go install, or git commit.
+Default bumps patch (1.0.6 → 1.0.7). Does not AMO-sign Firefox, go install, or git commit.
 
 Options:
   (default)               bump patch
   --minor                 bump minor, reset patch (1.0.6 → 1.1.0)
   --major                 bump major, reset minor/patch (1.0.6 → 2.0.0)
   --dry-run               print new version only (no writes)
-  --skip-bundle           bump + generate only (no vite/embed)
+  --skip-bundle           bump + generate only (no chrome/firefox package steps)
 ` + clicolor.FlagHelp + `  -h, --help              Show this help
 `
 }

@@ -12,7 +12,7 @@ const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.8";
+    : "1.0.9";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 const FEATURES = ["browser-agent"];
@@ -1720,8 +1720,12 @@ function attachDebugger(tabId) {
 
 /** Tabs with eager/job attach already in-flight (dedupe stampede). */
 const eagerAttachInFlight = new Set();
-/** Idle detach: holding chrome.debugger makes toolbar popup extremely slow. */
-const DEBUGGER_IDLE_DETACH_MS = 3000;
+/**
+ * Idle detach: holding chrome.debugger slows the toolbar default_popup.
+ * Keep content-tab attach warm for multi-step agent SPA work; only detach after
+ * 5 minutes without debugger activity (was 3s — thrash / mid-job detach).
+ */
+const DEBUGGER_IDLE_DETACH_MS = 5 * 60 * 1000;
 /** @type {ReturnType<typeof setTimeout>|null} */
 let debuggerIdleDetachTimer = null;
 

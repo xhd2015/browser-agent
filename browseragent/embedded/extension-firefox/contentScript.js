@@ -13,7 +13,7 @@
       product: "browser-agent",
       browser: "firefox",
       controlPort: 43761,
-      version: "1.0.8",
+      version: "1.0.9",
       features: ["browser-agent"],
     };
   } catch (e) {

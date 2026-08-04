@@ -1,6 +1,7 @@
 ## Expected
 
 - Nil error from Run.
+- FirefoxArgs starts with `-new-window`.
 - FirefoxArgs contains the request URL (exact element or substring).
 - FirefoxArgs does **not** contain `--load-extension` or `--user-data-dir` (any form).
 
@@ -10,7 +11,7 @@
 
 ## Errors
 
-- Missing URL or presence of managed flags fails.
+- Missing URL, missing `-new-window`, or presence of managed flags fails.
 
 ## Exit Code
 
@@ -28,7 +29,10 @@ func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err 
 		t.Fatal("resp is nil")
 	}
 	if len(resp.FirefoxArgs) == 0 {
-		t.Fatal("FirefoxArgs is empty; want session URL present")
+		t.Fatal("FirefoxArgs is empty; want -new-window + session URL")
+	}
+	if resp.FirefoxArgs[0] != "-new-window" {
+		t.Fatalf("FirefoxArgs[0] = %q, want -new-window; args=%v", resp.FirefoxArgs[0], resp.FirefoxArgs)
 	}
 	assertNoManagedFirefoxFlags(t, resp.FirefoxArgs)
 	found := false

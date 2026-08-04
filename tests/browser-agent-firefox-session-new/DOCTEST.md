@@ -34,9 +34,10 @@ temporary add-on manually via `about:debugging` (no managed profile).
 
 ```text
 BuildFirefoxOpenArgs(sessionURL) → []string  # argv without binary
+  # always starts with -new-window
   # non-empty URL: contains sessionURL; MUST NOT contain --load-extension
   # or --user-data-dir
-  # empty URL: still no load-extension / user-data-dir
+  # empty URL: [-new-window] only; still no load-extension / user-data-dir
 ```
 
 Production `openFirefox(sessionURL)` is best-effort platform open; tests never

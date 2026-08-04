@@ -1,9 +1,9 @@
 # Scenario
 
-**Feature**: pure BuildFirefoxOpenArgs (URL-only; no managed Firefox flags)
+**Feature**: pure BuildFirefoxOpenArgs (new window + URL; no managed Firefox flags)
 
 ```
-Test Client -> BuildFirefoxOpenArgs(sessionURL) -> argv without binary
+Test Client -> BuildFirefoxOpenArgs(sessionURL) -> [-new-window, url?] without binary
   # never --load-extension / --user-data-dir
 ```
 

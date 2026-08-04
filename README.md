@@ -142,6 +142,27 @@ driven. CDP still runs only on the attached tab; the session page
 be allowed. The notice goes away after detach (session page closed, Cancel on
 the bar, or sticky attach released).
 
+# Development
+
+When a feature is merged into main repo, do the following:
+
+```sh
+go run ./script/bump-version
+
+git add -A
+git commit -m "bump version to v1.0.x"
+git push
+
+git tag v1.0.x
+git push --tags
+
+# sign firefox .xpi extension (wait from minutes to hours)
+go run ./script/browser-agent/firefox/sign
+
+# release with signed firefox extension
+go run ./script/github/release
+```
+
 # License
 
 See [LICENSE](LICENSE).

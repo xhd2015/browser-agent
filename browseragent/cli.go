@@ -16,6 +16,7 @@ import (
 	"time"
 
 	inj "github.com/xhd2015/browser-agent/browseragent/inject"
+	lessflags "github.com/xhd2015/less-flags"
 )
 
 const briefUsage = `Usage: browser-agent <command> [flags]
@@ -25,7 +26,7 @@ Commands:
   session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|list
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install the embedded agent skill
-  install-chrome-extension   Extract embedded Chrome extension
+  install-chrome-extension   Extract Chrome extension; TTY drives Load unpacked UI
   install-firefox-extension  Extract signed .xpi (open in Firefox) + temporary add-on help
   assets      Ensure/status hydrated session-page + extension assets
 
@@ -50,7 +51,7 @@ Commands:
     session cdp [flags] <Method> [json]
                                        POST a raw CDP job (method + optional params JSON)
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
-  install-chrome-extension   Extract embedded extension and print Load unpacked help
+  install-chrome-extension   Extract embedded extension; on TTY, Load unpacked via UI
   install-firefox-extension  Extract signed .xpi, print path, open in Firefox (install prompt)
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
@@ -123,6 +124,18 @@ logs flags:
 
 create-tab flags:
   --url <url>                Optional URL (positional [url] also accepted); omit for blank tab
+
+install-chrome-extension flags:
+  --open                     Force UI Load unpacked even when stdout is not a TTY
+  --no-open                  Print path only; do not drive Chrome UI (default for pipes)
+  --dry-run                  Open chrome://extensions and report controls; no Load unpacked click
+  --dump-tree                Dump extensions-page UI tree to stderr (no load)
+  --extension-dir <path>     Unpacked folder for UI load (default: just-extracted path); still extracts embed
+  --keep-old                 After load, keep other same-name extension cards (default: remove older best-effort)
+  --debug-screenshot         Save a PNG after each UI step under a temp dir (path printed)
+  --screenshot-dir <dir>     Save step PNGs under this directory (deterministic; enables shots)
+  --color / --no-color       Force / disable ANSI on install help stdout
+  (default: drive Load unpacked UI when stdout is a TTY; remove older same-name cards after load)
 
 install-firefox-extension flags:
   --open                     Force open the signed .xpi in Firefox (install prompt)
@@ -353,8 +366,171 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 }
 
 func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Writer) error {
-	baseDir := flagString(args, "--base-dir")
-	return InstallChromeExtension(stdout, baseDir)
+	opts, err := parseInstallChromeExtOptions(args, stdout)
+	if err == lessflags.ErrHelp {
+		// Help already printed via HelpFunc; subcommand-level --help.
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if opts.forceColor && opts.noColor {
+		return fmt.Errorf("--color and --no-color cannot be specified together")
+	}
+	if opts.open && opts.noOpen {
+		return fmt.Errorf("--open and --no-open cannot be specified together")
+	}
+	if opts.noOpen && (opts.dryRun || opts.dumpTree || opts.open) {
+		return fmt.Errorf("--no-open cannot be combined with --open, --dry-run, or --dump-tree")
+	}
+
+	colors := newServeColor(stdout, env, opts.forceColor, opts.noColor)
+
+	// UI by default on TTY; --open / --no-open / dry-run / dump-tree override.
+	openUI := false
+	switch {
+	case opts.noOpen:
+		openUI = false
+	case opts.open || opts.dryRun || opts.dumpTree:
+		openUI = true
+	default:
+		openUI = stderrIsTTY(stdout)
+	}
+
+	shotDir, err := resolveChromeScreenshotDir(opts.debugScreenshot, opts.screenshotDir)
+	if err != nil {
+		return err
+	}
+	if shotDir != "" {
+		// Always print effective dir so operators can open the folder.
+		_, _ = fmt.Fprintf(stdout, "debug-screenshot dir: %s\n", shotDir)
+	}
+
+	ui := InstallChromeUIConfig{
+		OpenUI:        openUI && !opts.dryRun && !opts.dumpTree,
+		DryRun:        opts.dryRun,
+		DumpTree:      opts.dumpTree,
+		ExtensionDir:  opts.extensionDir,
+		KeepOlder:     opts.keepOld,
+		ScreenshotDir: shotDir,
+		Stderr:        stderr,
+		Colors:        colors,
+	}
+	// dry-run / dump-tree still need wantUI path inside body.
+	if opts.dryRun || opts.dumpTree {
+		ui.OpenUI = false
+		ui.DryRun = opts.dryRun
+		ui.DumpTree = opts.dumpTree
+	}
+
+	home := ""
+	if env != nil {
+		home = strings.TrimSpace(env["HOME"])
+	}
+	if home != "" {
+		return WithProcessEnv(map[string]string{"HOME": home}, func() error {
+			return installChromeExtensionBody(stdout, opts.baseDir, ui)
+		})
+	}
+	processEnvMu.Lock()
+	defer processEnvMu.Unlock()
+	return installChromeExtensionBody(stdout, opts.baseDir, ui)
+}
+
+type installChromeExtOptions struct {
+	baseDir         string
+	forceColor      bool
+	noColor         bool
+	open            bool
+	noOpen          bool
+	dryRun          bool
+	dumpTree        bool
+	extensionDir    string
+	keepOld         bool
+	debugScreenshot bool
+	screenshotDir   string
+}
+
+// resolveChromeScreenshotDir implements:
+//   - neither flag → "" (no shots)
+//   - --screenshot-dir PATH → PATH (deterministic; enables shots)
+//   - --debug-screenshot only → temp dir browser-agent-chrome-debug-<timestamp>
+//   - both → PATH wins
+func resolveChromeScreenshotDir(debugScreenshot bool, screenshotDir string) (string, error) {
+	dir := strings.TrimSpace(screenshotDir)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("screenshot-dir: %w", err)
+		}
+		return dir, nil
+	}
+	if !debugScreenshot {
+		return "", nil
+	}
+	dir = filepath.Join(os.TempDir(), fmt.Sprintf("browser-agent-chrome-debug-%s", time.Now().Format("20060102-150405")))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("debug-screenshot temp dir: %w", err)
+	}
+	return dir, nil
+}
+
+// installChromeExtHelp is subcommand-level help (flags-parsing: every level needs --help).
+const installChromeExtHelp = `Usage: browser-agent install-chrome-extension [flags]
+
+Extract the embedded Chrome extension to the canonical path and optionally
+drive Load unpacked UI (macOS; TTY auto, or --open).
+
+Flags:
+  --open                     Force UI Load unpacked even when stdout is not a TTY
+  --no-open                  Print path only; do not drive Chrome UI (default for pipes)
+  --dry-run                  Open chrome://extensions and report controls; no Load unpacked click
+  --dump-tree                Dump extensions-page UI tree to stderr (no load)
+  --extension-dir <path>     Unpacked folder for UI load (default: just-extracted path); still extracts embed
+  --keep-old                 After load, keep other same-name extension cards (default: remove older best-effort)
+  --debug-screenshot         Save a PNG after each UI step under a temp dir (path printed)
+  --screenshot-dir <dir>     Save step PNGs under this directory (deterministic; enables shots)
+  --base-dir <path>          Ignored for install path (kept for API compatibility)
+  --color / --no-color       Force / disable ANSI on install help stdout
+  -h, --help                 Show this help
+`
+
+func parseInstallChromeExtOptions(args []string, helpOut io.Writer) (installChromeExtOptions, error) {
+	var opts installChromeExtOptions
+	if helpOut == nil {
+		helpOut = io.Discard
+	}
+	helpFn := func() {
+		_, _ = io.WriteString(helpOut, installChromeExtHelp)
+		if !strings.HasSuffix(installChromeExtHelp, "\n") {
+			_, _ = io.WriteString(helpOut, "\n")
+		}
+	}
+	// less-flags (go-best-practice/flags-parsing); HelpNoExit so tests do not os.Exit.
+	_, err := lessflags.String("--base-dir", &opts.baseDir).
+		String("--extension-dir", &opts.extensionDir).
+		String("--screenshot-dir", &opts.screenshotDir).
+		Bool("--open", &opts.open).
+		Bool("--no-open", &opts.noOpen).
+		Bool("--dry-run", &opts.dryRun).
+		Bool("--dump-tree", &opts.dumpTree).
+		Bool("--keep-old", &opts.keepOld).
+		Bool("--debug-screenshot", &opts.debugScreenshot).
+		Bool("--color", &opts.forceColor).
+		Bool("--no-color", &opts.noColor).
+		HelpFunc("-h,--help", helpFn).
+		HelpNoExit().
+		Parse(args)
+	if err == lessflags.ErrHelp {
+		return opts, err
+	}
+	if err != nil {
+		msg := err.Error()
+		if strings.Contains(msg, "unrecognized flag") {
+			return opts, fmt.Errorf("%s\nRun 'browser-agent install-chrome-extension --help' for usage.", msg)
+		}
+		return opts, err
+	}
+	return opts, nil
 }
 
 func cliInstallFirefoxExt(args []string, env map[string]string, stdout, stderr io.Writer) error {

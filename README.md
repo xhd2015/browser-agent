@@ -55,13 +55,15 @@ use browser-agent with session-id: sess-xxx to check what's new on my github tre
 
 ## Chrome
 
-1. Install the extension package:
+1. Install the extension package (on a TTY, macOS also auto Load unpacked via UI):
 
    ```sh
    browser-agent install-chrome-extension
+   # extract + print only (CI / non-interactive):
+   browser-agent install-chrome-extension --no-open
    ```
 
-2. Open `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
+2. If UI automation did not run: open `chrome://extensions` → enable **Developer mode** → **Load unpacked** →
    select the folder printed by the command.
 
 3. Keep the session page open so the extension can connect.

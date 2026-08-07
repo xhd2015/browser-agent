@@ -4,7 +4,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -197,72 +196,8 @@ func extractEmbeddedExtensionUnder(baseDir, intermediateDir string) (installPath
 	return absDest, version, nil
 }
 
-// InstallChromeExtension extracts the embedded extension to the canonical install
-// path and writes user-facing Load unpacked instructions to w. baseDir is ignored
-// (canonical path is always under home). Output ends with a trailing newline.
-func InstallChromeExtension(w io.Writer, baseDir string) error {
-	processEnvMu.Lock()
-	defer processEnvMu.Unlock()
-	return installChromeExtensionBody(w, baseDir)
-}
-
-// InstallChromeExtensionWithHome isolates HOME for the install (parallel-safe).
-func InstallChromeExtensionWithHome(w io.Writer, baseDir, home string) error {
-	env := map[string]string{}
-	if home != "" {
-		env["HOME"] = home
-	}
-	return WithProcessEnv(env, func() error {
-		return installChromeExtensionBody(w, baseDir)
-	})
-}
-
-func installChromeExtensionBody(w io.Writer, baseDir string) error {
-	if w == nil {
-		w = io.Discard
-	}
-	_ = baseDir
-	path, version, err := ensureCanonicalExtensionBody()
-	if err != nil {
-		return err
-	}
-	// Prefer identity from bundle-sum.js (canonical after EnsureExtensionBundleSum).
-	sum, sumErr := ReadBundleSumFromDir(path)
-	if sumErr == nil && strings.TrimSpace(sum.Version) != "" {
-		version = sum.Version
-	}
-	md5hex := ""
-	if sumErr == nil {
-		md5hex = sum.MD5
-	}
-	if md5hex == "" {
-		// Fallback: recompute if sum missing (should be rare after extract).
-		if s, e := EnsureExtensionBundleSum(path, version); e == nil {
-			version = s.Version
-			md5hex = s.MD5
-		}
-	}
-
-	_, err = fmt.Fprintf(w, `Chrome extension extracted for browser-agent.
-
-  path     %s
-  version  %s
-  md5      %s
-
-Install / load the unpacked extension:
-
-  1. Open chrome://extensions
-  2. Enable Developer mode (top-right toggle)
-  3. Click Load unpacked
-  4. Select this folder:
-
-     %s
-
-After loading, keep the session page open so the extension can connect.
-Compare version/md5 with browser-agent serve "embedded" lines if connection warns of mismatch.
-`, path, version, md5hex, path)
-	return err
-}
+// InstallChromeExtension / InstallChromeExtensionWithHome / install body live in
+// install_chrome.go (optional UI Load unpacked via computer-use/macos/chrome).
 
 // BuildChromeArgs returns Chrome argv (without the binary name) for a
 // best-effort launch: new window, load-extension, session URL.

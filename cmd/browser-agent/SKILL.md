@@ -58,7 +58,14 @@ Second `session new` only if the first session is gone/unusable after cleanup, o
 browser-agent install-chrome-extension
 ```
 
-Then open `chrome://extensions` → enable Developer mode → Load unpacked → path printed by the CLI.
+On a **TTY** (macOS), the CLI also drives **Load unpacked** via UI automation
+(Accessibility), then **best-effort removes older same-name** extension cards.
+Use **`--no-open`** to extract and print the path only (default for pipes/CI).
+**`--keep-old`** skips older-card removal. Other flags: `--open`, `--dry-run`,
+`--dump-tree`, `--extension-dir`.
+
+If UI fails, open `chrome://extensions` → Developer mode → Load unpacked → path
+printed by the CLI.
 
 **Firefox**:
 

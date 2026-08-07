@@ -50,6 +50,14 @@ Second `session new` only if the first session is gone/unusable after cleanup, o
 
 **Keep** the session page on `/go?session=<id>` — do not close it or navigate that tab away.
 
+If `session new` waits for the extension and times out, stderr ends with:
+
+```text
+Please run or ask user to run manually: this needs user handling
+```
+
+plus `install-chrome-extension` (or `install-firefox-extension`) and manual load steps. **That needs user handling:** run the install command or ask the user to Load unpacked / temporary add-on. Then reuse the **same** session-id (`session info` / jobs) — do **not** call `session new` again.
+
 ### 1b. Extension install (Chrome vs Firefox)
 
 **Chrome** (default):

@@ -450,7 +450,7 @@ func SessionNew(cfg SessionNewConfig) error {
 		if timeout == 0 {
 			timeout = 30 * time.Second
 		}
-		if err := waitForExtensionConnection(baseURL, result.SessionID, timeout, stderr); err != nil {
+		if err := waitForExtensionConnection(baseURL, result.SessionID, browser, extPath, timeout, stderr); err != nil {
 			return err
 		}
 	}
@@ -664,11 +664,60 @@ func formatSessionNewFirefoxOutput(w io.Writer, result *postCreateSessionResult,
 	return nil
 }
 
+// extensionTimeoutUserHandling is the fixed stderr banner after a soft wait
+// timeout so agents/operators treat install as manual user handling.
+const extensionTimeoutUserHandling = "Please run or ask user to run manually: this needs user handling"
+
+// formatExtensionTimeoutHelp returns stderr lines after the soft wait timeout
+// warning. browser is "chrome" or "firefox"; extPath and sessionID may be empty.
+func formatExtensionTimeoutHelp(browser, extPath, sessionID string) string {
+	browser = strings.ToLower(strings.TrimSpace(browser))
+	extPath = strings.TrimSpace(extPath)
+	sessionID = strings.TrimSpace(sessionID)
+
+	var b strings.Builder
+	b.WriteString(extensionTimeoutUserHandling)
+	b.WriteByte('\n')
+	b.WriteByte('\n')
+
+	if browser == "firefox" {
+		b.WriteString("  browser-agent install-firefox-extension\n")
+		b.WriteByte('\n')
+		b.WriteString("  Or temporary add-on: about:debugging#/runtime/this-firefox → Load Temporary Add-on…\n")
+		if extPath != "" {
+			b.WriteString("    ")
+			b.WriteString(extPath)
+			b.WriteByte('\n')
+		}
+	} else {
+		b.WriteString("  browser-agent install-chrome-extension\n")
+		b.WriteByte('\n')
+		b.WriteString("  Or load unpacked: chrome://extensions → Developer mode → Load unpacked →\n")
+		if extPath != "" {
+			b.WriteString("    ")
+			b.WriteString(extPath)
+			b.WriteByte('\n')
+		}
+	}
+
+	b.WriteByte('\n')
+	b.WriteString("  Then reuse the same session (do not session new again):\n")
+	if sessionID != "" {
+		b.WriteString("    browser-agent session info --session-id ")
+		b.WriteString(sessionID)
+		b.WriteByte('\n')
+	} else {
+		b.WriteString("    browser-agent session info --session-id <session-id>\n")
+	}
+	return b.String()
+}
+
 // waitForExtensionConnection polls GET /v1/session?session=<id> every 500ms until
 // the extension connects with browser-agent support, connects without support, or
-// timeout is reached. Progress ticks go to stderr. On timeout, a warning is printed
-// to stderr and nil is returned (session remains usable).
-func waitForExtensionConnection(baseURL, sessionID string, timeout time.Duration, stderr io.Writer) error {
+// timeout is reached. Progress ticks go to stderr. On timeout, a warning plus
+// install help (user-handling banner) is printed to stderr and nil is returned
+// (session remains usable).
+func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, timeout time.Duration, stderr io.Writer) error {
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -703,6 +752,7 @@ func waitForExtensionConnection(baseURL, sessionID string, timeout time.Duration
 		now := time.Now()
 		if now.After(deadline) {
 			fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", timeoutLabel)
+			fmt.Fprint(stderr, formatExtensionTimeoutHelp(browser, extPath, sessionID))
 			return nil
 		}
 		if !now.Before(nextProgress) {

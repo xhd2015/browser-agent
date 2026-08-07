@@ -5,7 +5,7 @@
 ```
 No extension connects
 Poll GET /v1/session?session=ID -> extension.connected=false throughout
-  -> timeout warning on stderr, exit 0, stdout still has session output
+  -> timeout warning + user-handling install help on stderr, exit 0, stdout still has session output
 ```
 
 ## Preconditions
@@ -24,7 +24,7 @@ Poll GET /v1/session?session=ID -> extension.connected=false throughout
 ## Context
 
 - Polling happens every 500ms, so 3s gives ~6 poll cycles.
-- On timeout: stderr warning, stdout session output, exit 0.
+- On timeout: stderr warning + "Please run or ask user to run manually: this needs user handling" + install help; stdout session output; exit 0.
 
 ```go
 import (

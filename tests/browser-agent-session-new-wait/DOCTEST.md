@@ -12,7 +12,7 @@ connecting leaves; direct HTTP polling for extension status.
 |---------|-------------------|
 | `session new` + extension hello | Extension connects with `browser-agent` support → prints "Extension connected", exit 0, <5s |
 | `session new` + unsupported ext | Extension connects without `browser-agent` → error "does not support browser-agent", exit non-zero |
-| `session new` + no extension | No extension within timeout → stderr warning, exit 0, stdout has session output |
+| `session new` + no extension | No extension within timeout → stderr warning + user-handling install help, exit 0, stdout has session output |
 | `--no-open-chrome` | Skip wait entirely, exit immediately (backward compat) |
 | `--no-wait` | Skip wait entirely, exit immediately (new flag) |
 | Daemon unreachable during wait | Error, exit non-zero |
@@ -41,7 +41,7 @@ into the session snapshot served by `GET /v1/session`.
 - Extension connects with `browser-agent` support → print "Extension connected" to stderr, exit 0
 - Extension connects but does NOT support `browser-agent` (version < 1.0.0 or
   features missing `"browser-agent"`) → error "does not support browser-agent", exit 1
-- Timeout (`WaitExtensionTimeout`, default 30s) → warning on stderr, exit 0, still print session output
+- Timeout (`WaitExtensionTimeout`, default 30s) → warning + `Please run or ask user to run manually: this needs user handling` + install help on stderr, exit 0, still print session output
 - Daemon unreachable → error, exit non-zero
 
 **Skip conditions**: `NoOpenChrome=true` or `NoWait=true` → no wait at all.

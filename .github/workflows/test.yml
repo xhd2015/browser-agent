@@ -7,15 +7,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      COVERPKG: github.com/xhd2015/browser-agent/...
+      COVERMODE: set
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      # Project-specific: tracked embed roots are placeholders only; stage mini
+      # fixtures so go:embed / control-server paths work without npm or network hydrate.
       - name: Stage complete embeds from fixtures (go:embed)
         run: |
-          # tracked tree only has placeholder.txt; stage complete mini fixtures so
-          # control server / go:embed paths work in CI without npm or network hydrate.
           mkdir -p browseragent/embedded/extension browseragent/embedded/session-page
           cp -a browseragent/fixtures/extension/. browseragent/embedded/extension/
           cp -a browseragent/fixtures/session-page/. browseragent/embedded/session-page/
@@ -28,22 +32,30 @@ jobs:
           fi
           mkdir -p har-viewer/project-api-capture-react/dist
           printf '%s\n' '<!doctype html><title>placeholder</title>' > har-viewer/project-api-capture-react/dist/index.html
+
       - name: Go test
-        run: go test -v ./...
+        run: |
+          go test -count=1 \
+            -covermode="$COVERMODE" \
+            -coverpkg="$COVERPKG" \
+            -coverprofile=coverage-gotest.out \
+            ./...
 
       - name: Install doctest
-        run: |
-          if ! command -v doctest >/dev/null 2>&1; then
-            go install github.com/xhd2015/doctest/cmd/doctest@latest
-          fi
+        run: go install github.com/xhd2015/doctest/cmd/doctest@latest
+
       - name: Prefetch modules
         run: |
           go mod download
           go mod tidy
-      - name: Doctest
-        # mapping-gen shares one go.mod across suites; concurrent go mod tidy can
-        # race. Serialize go via flock and run each DOCTEST.md suite sequentially.
+
+      # Layer model: discovery = in-process mass; label e2e = full integration only.
+      # Serialize go via flock: concurrent go mod tidy / compile across suites can race.
+      # Each stage writes its own coverprofile — same path overwrites (no merge).
+      - name: Doctest discovery (in-process mass)
+        # --label '!e2e' skips e2e; heavy may still run. Fast PR feedback vs --label-all.
         run: |
+          set -euo pipefail
           REAL_GO="$(command -v go)"
           WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
           mkdir -p "$WRAP_DIR"
@@ -53,15 +65,93 @@ jobs:
             >"$WRAP_DIR/go"
           chmod +x "$WRAP_DIR/go"
           export PATH="$WRAP_DIR:$PATH"
-          failed=0
-          find tests -name DOCTEST.md -print | sort >"$WRAP_DIR/suites.list"
-          while IFS= read -r doc; do
-            [ -n "$doc" ] || continue
-            suite="$(dirname "$doc")"
-            echo "==> doctest $suite"
-            if ! doctest test -v --label-all "$suite"; then
-              echo "FAILED: $suite"
-              failed=1
+          doctest test --label '!e2e' -count=1 \
+            -cover -covermode="$COVERMODE" \
+            -coverpkg="$COVERPKG" \
+            -coverprofile=coverage-doctest-discovery.out \
+            ./...
+
+      - name: Doctest e2e (full integration)
+        # True process-boundary / browser leaves (label: e2e).
+        # Leaves often skip when playwright-debug is absent from PATH.
+        run: |
+          set -euo pipefail
+          REAL_GO="$(command -v go)"
+          WRAP_DIR="${RUNNER_TEMP:-/tmp}/go-flock-wrap"
+          mkdir -p "$WRAP_DIR"
+          printf '%s\n' \
+            '#!/bin/sh' \
+            "exec flock \"${WRAP_DIR}/go.lock\" \"${REAL_GO}\" \"\$@\"" \
+            >"$WRAP_DIR/go"
+          chmod +x "$WRAP_DIR/go"
+          export PATH="$WRAP_DIR:$PATH"
+          doctest test --label e2e -count=1 \
+            -cover -covermode="$COVERMODE" \
+            -coverpkg="$COVERPKG" \
+            -coverprofile=coverage-doctest-e2e.out \
+            ./...
+
+      - name: Install xgo (coverage merge)
+        # Prebuilt binary; see xgo doc/INSTALLATION.md (faster than go install in CI).
+        run: |
+          curl -fsSL https://github.com/xhd2015/xgo/raw/master/script/install/install.sh \
+            | env INSTALL_TO_BIN=true bash
+          xgo version
+
+      - name: Install kool (coverage package table)
+        # Released binary; package-table lives in kool v0.0.136+.
+        # Note: kool has no `version` subcommand — verify via package-table --help.
+        run: |
+          curl -fsSL https://github.com/xhd2015/kool/raw/master/install.sh | bash
+          # install.sh places kool in /usr/local/bin; also allow go install fallbacks.
+          export PATH="/usr/local/bin:${HOME}/go/bin:${PATH}"
+          command -v kool
+          kool go coverage package-table --help >/dev/null
+
+      - name: Merge coverage and report
+        # Merge only profiles that exist (partial success still reports).
+        # xgo tool coverage merge — do not reuse one -coverprofile path across stages.
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:${HOME}/go/bin:${PATH}"
+          profiles=()
+          for f in coverage-gotest.out coverage-doctest-discovery.out coverage-doctest-e2e.out; do
+            if [[ -s "$f" ]]; then
+              profiles+=("$f")
+              echo "include $f ($(wc -c <"$f") bytes)"
+            else
+              echo "skip missing/empty $f"
             fi
-          done <"$WRAP_DIR/suites.list"
-          exit "$failed"
+          done
+          if [[ ${#profiles[@]} -eq 0 ]]; then
+            echo "No coverage profiles found" >&2
+            exit 1
+          fi
+          xgo tool coverage merge -o coverage.out "${profiles[@]}"
+          go tool cover -func=coverage.out | tee coverage-func.txt
+          {
+            echo "## Coverage (merged)"
+            echo ""
+            echo "Sources: ${profiles[*]}"
+            echo ""
+            echo '```'
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+            echo ""
+            echo "### Package breakdown (product, lowest first)"
+            echo ""
+            kool go coverage package-table coverage.out
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          if-no-files-found: ignore
+          path: |
+            coverage.out
+            coverage-func.txt
+            coverage-gotest.out
+            coverage-doctest-discovery.out
+            coverage-doctest-e2e.out

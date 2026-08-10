@@ -69,7 +69,7 @@ jobs:
             -cover -covermode="$COVERMODE" \
             -coverpkg="$COVERPKG" \
             -coverprofile=coverage-doctest-discovery.out \
-            ./tests
+            ./...
 
       - name: Doctest e2e (full integration)
         # True process-boundary / browser leaves (label: e2e).
@@ -89,7 +89,7 @@ jobs:
             -cover -covermode="$COVERMODE" \
             -coverpkg="$COVERPKG" \
             -coverprofile=coverage-doctest-e2e.out \
-            ./tests
+            ./...
 
       - name: Install xgo (coverage merge)
         # Prebuilt binary; see xgo doc/INSTALLATION.md (faster than go install in CI).

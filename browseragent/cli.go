@@ -128,6 +128,7 @@ create-tab flags:
 install-chrome-extension flags:
   --open                     Force UI Load unpacked even when stdout is not a TTY
   --no-open                  Print path only; do not drive Chrome UI (default for pipes)
+  --write-json-result FILE   Write open handoff JSON to FILE (implies --no-open)
   --dry-run                  Open chrome://extensions and report controls; no Load unpacked click
   --dump-tree                Dump extensions-page UI tree to stderr (no load)
   --extension-dir <path>     Unpacked folder for UI load (default: just-extracted path); still extracts embed
@@ -383,13 +384,21 @@ func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Write
 	if opts.noOpen && (opts.dryRun || opts.dumpTree || opts.open) {
 		return fmt.Errorf("--no-open cannot be combined with --open, --dry-run, or --dump-tree")
 	}
+	jsonResult := strings.TrimSpace(opts.writeJSONResult)
+	if writeJSONResultFlagPresent(args) && jsonResult == "" {
+		return fmt.Errorf("--write-json-result requires a file path")
+	}
+	if jsonResult != "" && (opts.open || opts.dryRun || opts.dumpTree) {
+		return fmt.Errorf("--write-json-result cannot be combined with --open, --dry-run, or --dump-tree")
+	}
 
 	colors := newServeColor(stdout, env, opts.forceColor, opts.noColor)
 
 	// UI by default on TTY; --open / --no-open / dry-run / dump-tree override.
+	// --write-json-result is extract-only (same as --no-open).
 	openUI := false
 	switch {
-	case opts.noOpen:
+	case opts.noOpen || jsonResult != "":
 		openUI = false
 	case opts.open || opts.dryRun || opts.dumpTree:
 		openUI = true
@@ -407,14 +416,15 @@ func cliInstallExt(args []string, env map[string]string, stdout, stderr io.Write
 	}
 
 	ui := InstallChromeUIConfig{
-		OpenUI:        openUI && !opts.dryRun && !opts.dumpTree,
-		DryRun:        opts.dryRun,
-		DumpTree:      opts.dumpTree,
-		ExtensionDir:  opts.extensionDir,
-		KeepOlder:     opts.keepOld,
-		ScreenshotDir: shotDir,
-		Stderr:        stderr,
-		Colors:        colors,
+		OpenUI:         openUI && !opts.dryRun && !opts.dumpTree,
+		DryRun:         opts.dryRun,
+		DumpTree:       opts.dumpTree,
+		ExtensionDir:   opts.extensionDir,
+		KeepOlder:      opts.keepOld,
+		ScreenshotDir:  shotDir,
+		JSONResultPath: jsonResult,
+		Stderr:         stderr,
+		Colors:         colors,
 	}
 	// dry-run / dump-tree still need wantUI path inside body.
 	if opts.dryRun || opts.dumpTree {
@@ -443,12 +453,22 @@ type installChromeExtOptions struct {
 	noColor         bool
 	open            bool
 	noOpen          bool
+	writeJSONResult string
 	dryRun          bool
 	dumpTree        bool
 	extensionDir    string
 	keepOld         bool
 	debugScreenshot bool
 	screenshotDir   string
+}
+
+func writeJSONResultFlagPresent(args []string) bool {
+	for _, a := range args {
+		if a == "--write-json-result" || strings.HasPrefix(a, "--write-json-result=") {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveChromeScreenshotDir implements:
@@ -483,6 +503,7 @@ drive Load unpacked UI (macOS; TTY auto, or --open).
 Flags:
   --open                     Force UI Load unpacked even when stdout is not a TTY
   --no-open                  Print path only; do not drive Chrome UI (default for pipes)
+  --write-json-result FILE   Write open handoff JSON to FILE (implies --no-open)
   --dry-run                  Open chrome://extensions and report controls; no Load unpacked click
   --dump-tree                Dump extensions-page UI tree to stderr (no load)
   --extension-dir <path>     Unpacked folder for UI load (default: just-extracted path); still extracts embed
@@ -509,6 +530,7 @@ func parseInstallChromeExtOptions(args []string, helpOut io.Writer) (installChro
 	_, err := lessflags.String("--base-dir", &opts.baseDir).
 		String("--extension-dir", &opts.extensionDir).
 		String("--screenshot-dir", &opts.screenshotDir).
+		String("--write-json-result", &opts.writeJSONResult).
 		Bool("--open", &opts.open).
 		Bool("--no-open", &opts.noOpen).
 		Bool("--dry-run", &opts.dryRun).

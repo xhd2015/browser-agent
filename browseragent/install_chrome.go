@@ -2,9 +2,11 @@ package browseragent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -28,10 +30,28 @@ type InstallChromeUIConfig struct {
 	KeepOlder bool
 	// ScreenshotDir when set saves a PNG after each UI step (debug).
 	ScreenshotDir string
+	// JSONResultPath when set writes open-handoff JSON (ok/path/ui) after extract.
+	// CLI --write-json-result; implies no Chrome UI.
+	JSONResultPath string
 	// Stderr receives warnings and dump-tree (defaults to discarding if nil when no UI).
 	Stderr io.Writer
 	// Colors styles warning/success lines (optional zero = no color).
 	Colors serveColor
+}
+
+// installChromeJSONResult is the --write-json-result payload for a GUI host
+// (Marcus) to open chrome://extensions and reveal the unpacked folder.
+type installChromeJSONResult struct {
+	OK   bool                  `json:"ok"`
+	Path string                `json:"path"`
+	UI   []installChromeJSONUI `json:"ui"`
+}
+
+type installChromeJSONUI struct {
+	Kind string `json:"kind"`
+	App  string `json:"app,omitempty"`
+	URL  string `json:"url,omitempty"`
+	Path string `json:"path,omitempty"`
 }
 
 // InstallChromeExtension extracts the embedded extension to the canonical install
@@ -122,6 +142,12 @@ Compare version/md5 with browser-agent serve "embedded" lines if connection warn
 		return err
 	}
 
+	if dest := strings.TrimSpace(ui.JSONResultPath); dest != "" {
+		if err := writeInstallChromeJSONResult(dest, loadPath); err != nil {
+			return err
+		}
+	}
+
 	wantUI := ui.OpenUI || ui.DryRun || ui.DumpTree
 	if !wantUI {
 		return nil
@@ -196,6 +222,30 @@ Compare version/md5 with browser-agent serve "embedded" lines if connection warn
 		if _, err := fmt.Fprintf(w, "%s\n", colors.gray(fmt.Sprintf("Removed %d older same-name extension card(s).", res.RemovedOlder))); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func writeInstallChromeJSONResult(dest, loadPath string) error {
+	dest = strings.TrimSpace(dest)
+	if dest == "" {
+		return fmt.Errorf("--write-json-result requires a file path")
+	}
+	payload := installChromeJSONResult{
+		OK:   true,
+		Path: loadPath,
+		UI: []installChromeJSONUI{
+			{Kind: "open-url", App: chrome.DefaultAppName, URL: chrome.ExtensionsURL},
+			{Kind: "reveal", Path: loadPath},
+		},
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("write-json-result: %w", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(dest, raw, 0o644); err != nil {
+		return fmt.Errorf("write-json-result: %w", err)
 	}
 	return nil
 }

@@ -61,6 +61,8 @@ use browser-agent with session-id: sess-xxx to check what's new on my github tre
    browser-agent install-chrome-extension
    # extract + print only (CI / non-interactive):
    browser-agent install-chrome-extension --no-open
+   # extract + write open handoff JSON (no Chrome UI):
+   browser-agent install-chrome-extension --write-json-result /tmp/ba-ext.json
    ```
 
 2. If UI automation did not run: open `chrome://extensions` → enable **Developer mode** → **Load unpacked** →

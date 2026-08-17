@@ -69,6 +69,7 @@ browser-agent install-chrome-extension
 On a **TTY** (macOS), the CLI also drives **Load unpacked** via UI automation
 (Accessibility), then **best-effort removes older same-name** extension cards.
 Use **`--no-open`** to extract and print the path only (default for pipes/CI).
+**`--write-json-result FILE`** writes open-handoff JSON and implies `--no-open`.
 **`--keep-old`** skips older-card removal. Other flags: `--open`, `--dry-run`,
 `--dump-tree`, `--extension-dir`.
 

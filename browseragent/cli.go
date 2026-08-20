@@ -30,6 +30,14 @@ Commands:
   install-firefox-extension  Extract signed .xpi (open in Firefox) + temporary add-on help
   assets      Ensure/status hydrated session-page + extension assets
 
+Flags:
+  --version              Print version and exit
+      --version --fetch-latest
+                         Fetch and print latest published version from GitHub Releases
+      --version --fetch-latest -v
+                         Verbose: print local + latest and whether an update is available
+  -h, --help             Show this help
+
 Run 'browser-agent --help' for full help.
 `
 
@@ -60,6 +68,11 @@ Commands:
 
 Global flags:
   -h, --help                 Show this help
+      --version              Print local version and exit
+      --version --fetch-latest
+                             Fetch and print latest published version from GitHub Releases
+      --version --fetch-latest -v
+                             Verbose: print local + latest and whether an update is available
 
 serve flags:
   --host <host>              Listen host (default: 127.0.0.1)
@@ -196,6 +209,11 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return nil
 	}
 
+	// version
+	if args[0] == "--version" {
+		return cliVersion(args[1:], env, stdout, stderr)
+	}
+
 	cmd := args[0]
 	rest := args[1:]
 
@@ -222,6 +240,64 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		_, _ = io.WriteString(stderr, briefUsage)
 		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
 	}
+}
+
+// cliVersion handles --version with optional --fetch-latest and -v flags.
+//   --version                     Print local embedded version (default).
+//   --version --fetch-latest      Fetch and print latest published version from GitHub.
+//   --version --fetch-latest -v   Verbose: print local + latest and comparison.
+func cliVersion(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	fetchLatest := false
+	verbose := false
+	for _, a := range args {
+		switch a {
+		case "--fetch-latest":
+			fetchLatest = true
+		case "-v":
+			verbose = true
+		case "--help", "-h":
+			_, _ = io.WriteString(stdout, fullHelp)
+			if !strings.HasSuffix(fullHelp, "\n") {
+				_, _ = io.WriteString(stdout, "\n")
+			}
+			return nil
+		default:
+			_, _ = io.WriteString(stderr, briefUsage)
+			return fmt.Errorf("unknown flag %q for --version (try --fetch-latest or -v)", a)
+		}
+	}
+
+	if !fetchLatest {
+		_, _ = io.WriteString(stdout, ClientVersion())
+		_, _ = io.WriteString(stdout, "\n")
+		return nil
+	}
+
+	ctx := context.Background()
+	latest, err := FetchLatestReleaseVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch latest version: %w", err)
+	}
+	latest = strings.TrimSpace(latest)
+
+	if !verbose {
+		_, _ = io.WriteString(stdout, latest)
+		_, _ = io.WriteString(stdout, "\n")
+		return nil
+	}
+
+	local := ClientVersion()
+	_, _ = fmt.Fprintf(stdout, "local:   %s\n", local)
+	_, _ = fmt.Fprintf(stdout, "latest:  %s\n", latest)
+	switch CompareVersion(local, latest) {
+	case 0:
+		_, _ = fmt.Fprintf(stdout, "up-to-date\n")
+	case -1:
+		_, _ = fmt.Fprintf(stdout, "update available: %s → %s\n", local, latest)
+	default:
+		_, _ = fmt.Fprintf(stdout, "local is newer: %s > %s\n", local, latest)
+	}
+	return nil
 }
 
 // cliSession dispatches nested session side-commands:

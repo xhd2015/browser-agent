@@ -278,7 +278,7 @@ func (c *controlServer) handleExtResult(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = sess.queue.Complete(jobID, JobResult{
+	c.completeExtensionResult(sess, JobResult{
 		JobID: jobID,
 		OK:    req.OK,
 		Error: req.Error,

@@ -4,7 +4,7 @@ description: >-
   Use when research a browser or web page, or a non-api url mentioned. Drive a live Chrome session: start with
   session new (auto-ensures daemon), open the session page, then use nested
   session side commands (session info, create-tab, eval, run, logs, screenshot,
-  cdp).
+  cdp, har).
 ---
 
 # Browser Agent Skill
@@ -131,6 +131,12 @@ browser-agent session logs --session-id sess-xqbsmo --tab-id 216774025
 # Screenshot
 browser-agent session screenshot --session-id sess-xqbsmo -o /tmp/page.png
 browser-agent session screenshot --session-id sess-xqbsmo --tab-id 216774025 -o /tmp/tab.png
+
+# Chrome HAR capture (all user HTTP(S) tabs in the session window)
+browser-agent session har start sess-xqbsmo
+# perform the browser flow, then export per-tab HAR files plus manifest.json
+browser-agent session har end sess-xqbsmo
+browser-agent session har end sess-xqbsmo --output-dir /tmp/my-har-capture
 
 # CDP (page-scoped; prefer create-tab over Target.createTarget)
 browser-agent session cdp --session-id sess-xqbsmo Page.navigate '{"url":"https://example.com"}'

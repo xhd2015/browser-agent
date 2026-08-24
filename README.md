@@ -18,8 +18,11 @@ go install github.com/xhd2015/browser-agent@latest
 Then install the skills:
 
 ```sh
-# install the skill to ~/.agents/skills/browser-agent/SKILL.md
+# Existing browser-driving skill (the default when no name is given)
 browser-agent skill --install --global
+
+# Browser-network-to-API workflow
+browser-agent skill --install browser-agent-to-api --global
 ```
 
 Then install browser extensions (details see below):
@@ -112,15 +115,28 @@ browser-agent session info --session-id sess-xxxxxx
 browser-agent session create-tab --session-id sess-xxxxxx https://example.com
 browser-agent session eval --session-id sess-xxxxxx --tab-id <id> 'document.title'
 browser-agent session screenshot --session-id sess-xxxxxx --tab-id <id> -o out.png
+
+# Chrome only: capture all user HTTP(S) tabs and export per-tab HAR files
+browser-agent session har start sess-xxxxxx
+# perform the browser flow
+browser-agent session har end sess-xxxxxx
+# output: /tmp/browser-agent-sess-xxxxxx/manifest.json and tab-*.har
 ```
 
-## Agent skill
+## Agent skills
 
-Copy the embedded skill into your agent tools (Claude Code, Codex, Grok, etc.):
+Discover, inspect, or install either embedded skill:
 
 ```sh
+browser-agent skill --list
+
+# Existing browser-driving skill; omitted name defaults to this skill
 browser-agent skill --show
-browser-agent skill --install --global   # if supported by your skill host
+browser-agent skill --install --global
+
+# Browser-to-API capture and analysis workflow
+browser-agent skill --show browser-agent-to-api
+browser-agent skill --install browser-agent-to-api --global
 ```
 
 # Tips

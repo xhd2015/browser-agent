@@ -10,6 +10,8 @@ export const JOB_TYPE_LOGS = "logs";
 export const JOB_TYPE_SCREENSHOT = "screenshot";
 export const JOB_TYPE_CDP = "cdp";
 export const JOB_TYPE_CREATE_TAB = "create_tab";
+export const JOB_TYPE_HAR_START = "har_start";
+export const JOB_TYPE_HAR_END = "har_end";
 
 /** All known job types in stable order. */
 export const KNOWN_JOB_TYPES = [
@@ -20,6 +22,8 @@ export const KNOWN_JOB_TYPES = [
   JOB_TYPE_SCREENSHOT,
   JOB_TYPE_CDP,
   JOB_TYPE_CREATE_TAB,
+  JOB_TYPE_HAR_START,
+  JOB_TYPE_HAR_END,
 ] as const;
 
 export type JobType = (typeof KNOWN_JOB_TYPES)[number];

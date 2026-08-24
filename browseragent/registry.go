@@ -22,9 +22,9 @@ var ErrSessionExtensionConnected = errors.New("cannot delete session: extension 
 
 // SessionRegistry holds live sessions keyed by session id.
 type SessionRegistry struct {
-	mu      sync.RWMutex
-	baseDir string
-	addr    string
+	mu       sync.RWMutex
+	baseDir  string
+	addr     string
 	sessions map[string]*session
 }
 
@@ -313,6 +313,14 @@ func (r *SessionRegistry) Exists(id string) bool {
 	return SessionDirExists(r.baseDir, id)
 }
 
+func sweepSessionHARSpool(sessionDir string) error {
+	spool := filepath.Join(sessionDir, "har-spool")
+	if err := os.RemoveAll(spool); err != nil {
+		return fmt.Errorf("remove orphan HAR spool %s: %w", spool, err)
+	}
+	return nil
+}
+
 // RestoreSessionsFromDisk scans {baseDir}/sessions/*/ for valid session
 // directories with readable meta.json and registers them in-memory as
 // waiting_extension (extension.connected=false). It does not call Create and
@@ -337,6 +345,10 @@ func RestoreSessionsFromDisk(r *SessionRegistry) error {
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
+		}
+		sessionDir := filepath.Join(sessionsRoot, e.Name())
+		if err := sweepSessionHARSpool(sessionDir); err != nil {
+			return err
 		}
 		id := e.Name()
 		if ValidateSessionID(id) != nil {

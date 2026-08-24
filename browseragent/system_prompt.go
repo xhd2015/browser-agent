@@ -26,6 +26,12 @@ Use these nested CLI recipes (session id resolved from flag or env):
 - browser-agent session run path/to/script.js
 - browser-agent session logs
 - browser-agent session screenshot
+- browser-agent session har start
+- browser-agent session har end [-o output-directory]
+
+HAR capture is Chrome-only. It records every current and newly opened user HTTP(S)
+tab in the session window, then exports one HAR per tab plus manifest.json. HAR files
+may contain credentials, cookies, request bodies, and sensitive response data.
 
 Optional escape hatch:
 

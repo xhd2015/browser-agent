@@ -42,6 +42,10 @@ func jobParamsSummary(jobType string, params map[string]any) string {
 				parts = append(parts, "nav_url="+truncateForLog(u, 200))
 			}
 		}
+	case "har_start", "har_end":
+		if id, ok := stringParam(params, "capture_id"); ok {
+			parts = append(parts, "capture_id="+truncateForLog(id, 32))
+		}
 	case "eval", "run":
 		if e, ok := stringParam(params, "expression", "expr", "code", "source", "script"); ok {
 			parts = append(parts, "expr="+truncateForLog(e, 80))
@@ -122,7 +126,7 @@ func debugEnabled() bool {
 // BROWSER_AGENT_DEBUG.
 func shouldAlwaysLogJob(jobType string, params map[string]any) bool {
 	switch jobType {
-	case "create_tab", "eval", "run", "screenshot":
+	case "create_tab", "eval", "run", "screenshot", "har_start", "har_end":
 		// Always log attach-heavy jobs for cold-path latency digs.
 		return true
 	case "cdp":

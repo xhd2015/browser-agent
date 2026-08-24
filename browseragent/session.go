@@ -6,9 +6,16 @@ import (
 	"time"
 )
 
+var wsDisconnectGracePeriod = 2 * time.Second
+
 // session is the in-memory state for one serve instance.
 type session struct {
 	mu sync.Mutex
+
+	// extensionResultMu serializes extension result side effects and deduplicates
+	// replayed results by job ID.
+	extensionResultMu   sync.Mutex
+	extensionResultSeen map[string]struct{}
 
 	id        string
 	phase     string
@@ -33,8 +40,9 @@ type session struct {
 
 	queue *JobQueue
 
-	// Single extension WS writer (nil when disconnected).
-	ws *wsConn
+	// Single extension WS writer (nil when disconnected or reconnecting).
+	ws                   *wsConn
+	disconnectGeneration uint64
 
 	// Poll-mode control events (e.g. prepare_reconnect) for HTTP transport sessions.
 	pollEvents  []map[string]any
@@ -51,6 +59,9 @@ type session struct {
 	browsers         []string
 	sessionPages     []sessionPageTab
 	lastSeenAt       time.Time
+
+	// harCapture owns the daemon-side private artifact spool for the active capture.
+	harCapture *harCapture
 }
 
 type sessionPageTab struct {
@@ -61,11 +72,12 @@ type sessionPageTab struct {
 
 func newSession(id, baseDir string) *session {
 	return &session{
-		id:        id,
-		phase:     PhaseWaitingExtension,
-		createdAt: time.Now(),
-		baseDir:   baseDir,
-		queue:     NewJobQueue(),
+		id:                  id,
+		phase:               PhaseWaitingExtension,
+		createdAt:           time.Now(),
+		baseDir:             baseDir,
+		queue:               NewJobQueue(),
+		extensionResultSeen: make(map[string]struct{}),
 	}
 }
 
@@ -94,18 +106,33 @@ func (s *session) markHello(version string, features []string, bundleMD5 string)
 	}
 }
 
-func (s *session) markDisconnected() {
+func (s *session) markDisconnectedAfterGrace(c *wsConn) {
 	s.mu.Lock()
-	s.extConnected = false
-	s.ws = nil
-	// Keep version/features/md5 for last-seen display; supports becomes false when not connected.
-	s.supportsBA = false
-	s.phase = PhaseWaitingExtension
-	q := s.queue
-	s.mu.Unlock()
-	if q != nil {
-		q.FailAllInflight("extension disconnected: connection lost (websocket closed)")
+	if s.ws != c {
+		s.mu.Unlock()
+		return
 	}
+	s.ws = nil
+	s.disconnectGeneration++
+	generation := s.disconnectGeneration
+	s.mu.Unlock()
+
+	time.AfterFunc(wsDisconnectGracePeriod, func() {
+		s.mu.Lock()
+		if s.disconnectGeneration != generation || s.ws != nil {
+			s.mu.Unlock()
+			return
+		}
+		s.extConnected = false
+		// Keep version/features/md5 for last-seen display; supports becomes false when not connected.
+		s.supportsBA = false
+		s.phase = PhaseWaitingExtension
+		q := s.queue
+		s.mu.Unlock()
+		if q != nil {
+			q.FailAllInflight("extension disconnected: reconnect grace period expired")
+		}
+	})
 }
 
 func (s *session) setExtensionInstallPath(path string) {
@@ -137,6 +164,9 @@ func (s *session) setWS(c *wsConn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ws = c
+	if c != nil {
+		s.disconnectGeneration++
+	}
 }
 
 func (s *session) getWS() *wsConn {
@@ -346,10 +376,10 @@ func (s *session) snapshot() sessionSnapshot {
 }
 
 type sessionSnapshot struct {
-	SessionID            string           `json:"session_id"`
-	Phase                string           `json:"phase"`
-	Hint                 string           `json:"hint,omitempty"`
-	ExtensionInstallPath string           `json:"extension_install_path,omitempty"`
+	SessionID            string `json:"session_id"`
+	Phase                string `json:"phase"`
+	Hint                 string `json:"hint,omitempty"`
+	ExtensionInstallPath string `json:"extension_install_path,omitempty"`
 	// FirefoxXPIPath is the absolute filesystem path to the signed .xpi when available.
 	FirefoxXPIPath string `json:"firefox_xpi_path,omitempty"`
 	// FirefoxXPIURL is file:///… for the same path (copy/paste; click from http may be blocked).

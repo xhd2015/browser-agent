@@ -10,22 +10,63 @@ import (
 )
 
 //go:embed SKILL.md
-var skillContent string
+var browserAgentSkillContent string
 
-const skillName = ProductName
+//go:embed skills/browser-agent-to-api/SKILL.md
+var browserAgentToAPISkillContent string
 
-// browserAgentSkill returns the Shape-1 single skill definition.
+const (
+	skillName             = ProductName
+	browserAgentToAPIName = "browser-agent-to-api"
+)
+
+const browserAgentSkillHelp = `Usage: browser-agent skill --list
+       browser-agent skill --show [--header] [<name>]
+       browser-agent skill [<name>] --show [--header]
+       browser-agent skill --install [<name>] [OPTIONS] [<dir>]
+       browser-agent skill [<name>] --install [OPTIONS] [<dir>]
+
+Embedded skills:
+  browser-agent         Drive a live browser session
+  browser-agent-to-api  Capture browser behavior and derive reusable API calls
+
+Omitting <name> defaults to browser-agent for backward compatibility.
+Run 'browser-agent skill --install [<name>] --help' for install target flags.
+`
+
 func browserAgentSkill() *skillcmd.SingleSkill {
 	return &skillcmd.SingleSkill{
 		Name:        skillName,
-		RootContent: skillContent,
+		RootContent: browserAgentSkillContent,
 		Usage:       "browser-agent skill --install",
 	}
 }
 
+func browserAgentToAPISkill() *skillcmd.SingleSkill {
+	return &skillcmd.SingleSkill{
+		Name:        browserAgentToAPIName,
+		RootContent: browserAgentToAPISkillContent,
+		Usage:       "browser-agent skill --install browser-agent-to-api",
+	}
+}
+
+func browserAgentSkills() []*skillcmd.SingleSkill {
+	return []*skillcmd.SingleSkill{browserAgentSkill(), browserAgentToAPISkill()}
+}
+
+func findBrowserAgentSkill(name string) (*skillcmd.SingleSkill, bool) {
+	for _, skill := range browserAgentSkills() {
+		if skill.Name == name {
+			return skill, true
+		}
+	}
+	return nil, false
+}
+
 // cliSkill handles: skill [--list|--show|--install …]
-// Writes to the provided stdout/stderr (does not rely on os.Stdout alone).
+// Writes list/show/help to the provided writers; install uses skillcmd's installer.
 func cliSkill(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	_ = env
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -33,32 +74,37 @@ func cliSkill(args []string, env map[string]string, stdout, stderr io.Writer) er
 		stderr = io.Discard
 	}
 
-	sk := browserAgentSkill()
 	parsed, err := skillcmd.ParseSkillArgs(args)
 	if err != nil {
-		// skillcmd bare / missing-action error already mentions --show/--list/--install.
 		return err
 	}
 
 	switch parsed.Action {
 	case skillcmd.ActionHelp:
-		help := strings.TrimSpace(sk.Help)
-		if help == "" {
-			help = skillcmd.DefaultSingleSkillHelp(sk.Usage, sk.Name)
-		}
-		if !strings.HasSuffix(help, "\n") {
-			help += "\n"
-		}
-		_, _ = io.WriteString(stdout, help)
-		return nil
-
-	case skillcmd.ActionList:
-		// Shape 1: skill name + trailing newline.
-		_, err := fmt.Fprintln(stdout, sk.Name)
+		_, err := io.WriteString(stdout, browserAgentSkillHelp)
 		return err
 
+	case skillcmd.ActionList:
+		for _, skill := range browserAgentSkills() {
+			if _, err := fmt.Fprintln(stdout, skill.Name); err != nil {
+				return err
+			}
+		}
+		return nil
+
 	case skillcmd.ActionShow:
-		content, err := loadSkillContent(sk, parsed.Header, parsed.Rest)
+		skill := browserAgentSkill()
+		if len(parsed.Rest) > 1 {
+			return fmt.Errorf("unexpected arguments: %v", parsed.Rest[1:])
+		}
+		if len(parsed.Rest) == 1 {
+			var ok bool
+			skill, ok = findBrowserAgentSkill(parsed.Rest[0])
+			if !ok {
+				return fmt.Errorf("unknown skill %q", parsed.Rest[0])
+			}
+		}
+		content, err := loadSkillContent(skill, parsed.Header, nil)
 		if err != nil {
 			return err
 		}
@@ -69,20 +115,30 @@ func cliSkill(args []string, env map[string]string, stdout, stderr io.Writer) er
 		return err
 
 	case skillcmd.ActionInstall:
-		// Install uses skillcmd's HandleInstall (may write to process stdout for
-		// install progress). Not asserted by vite-skill tests; still support it.
-		return sk.Handle(append([]string{"--install"}, parsed.Rest...))
+		skill := browserAgentSkill()
+		rest := make([]string, 0, len(parsed.Rest))
+		selectedName := ""
+		for _, arg := range parsed.Rest {
+			if selected, ok := findBrowserAgentSkill(arg); ok {
+				if selectedName != "" && selectedName != selected.Name {
+					return fmt.Errorf("multiple skill names provided: %s and %s", selectedName, selected.Name)
+				}
+				selectedName = selected.Name
+				skill = selected
+				continue
+			}
+			rest = append(rest, arg)
+		}
+		return skill.Handle(append([]string{"--install"}, rest...))
 
 	default:
 		return fmt.Errorf("unknown skill action %q", parsed.Action)
 	}
 }
 
-func loadSkillContent(sk *skillcmd.SingleSkill, header bool, rest []string) (string, error) {
-	// Reuse SingleSkill show path logic without printing to os.Stdout.
-	// Only root content is required for Shape 1 tests.
+func loadSkillContent(skill *skillcmd.SingleSkill, header bool, rest []string) (string, error) {
 	if len(rest) == 0 {
-		content := sk.RootContent
+		content := skill.RootContent
 		if header {
 			out, err := skillcmd.FormatHeaderWithDelimiters(content)
 			if err != nil {
@@ -92,12 +148,8 @@ func loadSkillContent(sk *skillcmd.SingleSkill, header bool, rest []string) (str
 		}
 		return content, nil
 	}
-	// Nested topics: fall back to SingleSkill.Handle via stdout redirect is
-	// awkward; return a clear error when TreeFS is unset (default).
-	if sk.TreeFS == nil {
+	if skill.TreeFS == nil {
 		return "", fmt.Errorf("unknown topic path: %s", strings.Trim(rest[0], "/"))
 	}
-	// For multi-topic skills, delegate content load through Handle show.
-	// Not used by browser-agent Shape 1.
 	return "", fmt.Errorf("topic paths not supported via package skill load")
 }

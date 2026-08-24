@@ -83,9 +83,9 @@ func (s *controlServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	defer func() {
-		// Only clear if we are still the active conn.
+		// Only start grace if we are still the active connection.
 		if sess.getWS() == wc {
-			sess.markDisconnected()
+			sess.markDisconnectedAfterGrace(wc)
 		}
 		wc.close()
 	}()
@@ -124,6 +124,16 @@ func (s *controlServer) handleWSEnvelope(sess *session, wc *wsConn, env wsEnvelo
 		} else if v, ok := env.Payload["md5"].(string); ok {
 			bundleMD5 = v
 		}
+		extensionCaptureID, _ := env.Payload["har_capture_id"].(string)
+		var pendingEndCaptureIDs []string
+		if raw, ok := env.Payload["har_pending_end_capture_ids"].([]any); ok {
+			for _, value := range raw {
+				if captureID, ok := value.(string); ok && strings.TrimSpace(captureID) != "" {
+					pendingEndCaptureIDs = append(pendingEndCaptureIDs, captureID)
+				}
+			}
+		}
+		harAbortCaptureID := sess.reconcileHARHello(extensionCaptureID, pendingEndCaptureIDs)
 		// Also accept []string via re-marshal if needed — features usually []any from JSON.
 		sess.markHello(version, features, bundleMD5)
 		browserProduct, _ := env.Payload["browser_product"].(string)
@@ -137,9 +147,10 @@ func (s *controlServer) handleWSEnvelope(sess *session, wc *wsConn, env wsEnvelo
 			Type: "status",
 			ID:   env.ID,
 			Payload: map[string]any{
-				"ok":      true,
-				"phase":   PhaseExtensionConnected,
-				"session": sess.id,
+				"ok":                   true,
+				"phase":                PhaseExtensionConnected,
+				"session":              sess.id,
+				"har_abort_capture_id": harAbortCaptureID,
 			},
 		})
 		// Jobs enqueued while the extension was disconnected stay Queued and were
@@ -147,7 +158,7 @@ func (s *controlServer) handleWSEnvelope(sess *session, wc *wsConn, env wsEnvelo
 		s.repushQueuedJobs(sess)
 
 	case "result":
-		s.handleWSResult(sess, env)
+		s.handleWSResult(sess, wc, env)
 
 	case "ping":
 		_ = wc.writeJSON(wsEnvelope{V: 1, Type: "pong", ID: env.ID})
@@ -221,7 +232,7 @@ func (s *controlServer) repushQueuedJobs(sess *session) {
 	}
 }
 
-func (s *controlServer) handleWSResult(sess *session, env wsEnvelope) {
+func (s *controlServer) handleWSResult(sess *session, wc *wsConn, env wsEnvelope) {
 	payload := env.Payload
 	if payload == nil {
 		payload = map[string]any{}
@@ -248,12 +259,64 @@ func (s *controlServer) handleWSResult(sess *session, env wsEnvelope) {
 				sess.id, jobID, errMsg, resultDataSummary(data))
 		}
 	}
-	_ = sess.queue.Complete(jobID, JobResult{
-		JobID: jobID,
-		OK:    ok,
-		Error: errMsg,
-		Data:  data,
-	})
+	ack := s.completeExtensionResult(sess, JobResult{JobID: jobID, OK: ok, Error: errMsg, Data: data})
+	if wc != nil && ack {
+		_ = wc.writeJSON(wsEnvelope{
+			V:    1,
+			Type: "result_ack",
+			ID:   jobID,
+			Payload: map[string]any{
+				"job_id": jobID,
+			},
+		})
+	}
+}
+
+func (s *controlServer) completeExtensionResult(sess *session, result JobResult) bool {
+	sess.extensionResultMu.Lock()
+	defer sess.extensionResultMu.Unlock()
+	if _, seen := sess.extensionResultSeen[result.JobID]; seen {
+		return true
+	}
+
+	job, ok := sess.queue.Get(result.JobID)
+	if !ok {
+		return false
+	}
+	if job.Type == JobTypeHARStart || job.Type == JobTypeHAREnd {
+		capture := sess.harCaptureForJob(job)
+		if capture != nil {
+			switch job.Type {
+			case JobTypeHARStart:
+				if result.OK {
+					sess.confirmHARStart(capture)
+				} else {
+					sess.abortHARCapture(capture)
+				}
+			case JobTypeHAREnd:
+				captureAborted, _ := result.Data["capture_aborted"].(bool)
+				if result.OK {
+					if err := decorateHAREndResult(&result, capture); err != nil {
+						result.OK = false
+						result.Error = err.Error()
+						sess.abortHARCapture(capture)
+					} else {
+						sess.finishHAREnd(capture, &result)
+					}
+				} else if captureAborted || !capture.startIsConfirmed() {
+					sess.abortHARCapture(capture)
+				} else {
+					sess.finishHAREnd(capture, nil)
+				}
+			}
+		}
+	}
+	_, err := sess.queue.CompleteWithPrevious(result.JobID, result)
+	if err != nil {
+		return false
+	}
+	sess.extensionResultSeen[result.JobID] = struct{}{}
+	return true
 }
 
 // pushJob sends a type=job envelope to the connected extension, if any.
@@ -266,7 +329,6 @@ func (s *controlServer) pushJob(sess *session, j Job) bool {
 		}
 		return false
 	}
-	sess.queue.MarkRunning(j.ID)
 	payload := map[string]any{
 		"id":         j.ID,
 		"job_id":     j.ID,
@@ -290,5 +352,6 @@ func (s *controlServer) pushJob(sess *session, j Job) bool {
 		}
 		return false
 	}
+	sess.queue.MarkRunning(j.ID)
 	return true
 }

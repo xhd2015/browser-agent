@@ -199,19 +199,26 @@ func (q *JobQueue) Wait(ctx context.Context, id string) (JobResult, error) {
 // Complete finishes a job with a result. Unknown id → error.
 // Late complete after expired/failed/done is safe (ignored or soft error; status stays non-success if already expired).
 func (q *JobQueue) Complete(id string, res JobResult) error {
+	_, err := q.CompleteWithPrevious(id, res)
+	return err
+}
+
+// CompleteWithPrevious atomically returns the job state observed before completion.
+func (q *JobQueue) CompleteWithPrevious(id string, res JobResult) (Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	j, ok := q.jobs[id]
 	if !ok {
-		return fmt.Errorf("unknown job id %q: not found", id)
+		return Job{}, fmt.Errorf("unknown job id %q: not found", id)
 	}
+	previous := *j
 	if res.JobID == "" {
 		res.JobID = id
 	}
 	switch j.Status {
 	case JobStatusDone, JobStatusFailed, JobStatusExpired:
 		// Late / double complete: do not flip expired → done.
-		return nil
+		return previous, nil
 	}
 	if res.OK {
 		j.Status = JobStatusDone
@@ -223,7 +230,7 @@ func (q *JobQueue) Complete(id string, res JobResult) error {
 	// Remove from FIFO if still queued.
 	q.removeFromOrderLocked(id)
 	q.notifyWaitersLocked(id, res)
-	return nil
+	return previous, nil
 }
 
 // Fail marks a non-terminal job as failed with an error message.

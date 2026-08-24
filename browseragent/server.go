@@ -72,6 +72,8 @@ func (c *controlServer) handler() http.Handler {
 	mux.HandleFunc("/v1/sessions", c.handleSessions)
 	mux.HandleFunc("/v1/session", c.handleSession)
 	mux.HandleFunc("/v1/jobs", c.handleJobs)
+	mux.HandleFunc("/v1/har/artifact", c.handleHARArtifact)
+	mux.HandleFunc("/v1/har/capture", c.handleHARCapture)
 	mux.HandleFunc("/v1/ext/hello", c.handleExtHello)
 	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
 	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
@@ -427,6 +429,32 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	if jobType == "" {
 		jobType = "eval"
 	}
+	if jobType == JobTypeHARStart || jobType == JobTypeHAREnd {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+	}
+
+	if jobType == JobTypeHARStart || jobType == JobTypeHAREnd {
+		if sessionSnapIsFirefox(sess.snapshot()) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(JobResult{
+				OK:    false,
+				Error: fmt.Sprintf("HAR capture is currently supported only for Chrome; session %s uses Firefox", sid),
+			})
+			return
+		}
+	}
+
+	if jobType == JobTypeHAREnd {
+		if completed, ok := sess.completedHAREnd(); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(completed)
+			return
+		}
+	}
 
 	if c.fastFailNoExtension && !sess.isExtensionConnected() {
 		if shouldAlwaysLogJob(jobType, req.Params) {
@@ -444,6 +472,34 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Params == nil {
+		req.Params = make(map[string]any)
+	}
+	var harJobCapture *harCapture
+	var harJobErr error
+	switch jobType {
+	case JobTypeHARStart:
+		harJobCapture, harJobErr = sess.beginHARCapture()
+		if harJobErr == nil {
+			req.Params["capture_id"] = harJobCapture.ID
+			req.Params["artifact_token"] = harJobCapture.Token
+			req.Params["artifact_upload_url"] = c.registry.BaseURL() + "/v1/har/artifact"
+		}
+	case JobTypeHAREnd:
+		harJobCapture, harJobErr = sess.prepareHAREnd()
+		if harJobErr == nil {
+			req.Params["capture_id"] = harJobCapture.ID
+			req.Params["artifact_token"] = harJobCapture.Token
+			req.Params["artifact_upload_url"] = c.registry.BaseURL() + "/v1/har/artifact"
+		}
+	}
+	if harJobErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(JobResult{OK: false, Error: harJobErr.Error()})
+		return
+	}
+
 	enqueued, err := sess.queue.Enqueue(Job{
 		SessionID: sid,
 		Type:      jobType,
@@ -452,6 +508,11 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 		TimeoutMS: timeoutMS,
 	})
 	if err != nil {
+		if jobType == JobTypeHARStart {
+			sess.abortHARCapture(harJobCapture)
+		} else if jobType == JobTypeHAREnd {
+			sess.finishHAREnd(harJobCapture, nil)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -500,6 +561,48 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	if res.JobID == "" {
 		res.JobID = enqueued.ID
 	}
+
+	reconcileLater := false
+	if queued, ok := sess.queue.Get(enqueued.ID); ok {
+		reconcileLater = queued.Status == JobStatusExpired || strings.Contains(res.Error, "extension disconnected")
+	}
+	switch jobType {
+	case JobTypeHARStart:
+		if !res.OK {
+			if reconcileLater {
+				sess.scheduleHARReconciliation(enqueued, harJobCapture)
+			} else {
+				sess.abortHARCapture(harJobCapture)
+			}
+		} else {
+			sess.confirmHARStart(harJobCapture)
+			if res.Data == nil {
+				res.Data = make(map[string]any)
+			}
+			res.Data["capture_id"] = harJobCapture.ID
+			res.Data["started_at"] = harJobCapture.StartedAt.Format(time.RFC3339Nano)
+		}
+	case JobTypeHAREnd:
+		captureAborted, _ := res.Data["capture_aborted"].(bool)
+		if res.OK {
+			if err := decorateHAREndResult(&res, harJobCapture); err != nil {
+				res.OK = false
+				res.Error = err.Error()
+				sess.finishHAREnd(harJobCapture, nil)
+			} else {
+				sess.finishHAREnd(harJobCapture, &res)
+			}
+		} else if captureAborted {
+			sess.abortHARCapture(harJobCapture)
+		} else if reconcileLater {
+			sess.scheduleHARReconciliation(enqueued, harJobCapture)
+		} else if !harJobCapture.startIsConfirmed() {
+			sess.abortHARCapture(harJobCapture)
+		} else {
+			sess.finishHAREnd(harJobCapture, nil)
+		}
+	}
+
 	if !res.OK && res.Data == nil {
 		res.Data = c.jobFailureData(sid)
 	} else if !res.OK && res.Data != nil {

@@ -23,9 +23,9 @@ const briefUsage = `Usage: browser-agent <command> [flags]
 
 Commands:
   serve       Blocking multi-session daemon host (default 127.0.0.1:43761)
-  session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|list
+  session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har|list
   open-managed-chrome Open managed Chrome profile with embedded extension
-  skill       Show/list/install the embedded agent skill
+  skill       Show/list/install embedded agent skills
   install-chrome-extension   Extract Chrome extension; TTY drives Load unpacked UI
   install-firefox-extension  Extract signed .xpi (open in Firefox) + temporary add-on help
   assets      Ensure/status hydrated session-page + extension assets
@@ -59,11 +59,13 @@ Commands:
     session cdp [flags] <Method> [json]
                                        POST a raw CDP job (method + optional params JSON)
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
+    session har start [session-id]      Start Chrome HAR capture for all user tabs
+    session har end [session-id]        End capture; export per-tab HARs and manifest.json
   install-chrome-extension   Extract embedded extension; on TTY, Load unpacked via UI
   install-firefox-extension  Extract signed .xpi, print path, open in Firefox (install prompt)
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
-                             Embedded agent skill (see: browser-agent skill --help)
+                             Embedded agent skills (see: browser-agent skill --help)
   assets ensure|status       Hydrate / report session-page + extension assets
 
 Global flags:
@@ -137,6 +139,12 @@ logs flags:
 
 create-tab flags:
   --url <url>                Optional URL (positional [url] also accepted); omit for blank tab
+
+session har flags:
+  --session-id <id>          Session id (or positional id / BROWSER_AGENT_SESSION_ID)
+  --timeout <ms|duration>    HAR start/end timeout (default 60s)
+  -o, --output-dir <dir>     End destination (default /tmp/browser-agent-<session-slug>/)
+                             Chrome only; captures all current and new user HTTP(S) tabs
 
 install-chrome-extension flags:
   --open                     Force UI Load unpacked even when stdout is not a TTY
@@ -243,9 +251,10 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 }
 
 // cliVersion handles --version with optional --fetch-latest and -v flags.
-//   --version                     Print local embedded version (default).
-//   --version --fetch-latest      Fetch and print latest published version from GitHub.
-//   --version --fetch-latest -v   Verbose: print local + latest and comparison.
+//
+//	--version                     Print local embedded version (default).
+//	--version --fetch-latest      Fetch and print latest published version from GitHub.
+//	--version --fetch-latest -v   Verbose: print local + latest and comparison.
 func cliVersion(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	fetchLatest := false
 	verbose := false
@@ -301,11 +310,11 @@ func cliVersion(args []string, env map[string]string, stdout, stderr io.Writer) 
 }
 
 // cliSession dispatches nested session side-commands:
-// session new|info|delete|eval|run|logs|screenshot|cdp|create-tab …
+// session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har …
 func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|create-tab|list")
+		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har|list")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -330,6 +339,8 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return cliCDP(rest, env, stdout, stderr)
 	case "create-tab", "create_tab":
 		return cliCreateTab(rest, env, stdout, stderr)
+	case "har":
+		return cliSessionHAR(rest, env, stdout, stderr)
 	case "-h", "--help":
 		_, _ = io.WriteString(stdout, fullHelp)
 		if !strings.HasSuffix(fullHelp, "\n") {
@@ -338,7 +349,7 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return nil
 	default:
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, cdp, or create-tab", sub)
+		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, cdp, create-tab, or har", sub)
 	}
 }
 
@@ -1428,7 +1439,7 @@ func takePositional(args []string, n int) string {
 		if a == "--session-id" || a == "--addr" || a == "--host" || a == "--server-port" ||
 			a == "--base-dir" || a == "--root" ||
 			a == "--tab-id" || a == "--tab-index" ||
-			a == "--limit" || a == "--level" || a == "--output" || a == "-o" ||
+			a == "--limit" || a == "--level" || a == "--output" || a == "--output-dir" || a == "-o" ||
 			a == "--url" || a == "--timeout" {
 			skipNext = true
 			continue

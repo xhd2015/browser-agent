@@ -7,6 +7,11 @@ try {
   // bundle-sum.js may be written by serve extract if missing from package.
   console.warn("browser-agent: bundle-sum.js not loaded", e);
 }
+try {
+  importScripts("har-recorder.js");
+} catch (e) {
+  console.error("browser-agent: har-recorder.js not loaded", e);
+}
 const CONTROL_PORT = 43761;
 const WS_PATH = "/v1/ws";
 const EXT_VERSION =
@@ -15,12 +20,22 @@ const EXT_VERSION =
     : "1.0.14";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
-const FEATURES = ["browser-agent"];
+const FEATURES = ["browser-agent", "har-capture"];
 const CDP_PROTOCOL_VERSION = "1.3";
+const HAR_BODY_SETTLE_MS = 2000;
+const HAR_UPLOAD_TIMEOUT_MS = 30000;
+const HAR_NETWORK_BUFFER_SIZE = 10 * 1024 * 1024;
+
+/** Active HAR capture keyed by Browser Agent session id. */
+const harCaptures = new Map();
+/** Active HAR owner keyed by Chrome window id. */
+const harWindowOwners = new Map();
+/** Capture state keyed by enrolled tab id for Network event routing. */
+const harTabs = new Map();
 /** Max wait for chrome.debugger.attach + Runtime.enable (and attachLock-held work). */
 const ATTACH_TIMEOUT_MS = 10000;
 
-/** @type {Map<string, {ws: WebSocket|null, tabId: number|null, windowId: number|null, controlPort: number, reconnectTimer: ReturnType<typeof setTimeout>|null, reconnectAttempt: number, connectTimeoutTimer: ReturnType<typeof setTimeout>|null, keepaliveTimer: ReturnType<typeof setInterval>|null}>} */
+/** @type {Map<string, {ws: WebSocket|null, tabId: number|null, windowId: number|null, controlPort: number, reconnectTimer: ReturnType<typeof setTimeout>|null, reconnectAttempt: number, connectTimeoutTimer: ReturnType<typeof setTimeout>|null, keepaliveTimer: ReturnType<typeof setInterval>|null, pendingResults: Map<string, object>, activeJobIds: Set<string>, completedJobIds: Set<string>}>} */
 const sessions = new Map();
 
 /** Abort hung CONNECTING sockets (ms). */
@@ -193,6 +208,9 @@ function getOrCreateSessionEntry(sessionId) {
       reconnectAttempt: 0,
       connectTimeoutTimer: null,
       keepaliveTimer: null,
+      pendingResults: new Map(),
+      activeJobIds: new Set(),
+      completedJobIds: new Set(),
     };
     sessions.set(sessionId, entry);
   }
@@ -230,11 +248,12 @@ function startKeepalive(sessionId, entry) {
 }
 
 function sendJSON(entry, obj) {
-  if (!entry.ws || entry.ws.readyState !== WebSocket.OPEN) return;
+  if (!entry.ws || entry.ws.readyState !== WebSocket.OPEN) return false;
   try {
     entry.ws.send(JSON.stringify(obj));
+    return true;
   } catch (e) {
-    /* ignore */
+    return false;
   }
 }
 
@@ -266,6 +285,20 @@ async function buildSessionTelemetry(sessionId) {
   };
 }
 
+function pendingHAREndCaptureIDs(entry) {
+  const ids = [];
+  if (!entry || !entry.pendingResults) return ids;
+  for (const message of entry.pendingResults.values()) {
+    const result = message && message.payload;
+    const data = result && result.data;
+    const captureId = data && data.type === "har_end" && result.ok
+      ? String(data.capture_id || "")
+      : "";
+    if (captureId && !ids.includes(captureId)) ids.push(captureId);
+  }
+  return ids;
+}
+
 async function sendHello(sessionId, entry) {
   const telemetry = await buildSessionTelemetry(sessionId);
   const payload = {
@@ -275,10 +308,18 @@ async function sendHello(sessionId, entry) {
     session_page_count: telemetry.session_page_count,
     session_pages: telemetry.session_pages,
   };
+  const capture = harCaptures.get(sessionId);
+  if (capture && capture.captureId) {
+    payload.har_capture_id = capture.captureId;
+  }
+  const pendingEndCaptureIDs = pendingHAREndCaptureIDs(entry);
+  if (pendingEndCaptureIDs.length > 0) {
+    payload.har_pending_end_capture_ids = pendingEndCaptureIDs;
+  }
   if (EXT_BUNDLE_MD5) {
     payload.bundle_md5 = EXT_BUNDLE_MD5;
   }
-  sendJSON(entry, {
+  return sendJSON(entry, {
     v: 1,
     type: "hello",
     payload: payload,
@@ -424,7 +465,7 @@ function handleGetStatus(msg, sendResponse) {
     Promise.all(
       sessionIds.map((id) => detachSessionDebugger(id).catch(() => {})),
     ).then(() => {
-      const leftovers = Array.from(attachedTabs.keys());
+      const leftovers = Array.from(attachedTabs.keys()).filter((tid) => !isHAROwnedTab(tid));
       return Promise.all(leftovers.map((tid) => detachDebugger(tid).catch(() => {})));
     });
   }, 0);
@@ -543,7 +584,9 @@ function connectSession(sessionId, reason) {
   socket.onopen = () => {
     clearConnectTimeout(entry);
     entry.reconnectAttempt = 0;
-    sendHello(sessionId, entry).catch(() => {});
+    sendHello(sessionId, entry)
+      .then(() => flushPendingJobResults(entry))
+      .catch(() => {});
     startKeepalive(sessionId, entry);
   };
 
@@ -579,7 +622,16 @@ function unregisterSession(sessionId) {
   const entry = sessions.get(sessionId);
   if (!entry) return;
   // Tear down chrome.debugger held by this session (leave / last control tab gone).
-  detachSessionDebugger(sessionId);
+  const activeCapture = harCaptures.get(sessionId);
+  if (activeCapture) {
+    activeCapture.partial = true;
+    activeCapture.warnings.push("session unregistered while HAR capture was active");
+    rollbackHARCapture(activeCapture, true)
+      .catch(() => {})
+      .finally(() => detachSessionDebugger(sessionId).catch(() => {}));
+  } else {
+    detachSessionDebugger(sessionId);
+  }
   if (entry.reconnectTimer) {
     clearTimeout(entry.reconnectTimer);
     entry.reconnectTimer = null;
@@ -598,40 +650,61 @@ function unregisterSession(sessionId) {
   sessionAttachState.delete(sessionId);
 }
 
-function isSessionGoPageURL(url, sessionId) {
-  if (!url || typeof url !== "string") return false;
-  const u = url.trim();
-  if (!u.includes("/go")) return false;
-  if (!sessionId) return u.includes("/go");
-  return (
-    u.includes("/go?session=" + sessionId) ||
-    u.includes("/go?session=" + encodeURIComponent(sessionId))
-  );
-}
-
-function parseGoSessionFromURL(url) {
+function parseSessionGoPageURL(url) {
   if (!url || typeof url !== "string") return null;
   try {
     const parsed = new URL(url);
+    const protocol = (parsed.protocol || "").toLowerCase();
+    if (protocol !== "http:" && protocol !== "https:") return null;
     const host = (parsed.hostname || "").toLowerCase();
-    if (host !== "127.0.0.1" && host !== "localhost") return null;
-    const path = (parsed.pathname || "").toLowerCase();
-    if (!path.includes("/go")) return null;
-    const sessionId = parsed.searchParams.get("session");
-    if (!sessionId) return null;
-    let controlPort = CONTROL_PORT;
-    if (parsed.port) {
-      const p = parseInt(parsed.port, 10);
-      if (!Number.isNaN(p) && p > 0) controlPort = p;
-    } else if (parsed.protocol === "https:") {
-      controlPort = 443;
-    } else if (parsed.protocol === "http:") {
-      controlPort = 80;
+    if (
+      host !== "127.0.0.1" &&
+      host !== "localhost" &&
+      host !== "::1" &&
+      host !== "[::1]"
+    ) {
+      return null;
     }
-    return { sessionId: sessionId, controlPort: controlPort };
+    if (parsed.pathname !== "/go") return null;
+    return parsed;
   } catch (e) {
     return null;
   }
+}
+
+function isSessionGoPageURL(url, sessionId) {
+  const parsed = parseSessionGoPageURL(url);
+  if (!parsed) return false;
+  if (!sessionId) return true;
+  return parsed.searchParams.get("session") === String(sessionId);
+}
+
+function isSessionGoPageURLAtPort(url, controlPort) {
+  const parsed = parseSessionGoPageURL(url);
+  if (!parsed) return false;
+  const port = parsed.port
+    ? parseInt(parsed.port, 10)
+    : parsed.protocol === "https:"
+      ? 443
+      : 80;
+  return port === Number(controlPort);
+}
+
+function parseGoSessionFromURL(url) {
+  const parsed = parseSessionGoPageURL(url);
+  if (!parsed) return null;
+  const sessionId = parsed.searchParams.get("session");
+  if (!sessionId) return null;
+  let controlPort = CONTROL_PORT;
+  if (parsed.port) {
+    const p = parseInt(parsed.port, 10);
+    if (!Number.isNaN(p) && p > 0) controlPort = p;
+  } else if (parsed.protocol === "https:") {
+    controlPort = 443;
+  } else if (parsed.protocol === "http:") {
+    controlPort = 80;
+  }
+  return { sessionId: sessionId, controlPort: controlPort };
 }
 
 function maybeRegisterGoTab(tabId, url, tab) {
@@ -645,7 +718,7 @@ function maybeRegisterGoTab(tabId, url, tab) {
       tabId: tabId,
       windowId: tab && tab.windowId,
     },
-    { tab: { id: tabId, windowId: tab && tab.windowId } },
+    { tab: { id: tabId, windowId: tab && tab.windowId, url: url } },
   );
 }
 
@@ -695,8 +768,9 @@ function detachSessionDebugger(sessionId) {
   }
   const run = async () => {
     const tabIds = Array.from(state.attachedTabIds || []);
-    state.attachedTabIds.clear();
     for (const tabId of tabIds) {
+      if (isHAROwnedTab(tabId)) continue;
+      state.attachedTabIds.delete(tabId);
       await detachDebugger(tabId);
     }
   };
@@ -730,18 +804,18 @@ async function handleSessionControlLeave(sessionId) {
 }
 
 function handleRegisterMessage(msg, sender) {
-  const sessionId = msg.session_id || msg.sessionId || "";
-  if (!sessionId) return;
+  const claimedSessionId = msg.session_id || msg.sessionId || "";
+  const senderURL =
+    (sender && sender.tab && sender.tab.url) || (sender && sender.url) || "";
+  const parsed = parseGoSessionFromURL(senderURL);
+  if (!claimedSessionId || !parsed || parsed.sessionId !== claimedSessionId) return false;
+  const sessionId = parsed.sessionId;
+  const senderTab = sender && sender.tab;
+  if (!senderTab || senderTab.id == null || senderTab.windowId == null) return false;
   const entry = getOrCreateSessionEntry(sessionId);
-  const tabId = msg.tabId != null ? msg.tabId : sender && sender.tab && sender.tab.id;
-  const windowId =
-    msg.windowId != null ? msg.windowId : sender && sender.tab && sender.tab.windowId;
-  const controlPort =
-    msg.control_port != null
-      ? msg.control_port
-      : msg.controlPort != null
-        ? msg.controlPort
-        : entry.controlPort;
+  const tabId = senderTab.id;
+  const windowId = senderTab.windowId;
+  const controlPort = parsed.controlPort;
   if (tabId != null) entry.tabId = tabId;
   if (windowId != null) entry.windowId = windowId;
   if (controlPort != null && !Number.isNaN(controlPort) && controlPort > 0) {
@@ -752,13 +826,16 @@ function handleRegisterMessage(msg, sender) {
   // delays/blocks the toolbar default_popup for tens of seconds. Content tabs still
   // eager-attach on create_tab / navigate (P2); jobs attach on demand.
   connectSession(sessionId, "register");
+  return true;
 }
 
 function handleRegisterFromMessage(msg, sender, sendResponse) {
-  handleRegisterMessage(msg, sender);
+  const registered = handleRegisterMessage(msg, sender);
   // Ack so content-script / page burst retries can stop early after SW is live.
   try {
-    sendResponse({ ok: true, type: "register_ack" });
+    sendResponse(registered
+      ? { ok: true, type: "register_ack" }
+      : { ok: false, type: "register_rejected" });
   } catch (e) {
     /* channel closed */
   }
@@ -803,6 +880,7 @@ try {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  closeHARTab(tabId);
   // Re-query remaining control tabs for every session (multi-tab safe).
   // Do not trust entry.tabId alone — last register wins and would wrongly disarm.
   const sessionIds = Array.from(sessions.keys());
@@ -816,6 +894,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  updateHARTabFromChrome(tabId, changeInfo, tab).catch(() => {});
   const url = (changeInfo && changeInfo.url) || (tab && tab.url) || "";
   if (url) {
     if (changeInfo.status === "loading" || changeInfo.status === "complete") {
@@ -856,6 +935,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
+  if (tab && tab.id != null) updateHARTabFromChrome(tab.id, {}, tab).catch(() => {});
   // P2 eager arm: auto-attach newly opened capturable tabs in armed session windows.
   if (!tab || tab.id == null || tab.windowId == null) return;
   const tabUrl = tab.url || tab.pendingUrl || "";
@@ -976,9 +1056,26 @@ try {
   // alarms permission optional in mini fixtures
 }
 
+function handleHARStatus(msg, sessionId) {
+  const payload = msg && msg.payload;
+  const abortCaptureId = payload && String(payload.har_abort_capture_id || "");
+  if (!abortCaptureId) return;
+  const capture = harCaptures.get(sessionId);
+  if (!capture || capture.captureId !== abortCaptureId) return;
+  rollbackHARCapture(capture, false).catch(() => {});
+}
+
 function handleMessage(msg, sessionId, entry) {
   if (!msg || typeof msg !== "object") return;
   const type = msg.type;
+  if (type === "result_ack") {
+    handleResultAck(msg, entry);
+    return;
+  }
+  if (type === "status") {
+    handleHARStatus(msg, sessionId);
+    return;
+  }
   if (type === "prepare_reconnect") {
     handlePrepareReconnect(msg, sessionId, entry);
     return;
@@ -988,8 +1085,21 @@ function handleMessage(msg, sessionId, entry) {
   }
 }
 
+function flushPendingJobResults(entry) {
+  if (!entry || !entry.pendingResults) return;
+  for (const message of entry.pendingResults.values()) {
+    if (!sendJSON(entry, message)) return;
+  }
+}
+
+function handleResultAck(msg, entry) {
+  const payload = msg && msg.payload;
+  const jobId = String((payload && (payload.job_id || payload.id)) || (msg && msg.id) || "");
+  if (jobId && entry && entry.pendingResults) entry.pendingResults.delete(jobId);
+}
+
 function sendJobResult(entry, jobId, ok, data, error) {
-  sendJSON(entry, {
+  const message = {
     v: 1,
     type: "result",
     id: jobId,
@@ -1000,7 +1110,438 @@ function sendJobResult(entry, jobId, ok, data, error) {
       error: error || "",
       data: data || {},
     },
+  };
+  if (entry && entry.pendingResults) entry.pendingResults.set(jobId, message);
+  sendJSON(entry, message);
+}
+
+function claimJobExecution(entry, jobId) {
+  jobId = String(jobId || "");
+  if (!entry || !jobId) return true;
+  if (entry.pendingResults && entry.pendingResults.has(jobId)) {
+    sendJSON(entry, entry.pendingResults.get(jobId));
+    return false;
+  }
+  if (!entry.activeJobIds) entry.activeJobIds = new Set();
+  if (!entry.completedJobIds) entry.completedJobIds = new Set();
+  if (entry.activeJobIds.has(jobId) || entry.completedJobIds.has(jobId)) return false;
+  entry.activeJobIds.add(jobId);
+  return true;
+}
+
+function finishJobExecution(entry, jobId) {
+  jobId = String(jobId || "");
+  if (!entry || !jobId) return;
+  if (!entry.activeJobIds) entry.activeJobIds = new Set();
+  if (!entry.completedJobIds) entry.completedJobIds = new Set();
+  entry.activeJobIds.delete(jobId);
+  entry.completedJobIds.add(jobId);
+  while (entry.completedJobIds.size > 1024) {
+    entry.completedJobIds.delete(entry.completedJobIds.values().next().value);
+  }
+}
+
+function isHARCapturedTab(tabId) {
+  return harTabs.has(Number(tabId));
+}
+
+function isHAROwnedTab(tabId) {
+  tabId = Number(tabId);
+  if (harTabs.has(tabId)) return true;
+  for (const capture of harCaptures.values()) {
+    if (capture && capture.enrolling && capture.enrolling.has(tabId)) return true;
+  }
+  return false;
+}
+
+function harErrorMessage(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+function validateHARUploadURL(rawURL, controlPort) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawURL || ""));
+  } catch (error) {
+    throw new Error("HAR artifact upload URL is invalid");
+  }
+  const host = (parsed.hostname || "").toLowerCase();
+  const port = parsed.port
+    ? parseInt(parsed.port, 10)
+    : parsed.protocol === "https:"
+      ? 443
+      : 80;
+  const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  if (
+    parsed.protocol !== "http:" ||
+    !loopback ||
+    port !== Number(controlPort) ||
+    parsed.pathname !== "/v1/har/artifact" ||
+    parsed.username ||
+    parsed.password
+  ) {
+    throw new Error("HAR artifact upload URL must use the session control server");
+  }
+  return parsed.toString();
+}
+
+function isHAREligibleTab(tab, capture) {
+  if (!capture || !tab || tab.id == null || tab.windowId !== capture.windowId) return false;
+  const url = tab.url || tab.pendingUrl || "";
+  return isCapturableTabURL(url) && !isSessionGoPageURLAtPort(url, capture.controlPort);
+}
+
+async function enableHARNetwork(tabId) {
+  await sendDebuggerCommand(tabId, "Network.enable", {
+    maxPostDataSize: HAR_NETWORK_BUFFER_SIZE,
+    maxTotalBufferSize: HAR_NETWORK_BUFFER_SIZE,
+    maxResourceBufferSize: HAR_NETWORK_BUFFER_SIZE,
   });
+}
+
+async function enrollHARTab(capture, tab, initial) {
+  if (!capture || capture.stopping || !isHAREligibleTab(tab, capture)) {
+    return null;
+  }
+  const updateIdentity = (state) => {
+    state.title = tab.title || state.title;
+    state.url = tab.url || tab.pendingUrl || state.url;
+    return state;
+  };
+  if (capture.tabs.has(tab.id)) {
+    return updateIdentity(capture.tabs.get(tab.id));
+  }
+
+  let enrollment = capture.enrolling.get(tab.id);
+  if (!enrollment) {
+    const wasAttached = attachedTabs.has(tab.id);
+    enrollment = (async () => {
+      try {
+        await attachDebuggerForSession(capture.sessionId, tab.id);
+        await enableHARNetwork(tab.id);
+        if (capture.stopping) throw new Error("capture is stopping");
+        const recorder = new BrowserAgentHAR.Recorder(tab.id, {
+          controlPort: capture.controlPort,
+          creatorVersion: EXT_VERSION,
+          sendCommand: (method, params) => sendDebuggerCommand(tab.id, method, params),
+        });
+        const state = {
+          tabId: tab.id,
+          title: tab.title || "",
+          url: tab.url || tab.pendingUrl || "",
+          state: "open",
+          recorder,
+          errors: [],
+          wasAttached,
+          uploaded: false,
+          uploadPromise: null,
+          snapshot: null,
+          snapshotJSON: "",
+          snapshotResult: null,
+        };
+        capture.tabs.set(tab.id, state);
+        harTabs.set(tab.id, { capture, state, routing: true });
+        return state;
+      } catch (error) {
+        if (!wasAttached) {
+          const attachState = sessionAttachState.get(capture.sessionId);
+          if (attachState && attachState.attachedTabIds) attachState.attachedTabIds.delete(tab.id);
+          await detachDebugger(tab.id, true).catch(() => {});
+        }
+        throw new Error("tab " + tab.id + " enrollment failed: " + harErrorMessage(error));
+      }
+    })();
+    capture.enrolling.set(tab.id, enrollment);
+  }
+
+  try {
+    return updateIdentity(await enrollment);
+  } catch (error) {
+    const message = harErrorMessage(error);
+    if (initial) throw error;
+    capture.partial = true;
+    if (!capture.enrollmentFailures.has(tab.id)) {
+      capture.enrollmentFailures.add(tab.id);
+      capture.warnings.push(message);
+    }
+    return null;
+  } finally {
+    if (capture.enrolling.get(tab.id) === enrollment) {
+      capture.enrolling.delete(tab.id);
+    }
+  }
+}
+
+function stopHARRouting(capture) {
+  if (!capture) return;
+  for (const routed of harTabs.values()) {
+    if (routed && routed.capture === capture) routed.routing = false;
+  }
+}
+
+async function waitForHAREnrollments(capture) {
+  while (capture.enrolling.size > 0) {
+    await Promise.allSettled(Array.from(capture.enrolling.values()));
+  }
+}
+
+async function rollbackHARCapture(capture, forceDetach) {
+  if (!capture) return;
+  capture.stopping = true;
+  stopHARRouting(capture);
+  await waitForHAREnrollments(capture);
+  stopHARRouting(capture);
+  const attachState = sessionAttachState.get(capture.sessionId);
+  for (const state of capture.tabs.values()) {
+    const routed = harTabs.get(state.tabId);
+    if (routed && routed.capture === capture) harTabs.delete(state.tabId);
+    if (forceDetach || !state.wasAttached) {
+      if (attachState && attachState.attachedTabIds) attachState.attachedTabIds.delete(state.tabId);
+      await detachDebugger(state.tabId, true).catch(() => {});
+    }
+  }
+  capture.tabs.clear();
+  harCaptures.delete(capture.sessionId);
+  if (harWindowOwners.get(capture.windowId) === capture.sessionId) {
+    harWindowOwners.delete(capture.windowId);
+  }
+}
+
+function freezeHARSnapshot(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) freezeHARSnapshot(child);
+  return Object.freeze(value);
+}
+
+function harTabResult(state) {
+  if (state.snapshotResult) return state.snapshotResult;
+  const har = state.recorder.buildHAR();
+  const entries = (har.log && har.log.entries) || [];
+  const recorderErrors = state.recorder.errors || [];
+  const errors = state.errors.concat(recorderErrors.map((item) => item.error || String(item)));
+  return {
+    tab_id: state.tabId,
+    title: state.title || "",
+    url: state.url || "",
+    state: state.state,
+    request_count: entries.length,
+    error_count: errors.length,
+    errors,
+  };
+}
+
+function snapshotHARTab(state) {
+  if (state.snapshot) return;
+  state.snapshot = freezeHARSnapshot(state.recorder.buildHAR());
+  state.snapshotJSON = JSON.stringify(state.snapshot);
+  const entries = (state.snapshot.log && state.snapshot.log.entries) || [];
+  const recorderErrors = state.recorder.errors || [];
+  const errors = state.errors.concat(recorderErrors.map((item) => item.error || String(item)));
+  state.snapshotResult = freezeHARSnapshot({
+    tab_id: state.tabId,
+    title: state.title || "",
+    url: state.url || "",
+    state: state.state,
+    request_count: entries.length,
+    error_count: errors.length,
+    errors,
+  });
+}
+
+async function finalizeHARCapture(capture) {
+  if (capture.snapshotsReady) return;
+  if (capture.finalizePromise) return capture.finalizePromise;
+  capture.stopping = true;
+  stopHARRouting(capture);
+  capture.finalizePromise = (async () => {
+    await waitForHAREnrollments(capture);
+    stopHARRouting(capture);
+    const states = Array.from(capture.tabs.values());
+    const flushes = await Promise.all(
+      states.map((state) => state.recorder.flush(HAR_BODY_SETTLE_MS)),
+    );
+    for (let index = 0; index < states.length; index += 1) {
+      const state = states[index];
+      const flush = flushes[index] || {};
+      if (flush.partial) capture.partial = true;
+      if (flush.timedOut) {
+        capture.warnings.push(
+          "tab " + state.tabId + " response body flush timed out with " +
+            (flush.pendingBodyCount || 0) + " pending request(s)",
+        );
+      }
+      snapshotHARTab(state);
+    }
+    capture.snapshotsReady = true;
+  })();
+  try {
+    await capture.finalizePromise;
+  } finally {
+    capture.finalizePromise = null;
+  }
+}
+
+async function uploadHARTab(capture, state) {
+  if (state.uploaded) return;
+  if (state.uploadPromise) return state.uploadPromise;
+  if (!state.snapshot || !state.snapshotJSON) {
+    throw new Error("HAR snapshot for tab " + state.tabId + " is unavailable");
+  }
+  state.uploadPromise = (async () => {
+    const url = new URL(capture.uploadURL);
+    url.searchParams.set("session", capture.sessionId);
+    url.searchParams.set("capture", capture.captureId);
+    url.searchParams.set("token", capture.artifactToken);
+    url.searchParams.set("tab_id", String(state.tabId));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HAR_UPLOAD_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(url.toString(), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: state.snapshotJSON,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("upload HAR for tab " + state.tabId + " timed out");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      const error = new Error("upload HAR for tab " + state.tabId + " failed: HTTP " + response.status + (detail ? " " + detail.trim() : ""));
+      error.harPermanentUploadFailure = response.status >= 400 && response.status < 500;
+      throw error;
+    }
+    state.uploaded = true;
+  })();
+  try {
+    await state.uploadPromise;
+  } finally {
+    state.uploadPromise = null;
+  }
+}
+
+async function handleHARStartJob(params, sessionId) {
+  if (typeof BrowserAgentHAR === "undefined" || typeof BrowserAgentHAR.Recorder !== "function") {
+    throw new Error("HAR recorder module is unavailable");
+  }
+  if (harCaptures.has(sessionId)) {
+    throw new Error("HAR capture is already active for this session");
+  }
+  const entry = sessions.get(sessionId);
+  if (!entry || entry.windowId == null) {
+    throw new Error("session page not bound (windowId missing); open /go?session=" + sessionId);
+  }
+  const owner = harWindowOwners.get(entry.windowId);
+  if (owner && owner !== sessionId) {
+    throw new Error("Chrome window " + entry.windowId + " already has an active HAR capture owned by session " + owner);
+  }
+  const captureId = String(params.capture_id || "");
+  const artifactToken = String(params.artifact_token || "");
+  const rawUploadURL = String(params.artifact_upload_url || "");
+  if (!captureId || !artifactToken || !rawUploadURL) {
+    throw new Error("HAR start is missing daemon artifact parameters");
+  }
+  const controlPort = entry.controlPort || CONTROL_PORT;
+  const uploadURL = validateHARUploadURL(rawUploadURL, controlPort);
+  const capture = {
+    sessionId,
+    captureId,
+    artifactToken,
+    uploadURL,
+    controlPort,
+    windowId: entry.windowId,
+    startedAt: new Date().toISOString(),
+    tabs: new Map(),
+    enrolling: new Map(),
+    enrollmentFailures: new Set(),
+    warnings: [],
+    partial: false,
+    stopping: false,
+    snapshotsReady: false,
+    finalizePromise: null,
+  };
+  harCaptures.set(sessionId, capture);
+  harWindowOwners.set(entry.windowId, sessionId);
+  try {
+    const tabs = await chrome.tabs.query({ windowId: entry.windowId });
+    for (const tab of tabs || []) {
+      if (!isHAREligibleTab(tab, capture)) continue;
+      await enrollHARTab(capture, tab, true);
+    }
+  } catch (error) {
+    await rollbackHARCapture(capture);
+    throw error;
+  }
+  return {
+    type: "har_start",
+    capture_id: captureId,
+    window_id: capture.windowId,
+    tab_count: capture.tabs.size,
+    tabs: Array.from(capture.tabs.values()).map(harTabResult),
+  };
+}
+
+async function handleHAREndJob(params, sessionId) {
+  const capture = harCaptures.get(sessionId);
+  if (!capture) throw new Error("no active HAR capture for this session");
+  if (String(params.capture_id || "") !== capture.captureId) {
+    throw new Error("HAR capture id does not match the active capture");
+  }
+  capture.stopping = true;
+  stopHARRouting(capture);
+  await finalizeHARCapture(capture);
+  try {
+    for (const state of capture.tabs.values()) {
+      await uploadHARTab(capture, state);
+    }
+  } catch (error) {
+    if (error && error.harPermanentUploadFailure) {
+      error.harCaptureAborted = true;
+      error.harCaptureId = capture.captureId;
+      await rollbackHARCapture(capture, false);
+    }
+    throw error;
+  }
+  const tabs = Array.from(capture.tabs.values()).map(harTabResult);
+  const result = {
+    type: "har_end",
+    capture_id: capture.captureId,
+    window_id: capture.windowId,
+    tab_count: tabs.length,
+    partial: capture.partial || tabs.some((tab) => tab.error_count > 0),
+    warnings: capture.warnings.slice(),
+    tabs,
+  };
+  await rollbackHARCapture(capture);
+  return result;
+}
+
+async function updateHARTabFromChrome(tabId, changeInfo, tab) {
+  for (const capture of harCaptures.values()) {
+    if (!tab || tab.windowId !== capture.windowId || capture.stopping) continue;
+    const state = capture.tabs.get(tabId);
+    if (state) {
+      if (tab.title) state.title = tab.title;
+      if (tab.url || tab.pendingUrl) state.url = tab.url || tab.pendingUrl;
+      continue;
+    }
+    if (isHAREligibleTab(tab, capture)) {
+      await enrollHARTab(capture, tab, false);
+    }
+  }
+}
+
+function closeHARTab(tabId) {
+  const routed = harTabs.get(tabId);
+  if (!routed) return;
+  routed.state.state = "closed";
+  harTabs.delete(tabId);
 }
 
 async function handleJob(msg, sessionId, entry) {
@@ -1009,6 +1550,8 @@ async function handleJob(msg, sessionId, entry) {
   const jobId = payload.job_id || payload.id || msg.id || "";
   const jobType = payload.type || payload.job_type || "eval";
   const params = payload.params || {};
+
+  if (!claimJobExecution(entry, jobId)) return;
 
   const targetOpts = {
     tabId: payload.tab_id != null ? payload.tab_id : params.tab_id,
@@ -1052,6 +1595,12 @@ async function handleJob(msg, sessionId, entry) {
       case "create_tab":
         data = await handleCreateTabJob(params, jobSessionId);
         break;
+      case "har_start":
+        data = await handleHARStartJob(params, jobSessionId);
+        break;
+      case "har_end":
+        data = await handleHAREndJob(params, jobSessionId);
+        break;
       default:
         baLog("error", "job unknown type", { job_id: jobId, type: jobType });
         sendJobResult(entry, jobId, false, { type: jobType }, "unknown job type: " + jobType);
@@ -1080,7 +1629,14 @@ async function handleJob(msg, sessionId, entry) {
       error: errMsg,
       params: baSummarizeParams(jobType, params),
     });
-    sendJobResult(entry, jobId, false, { type: jobType, stub: false }, errMsg);
+    const failureData = { type: jobType, stub: false };
+    if (e && e.harCaptureAborted) {
+      failureData.capture_aborted = true;
+      failureData.capture_id = e.harCaptureId || String(params.capture_id || "");
+    }
+    sendJobResult(entry, jobId, false, failureData, errMsg);
+  } finally {
+    finishJobExecution(entry, jobId);
   }
 }
 
@@ -1606,23 +2162,13 @@ async function pickTargetTabIdForSession(sessionId, opts) {
     }
   }
 
-  const needles = [
-    "/go?session=" + sessionId,
-    "/go?session=" + encodeURIComponent(sessionId),
-    "go?session=" + sessionId,
-    "go?session=" + encodeURIComponent(sessionId),
-  ];
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs || []) {
       if (t.id == null) continue;
       const url = t.url || "";
       if (!isCapturableTabURL(url)) continue;
-      for (const needle of needles) {
-        if (url.includes(needle)) {
-          return t.id;
-        }
-      }
+      if (isSessionGoPageURL(url, sessionId)) return t.id;
     }
   } catch (e) {
     /* ignore */
@@ -1630,15 +2176,19 @@ async function pickTargetTabIdForSession(sessionId, opts) {
   throw new Error("no capturable tab for session " + sessionId);
 }
 
-function detachDebugger(tabId) {
+function detachDebugger(tabId, force) {
   return new Promise((resolve) => {
+    if (isHARCapturedTab(tabId) && !force) {
+      resolve(false);
+      return;
+    }
     if (!attachedTabs.has(tabId)) {
-      resolve();
+      resolve(false);
       return;
     }
     chrome.debugger.detach({ tabId: tabId }, () => {
       attachedTabs.delete(tabId);
-      resolve();
+      resolve(true);
     });
   });
 }
@@ -1729,6 +2279,10 @@ const DEBUGGER_IDLE_DETACH_MS = 5 * 60 * 1000;
 /** @type {ReturnType<typeof setTimeout>|null} */
 let debuggerIdleDetachTimer = null;
 
+function idleDebuggerLeftoverTabIDs() {
+  return Array.from(attachedTabs.keys()).filter((tabId) => !isHAROwnedTab(tabId));
+}
+
 function scheduleDebuggerIdleDetach() {
   if (debuggerIdleDetachTimer) {
     clearTimeout(debuggerIdleDetachTimer);
@@ -1747,7 +2301,7 @@ function scheduleDebuggerIdleDetach() {
       sessionIds.map((id) => detachSessionDebugger(id).catch(() => {})),
     ).then(() => {
       // Safety: clear any orphans not tracked in session state.
-      const leftovers = Array.from(attachedTabs.keys());
+      const leftovers = idleDebuggerLeftoverTabIDs();
       return Promise.all(leftovers.map((tid) => detachDebugger(tid).catch(() => {})));
     });
   }, DEBUGGER_IDLE_DETACH_MS);
@@ -1950,6 +2504,10 @@ async function withDebuggerForSession(sessionId, fn, opts) {
 
 try {
   chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (source && source.tabId != null && typeof method === "string" && method.startsWith("Network.")) {
+      const routed = harTabs.get(source.tabId);
+      if (routed && routed.routing) routed.state.recorder.handle(method, params || {});
+    }
     if (method === "Runtime.consoleAPICalled" && params) {
       const entry = {
         level: params.type || "log",
@@ -1975,8 +2533,17 @@ try {
       }
     }
   });
-  chrome.debugger.onDetach.addListener((source) => {
+  chrome.debugger.onDetach.addListener((source, reason) => {
     if (source && source.tabId != null) {
+      const routed = harTabs.get(source.tabId);
+      if (routed && !routed.capture.snapshotsReady) {
+        const message = "debugger detached while recording" + (reason ? ": " + reason : "");
+        routed.capture.partial = true;
+        routed.capture.warnings.push("tab " + source.tabId + " " + message);
+        routed.state.errors.push(message);
+        routed.state.state = "detached";
+      }
+      if (routed) harTabs.delete(source.tabId);
       attachedTabs.delete(source.tabId);
       for (const state of sessionAttachState.values()) {
         if (state && state.attachedTabIds) {

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "session_id": "sess-partial",
+  "capture_id": "cap-1",
+  "browser": "chrome",
+  "partial": true,
+  "tab_count": 1,
+  "request_count": 7,
+  "error_count": 3,
+  "tabs": [
+    {
+      "tab_id": 9,
+      "title": "App",
+      "url": "https://app.example.com/",
+      "state": "open",
+      "request_count": 7,
+      "error_count": 3,
+      "file": "tab-9-app.har"
+    }
+  ]
+}

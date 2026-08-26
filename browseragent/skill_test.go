@@ -27,7 +27,9 @@ func TestEmbeddedSkillListAndShow(t *testing.T) {
 	if err := HandleCLI([]string{"skill", "--show", "browser-agent-to-api"}, nil, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "name: browser-agent-to-api\n") || !strings.Contains(stdout.String(), "session har start") {
+	if !strings.Contains(stdout.String(), "name: browser-agent-to-api\n") ||
+		!strings.Contains(stdout.String(), "session har start") ||
+		!strings.Contains(stdout.String(), "har inspect") {
 		t.Fatalf("named show = %q", stdout.String())
 	}
 

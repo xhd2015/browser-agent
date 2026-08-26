@@ -121,6 +121,11 @@ browser-agent session har start sess-xxxxxx
 # perform the browser flow
 browser-agent session har end sess-xxxxxx
 # output: /tmp/browser-agent-sess-xxxxxx/manifest.json and tab-*.har
+
+# Offline inspect (no live session)
+browser-agent har inspect summary /tmp/browser-agent-sess-xxxxxx
+browser-agent har inspect paths /tmp/browser-agent-sess-xxxxxx --host app.example.com
+browser-agent har inspect show /tmp/browser-agent-sess-xxxxxx --match /api/example --json
 ```
 
 ## Agent skills

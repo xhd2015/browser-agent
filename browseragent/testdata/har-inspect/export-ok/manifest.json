@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "session_id": "sess-test",
+  "capture_id": "cap-1",
+  "browser": "chrome",
+  "partial": false,
+  "tab_count": 2,
+  "request_count": 7,
+  "error_count": 0,
+  "tabs": [
+    {
+      "tab_id": 1,
+      "title": "App",
+      "url": "https://app.example.com/",
+      "state": "open",
+      "request_count": 7,
+      "error_count": 0,
+      "file": "tab-1-app.har"
+    },
+    {
+      "tab_id": 2,
+      "title": "Quiet",
+      "url": "https://app.example.com/quiet",
+      "state": "open",
+      "request_count": 0,
+      "error_count": 0,
+      "file": "tab-2-quiet.har"
+    }
+  ]
+}

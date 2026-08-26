@@ -138,6 +138,11 @@ browser-agent session har start sess-xqbsmo
 browser-agent session har end sess-xqbsmo
 browser-agent session har end sess-xqbsmo --output-dir /tmp/my-har-capture
 
+# Offline HAR inspect (no live session)
+browser-agent har inspect summary /tmp/browser-agent-sess-xqbsmo
+browser-agent har inspect paths /tmp/browser-agent-sess-xqbsmo --host app.example.com
+browser-agent har inspect show /tmp/browser-agent-sess-xqbsmo --match /api/example --json
+
 # CDP (page-scoped; prefer create-tab over Target.createTarget)
 browser-agent session cdp --session-id sess-xqbsmo Page.navigate '{"url":"https://example.com"}'
 browser-agent session cdp --session-id sess-xqbsmo --tab-id 216774025 Page.navigate '{"url":"https://example.com"}'

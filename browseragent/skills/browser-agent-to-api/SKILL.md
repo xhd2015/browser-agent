@@ -43,19 +43,20 @@ HAR files can contain authorization headers, cookies, request bodies, and sensit
 
 ## Inspect the export
 
-Read `manifest.json` first. It records the capture status, warnings, aggregate counts, and one HAR filename per tab.
+Use offline inspect commands (no live session required). Start with summary, then path inventory, then show the create/mutation calls:
 
 ```bash
-python3 - <<'PY' /tmp/browser-agent-<session-slug>/manifest.json
-import json, sys
-manifest = json.load(open(sys.argv[1]))
-print(json.dumps(manifest, indent=2))
-PY
+DIR=/tmp/browser-agent-<session-slug>
+
+browser-agent har inspect summary "$DIR"
+browser-agent har inspect paths "$DIR" --host <app-host>
+browser-agent har inspect entries "$DIR" --host <app-host> --method POST --limit 50
+browser-agent har inspect show "$DIR" --match /api/example --json
 ```
 
-Treat `partial: true`, tab errors, and missing response bodies as uncertainty. Do not claim an endpoint contract is complete when the manifest says capture was partial.
+`summary` reports `partial` and body coverage. Treat `partial: true`, tab errors, and missing response bodies as uncertainty. Do not claim an endpoint contract is complete when the capture is partial.
 
-Analyze every HAR named by the manifest, not just the active tab. Combine relevant entries by `startedDateTime` across files. Filter static assets, fonts, images, analytics, telemetry, and routine preflight traffic unless they are part of the question. Keep:
+Inspect every tab listed by the manifest (default), not just the active tab. Prefer `--match` / `--path-substr` over reading raw HAR. Static assets and analytics are dropped by default (`--no-noise`). Keep:
 
 - application API `POST`, `PUT`, `PATCH`, and `DELETE` requests;
 - `GET` requests that load or verify task data;
@@ -72,18 +73,17 @@ For each relevant request, extract:
 
 Prefer captured request and response bodies as evidence. A missing body is not evidence that the body is empty.
 
-## Produce the API workflow
+## Report what the capture implies
 
-Report:
+Present findings in whatever shape fits the question. Do **not** follow a fixed section template. The report must still make these information needs clear:
 
-1. **Capture evidence** — output directory, relevant tab files, manifest partial status, and the selected timeline.
-2. **API sequence** — ordered method/path list with request shape, response shape, and values passed to later calls.
-3. **Authentication and session state** — required headers/cookies and how callers should obtain them, with secrets redacted.
-4. **Behavioral details** — pagination, retries, polling, idempotency, redirects, and success conditions.
-5. **Uncertainty** — missing bodies, failed requests, dynamic values, or browser-only mechanisms that were not proven.
-6. **Reusable example** — `curl`, Python, or project-language code using placeholders for secrets and environment-specific identifiers.
+1. **Capture provenance** — export directory or `.har` path; that analysis used `browser-agent har inspect`; relevant tabs/entries; `partial` / body-coverage limits on confidence.
+2. **API inventory with roles** — a high-level view of the APIs that matter for the goal (method + path + role: what the call is for). Prefer APIs needed for the task plus notable extras; say explicitly when an expected capability (e.g. update) was **not** observed.
+3. **Lifecycle / composition** — how those APIs compose for the user goal: order, which response fields feed later requests, success checks, and optional verify or cleanup. This is the reusable workflow, not a dump of every HAR entry.
+4. **Contracts for critical steps** — enough detail to reuse mutations and their dependencies (auth style without secrets, request/response shapes, success signals). Depth may vary by importance.
+5. **Gaps and uncertainty** — missing bodies, failed requests, dynamic values, browser-only mechanisms, or flows the capture does not prove.
 
-When project code already contains an API client, compare its endpoint, request shape, ordering, and response handling to the HAR. Implement changes only when the user requested implementation; otherwise provide the evidence and proposed changes.
+Include a code/client gap comparison or a reusable `curl`/project-language example only when it helps answer the request. Implement product changes only when the user asked for implementation.
 
 ## Verify a replacement
 

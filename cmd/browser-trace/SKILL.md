@@ -113,39 +113,22 @@ the original request.
 4. **Align timeline** — order by `startedDateTime`; group into transactions.
 5. **Extract contracts** for key calls: method+path, request body, response
    envelope, auth style (do not paste secrets), success signal.
-6. If the repo has **`analyse-har`** (or `skills/analyse-har`), use its
-   `summarize_har.py` and deeper playbook when reverse-engineering APIs:
+6. Prefer **`browser-agent har inspect`** (and `skills/analyse-har` playbook) when
+   reverse-engineering APIs:
 
    ```bash
-   python3 skills/analyse-har/scripts/summarize_har.py \
-     "$SESSION/recording.har" --host <app-host> --json
+   browser-agent har inspect summary "$SESSION/recording.har"
+   browser-agent har inspect paths "$SESSION/recording.har" --host <app-host>
+   browser-agent har inspect show "$SESSION/recording.har" --match /api/example --json
    ```
 
 ### 5. Discuss with the user (analysis-first)
 
 Present findings **before** implementing unless they already asked to implement.
-
-Suggested structure:
-
-```markdown
-## Request
-<one sentence restating the user goal>
-
-## Capture
-- Session: <SESSION path>
-- Stop: <stop_reason> · entries: <n> · partial: <yes/no>
-- Extension: <version if present>
-
-## What the browser did (relevant)
-1. `METHOD path` → status · short note
-2. …
-
-## Analysis vs your request
-- <answer, gap table, or root-cause hypothesis>
-
-## Options / next steps
-- Re-record with … / implement fix / dig into entry N …
-```
+Use the same information requirements as `skills/analyse-har` /
+`browser-agent-to-api` (no fixed section template): capture provenance; API
+inventory with roles; lifecycle / how APIs compose; contracts for critical
+steps; gaps and uncertainty. Shape the write-up to the user's question.
 
 **Discuss:** ask if the sequence matches what they did, whether hosts look right,
 and what they want next (deeper dive, code change, another capture).

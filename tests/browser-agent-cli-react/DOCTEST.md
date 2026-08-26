@@ -106,7 +106,11 @@ browser-agent-cli-react
 │   ├── bare/                                    A1 empty args → brief + err + \n
 │   ├── help/                                    A2 --help lists serve,session + nested +\n
 │   ├── eval-without-session/                    A3 session eval missing session → both sources
-│   └── info-without-session/                    A4 session info missing session → both sources
+│   ├── info-without-session/                    A4 session info missing session → both sources
+│   ├── har-inspect-help/                          H1 har inspect --help lists commands
+│   ├── har-inspect-summary-dir/                   H2 summary on export dir
+│   ├── har-inspect-show-redact/                   H3 show --match redacts Authorization
+│   └── har-inspect-missing-manifest/              H4 dir without manifest → error
 ├── cli-sidecmd/                               [serve + HandleCLI nested side-command]
 │   ├── eval-with-fake-extension/                B1 session eval --session-id; fake WS; ok +\n
 │   └── info-session-snapshot/                   B2 session info --session-id; session_id +\n

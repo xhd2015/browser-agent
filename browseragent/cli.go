@@ -24,6 +24,7 @@ const briefUsage = `Usage: browser-agent <command> [flags]
 Commands:
   serve       Blocking multi-session daemon host (default 127.0.0.1:43761)
   session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har|list
+  har         Offline HAR inspect (summary|paths|entries|show); live capture is session har
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install embedded agent skills
   install-chrome-extension   Extract Chrome extension; TTY drives Load unpacked UI
@@ -61,6 +62,8 @@ Commands:
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
     session har start [session-id]      Start Chrome HAR capture for all user tabs
     session har end [session-id]        End capture; export per-tab HARs and manifest.json
+  har inspect <cmd> <path>   Offline inspect of export dirs / .har files
+    har inspect summary|paths|entries|show
   install-chrome-extension   Extract embedded extension; on TTY, Load unpacked via UI
   install-firefox-extension  Extract signed .xpi, print path, open in Firefox (install prompt)
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
@@ -146,6 +149,16 @@ session har flags:
   -o, --output-dir <dir>     End destination (default /tmp/browser-agent-<session-slug>/)
                              Chrome only; captures all current and new user HTTP(S) tabs
 
+har inspect flags:
+  --json                     Machine-readable JSON (no ANSI)
+  --host <host>              Include host (repeatable)
+  --method <m>               Filter method
+  --path-substr <s> / --match <s>
+  --tab-id <id> / --index N  Tab / entry selection
+  --no-noise (default) / --noise
+  --redact (default) / --no-redact
+  --limit N                  entries (default 100); optional for paths
+
 install-chrome-extension flags:
   --open                     Force UI Load unpacked even when stdout is not a TTY
   --no-open                  Print path only; do not drive Chrome UI (default for pipes)
@@ -230,6 +243,8 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliServe(rest, env, stdout, stderr)
 	case "session":
 		return cliSession(rest, env, stdout, stderr)
+	case "har":
+		return cliHAR(rest, env, stdout, stderr)
 	case "install-chrome-extension":
 		return cliInstallExt(rest, env, stdout, stderr)
 	case "install-firefox-extension":
@@ -246,7 +261,7 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, har, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
 	}
 }
 

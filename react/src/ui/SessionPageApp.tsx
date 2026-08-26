@@ -2,6 +2,10 @@ import { useEffect, useState } from "react";
 import type { ProductConfig } from "../products/types";
 import { browserAgentProduct } from "../products/browser-agent";
 import { InstallGuideline, type InstallBrowser } from "./InstallGuideline";
+import {
+  formatUpgradeHintHeadline,
+  resolveExtensionUpgradeHint,
+} from "./extensionUpgradeHint";
 
 export interface SessionPageAppProps {
   product?: ProductConfig;
@@ -188,6 +192,13 @@ export function SessionPageApp({
   const xpiHttpURL = snap?.firefox_xpi_http_url || "/v1/firefox-xpi";
   const installBrowser = resolveInstallBrowser(browserProp, snap, installPath);
   const isFirefox = installBrowser === "firefox";
+  const upgradeHint = resolveExtensionUpgradeHint({
+    match,
+    bundledVersion: bundled?.version,
+    loadedVersion: connected ? loaded?.version : undefined,
+    browser: installBrowser,
+  });
+  const showMd5Details = match !== "ok" && match !== "not_connected";
 
   return (
     <div className="session-page" data-product={product.id} data-control-port={product.controlPort}>
@@ -230,17 +241,35 @@ export function SessionPageApp({
           Extension package
         </h2>
         <div>
-          <strong>Bundled (this serve)</strong> version{" "}
-          <code>{dash(bundled?.version)}</code> md5{" "}
-          <code style={{ wordBreak: "break-all" }}>{dash(bundled?.md5)}</code>
+          <strong>Bundled (this serve)</strong>{" "}
+          <code>{dash(bundled?.version)}</code>
         </div>
         <div>
-          <strong>Loaded ({isFirefox ? "Firefox" : "Chrome"})</strong> version{" "}
-          <code>{connected ? dash(loaded?.version) : "—"}</code> md5{" "}
-          <code style={{ wordBreak: "break-all" }}>
-            {connected ? dash(loaded?.bundle_md5) : "—"}
-          </code>
+          <strong>Loaded ({isFirefox ? "Firefox" : "Chrome"})</strong>{" "}
+          <code>{connected ? dash(loaded?.version) : "—"}</code>
         </div>
+        {upgradeHint ? (
+          <div
+            data-browser-agent-ext-upgrade
+            data-upgrade-kind={upgradeHint.kind}
+            style={{
+              margin: "0.65rem 0 0.35rem",
+              padding: "0.55rem 0.7rem",
+              borderRadius: 6,
+              background: "#fff6eb",
+              border: "1px solid #f0c48a",
+              color: "#8a4b00",
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>
+              ⚠ {formatUpgradeHintHeadline(upgradeHint)}
+            </div>
+            <div style={{ marginTop: "0.35rem", fontSize: "0.9rem" }}>
+              Run:{" "}
+              <code style={{ wordBreak: "break-all" }}>{upgradeHint.command}</code>
+            </div>
+          </div>
+        ) : null}
         <div>
           <strong>Match:</strong>{" "}
           <span
@@ -257,6 +286,36 @@ export function SessionPageApp({
             {match}
           </span>
         </div>
+        {showMd5Details ? (
+          <details
+            data-browser-agent-ext-md5
+            style={{ marginTop: "0.5rem", fontSize: "0.85rem" }}
+          >
+            <summary className="muted" style={{ cursor: "pointer" }}>
+              Details (md5)
+            </summary>
+            <div style={{ marginTop: "0.35rem" }}>
+              Bundled md5{" "}
+              <code style={{ wordBreak: "break-all" }}>{dash(bundled?.md5)}</code>
+            </div>
+            <div>
+              Loaded md5{" "}
+              <code style={{ wordBreak: "break-all" }}>
+                {connected ? dash(loaded?.bundle_md5) : "—"}
+              </code>
+            </div>
+          </details>
+        ) : (
+          <div className="muted" style={{ fontSize: "0.85rem", marginTop: "0.35rem" }}>
+            Bundled md5{" "}
+            <code style={{ wordBreak: "break-all" }}>{dash(bundled?.md5)}</code>
+            {" · "}
+            Loaded md5{" "}
+            <code style={{ wordBreak: "break-all" }}>
+              {connected ? dash(loaded?.bundle_md5) : "—"}
+            </code>
+          </div>
+        )}
         <p
           className="muted"
           style={{ fontSize: "0.85rem" }}

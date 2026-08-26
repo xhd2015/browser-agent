@@ -169,24 +169,8 @@ the bar, or sticky attach released).
 
 # Development
 
-When a feature is merged into main repo, do the following:
-
-```sh
-go run ./script/bump-version
-
-git add -A
-git commit -m "bump version to v1.0.x"
-git push
-
-git tag v1.0.x
-git push --tags
-
-# sign firefox .xpi extension (wait from minutes to hours)
-go run ./script/browser-agent/firefox/sign
-
-# release with signed firefox extension
-go run ./script/github/release
-```
+To land a feature worktree, bump the version, tag, sign Firefox, and publish a
+GitHub release, follow **[Publish / release](docs/publish.md)**.
 
 # License
 

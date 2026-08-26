@@ -7,7 +7,7 @@ require (
 	github.com/xhd2015/kool v0.0.153
 	github.com/xhd2015/less-flags v1.0.2
 	github.com/xhd2015/less-gen v0.0.19
-	github.com/xhd2015/skills v0.0.28
+	github.com/xhd2015/skills v0.0.30
 	github.com/xhd2015/xgo v1.2.8
 	golang.org/x/term v0.45.0
 )
@@ -21,5 +21,3 @@ require (
 )
 
 require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.137
-
-replace github.com/xhd2015/skills => /Users/xhd2015/.wrk/worktrees/browser-agent-master-2026-08-20-add-a-new-skill-named-browser-agent-to-api-it-allows-to-capture/external/skills-master-2026-08-20

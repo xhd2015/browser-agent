@@ -2,6 +2,7 @@ package browseragent
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -23,6 +24,8 @@ const (
 const browserAgentSkillHelp = `Usage: browser-agent skill --list
        browser-agent skill --show [--header] [<name>]
        browser-agent skill [<name>] --show [--header]
+       browser-agent skill --version [<name>]
+       browser-agent skill [<name>] --version
        browser-agent skill --install [<name>] [OPTIONS] [<dir>]
        browser-agent skill [<name>] --install [OPTIONS] [<dir>]
 
@@ -63,8 +66,8 @@ func findBrowserAgentSkill(name string) (*skillcmd.SingleSkill, bool) {
 	return nil, false
 }
 
-// cliSkill handles: skill [--list|--show|--install …]
-// Writes list/show/help to the provided writers; install uses skillcmd's installer.
+// cliSkill handles: skill [--list|--show|--version|--install …]
+// Writes list/show/version/help to the provided writers; install uses skillcmd's installer.
 func cliSkill(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	_ = env
 	if stdout == nil {
@@ -112,6 +115,28 @@ func cliSkill(args []string, env map[string]string, stdout, stderr io.Writer) er
 			content += "\n"
 		}
 		_, err = io.WriteString(stdout, content)
+		return err
+
+	case skillcmd.ActionVersion:
+		skill := browserAgentSkill()
+		if len(parsed.Rest) > 1 {
+			return fmt.Errorf("unexpected arguments: %v", parsed.Rest[1:])
+		}
+		if len(parsed.Rest) == 1 {
+			var ok bool
+			skill, ok = findBrowserAgentSkill(parsed.Rest[0])
+			if !ok {
+				return fmt.Errorf("unknown skill %q", parsed.Rest[0])
+			}
+		}
+		version, err := skillcmd.SkillVersion(skill.RootContent)
+		if errors.Is(err, skillcmd.ErrSkillVersionMissing) {
+			return fmt.Errorf("skill %s has no metadata.version", skill.Name)
+		}
+		if err != nil {
+			return fmt.Errorf("skill %s: %w", skill.Name, err)
+		}
+		_, err = fmt.Fprintln(stdout, version)
 		return err
 
 	case skillcmd.ActionInstall:

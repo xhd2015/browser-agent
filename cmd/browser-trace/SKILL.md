@@ -4,6 +4,8 @@ description: >-
   Capture browser network traffic with the browser-trace CLI, wait for the user
   to finish their flow, then inspect the session directory (recording.har +
   meta.json) and discuss findings against the user's request. Use when user explicitly mentioned
+metadata:
+  version: "1.0.15"
 ---
 
 # Browser Trace Skill

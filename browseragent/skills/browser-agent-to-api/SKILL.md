@@ -5,6 +5,8 @@ description: >-
   derive a reusable API workflow from the observed requests. Use when the user
   asks to inspect website APIs, reverse-engineer browser requests, reproduce a
   browser action with direct HTTP calls, or runs /browser-agent-to-api.
+metadata:
+  version: "1.0.15"
 ---
 
 # Browser Agent to API

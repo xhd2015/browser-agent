@@ -5,6 +5,8 @@ description: >-
   session new (auto-ensures daemon), open the session page, then use nested
   session side commands (session info, create-tab, eval, run, logs, screenshot,
   cdp, har).
+metadata:
+  version: "1.0.15"
 ---
 
 # Browser Agent Skill

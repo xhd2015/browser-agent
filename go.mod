@@ -21,3 +21,5 @@ require (
 )
 
 require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.137
+
+replace github.com/xhd2015/skills => /Users/xhd2015/.wrk/worktrees/browser-agent-master-2026-08-20-add-a-new-skill-named-browser-agent-to-api-it-allows-to-capture/external/skills-master-2026-08-20

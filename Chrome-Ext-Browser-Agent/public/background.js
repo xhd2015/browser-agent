@@ -954,6 +954,17 @@ chrome.tabs.onCreated.addListener((tab) => {
  */
 async function healSessionsFromTabs(reason) {
   baLog("log", "healSessionsFromTabs start", { reason: reason || "" });
+  // Reconcile chrome.debugger ownership into attachedTabs after SW restart.
+  // Do not attach here — only adopt already-attached targets so later jobs can reuse.
+  let adopted = 0;
+  try {
+    adopted = await adoptDebuggerTargetsFromChrome(reason || "heal");
+  } catch (e) {
+    baLog("warn", "healSessionsFromTabs adopt failed", {
+      reason: reason || "",
+      error: String(e && e.message ? e.message : e),
+    });
+  }
   let tabs = [];
   try {
     tabs = await chrome.tabs.query({});
@@ -978,6 +989,7 @@ async function healSessionsFromTabs(reason) {
     reason: reason || "",
     control_tabs: found,
     attach: "skipped_for_popup_ux",
+    adopted_debugger_tabs: adopted,
   });
 }
 
@@ -2176,13 +2188,72 @@ async function pickTargetTabIdForSession(sessionId, opts) {
   throw new Error("no capturable tab for session " + sessionId);
 }
 
+function isAnotherDebuggerAttachedError(err) {
+  const msg = String(err && err.message ? err.message : err || "");
+  return /another debugger is already attached/i.test(msg);
+}
+
+function anotherDebuggerAttachedHint(tabId) {
+  return (
+    "Another debugger is already attached to the tab with id: " +
+    tabId +
+    ". Close DevTools on that tab, or reload the Browser Agent extension, then retry."
+  );
+}
+
+/** List tab ids this extension currently owns via chrome.debugger (survives SW restart). */
+function debuggerGetTargets() {
+  return new Promise((resolve) => {
+    if (!chrome.debugger || typeof chrome.debugger.getTargets !== "function") {
+      resolve([]);
+      return;
+    }
+    chrome.debugger.getTargets((targets) => {
+      if (chrome.runtime.lastError) {
+        resolve([]);
+        return;
+      }
+      resolve(Array.isArray(targets) ? targets : []);
+    });
+  });
+}
+
+/**
+ * Adopt Chrome-owned debugger targets into attachedTabs.
+ * After MV3 SW death the in-memory map is empty while Chrome still holds attaches
+ * for this extension — jobs then fail with "Another debugger is already attached".
+ */
+async function adoptDebuggerTargetsFromChrome(reason) {
+  const targets = await debuggerGetTargets();
+  let adopted = 0;
+  for (const t of targets) {
+    if (!t || !t.attached || t.tabId == null) continue;
+    if (!attachedTabs.has(t.tabId)) {
+      attachedTabs.set(t.tabId, true);
+      adopted += 1;
+    }
+  }
+  if (adopted > 0) {
+    baLog("log", "adoptDebuggerTargetsFromChrome", {
+      reason: reason || "",
+      adopted,
+      attached_tabs: attachedTabs.size,
+      targets: targets.length,
+    });
+    // Keep idle-detach armed so adopted orphans do not freeze popup UX forever.
+    touchDebuggerActivity();
+  }
+  return adopted;
+}
+
 function detachDebugger(tabId, force) {
   return new Promise((resolve) => {
     if (isHARCapturedTab(tabId) && !force) {
       resolve(false);
       return;
     }
-    if (!attachedTabs.has(tabId)) {
+    // force=true: detach even when attachedTabs lost the id (SW orphan / reclaim).
+    if (!force && !attachedTabs.has(tabId)) {
       resolve(false);
       return;
     }
@@ -2197,6 +2268,10 @@ function detachDebugger(tabId, force) {
  * Attach chrome.debugger to a single tabId (CDP transport for jobs).
  * Side effect: Chrome may show a browser-wide "debugging this browser" notice
  * on unrelated tabs/windows while this attach remains live — not multi-tab CDP.
+ *
+ * Reclaim: if attach fails with "Another debugger is already attached", adopt
+ * targets we already own (SW restart) or best-effort detach+retry once. If still
+ * blocked (e.g. DevTools), fail with an actionable hint.
  */
 function attachDebugger(tabId) {
   if (attachedTabs.has(tabId)) {
@@ -2210,26 +2285,9 @@ function attachDebugger(tabId) {
     protocol: CDP_PROTOCOL_VERSION,
     timeout_ms: ATTACH_TIMEOUT_MS,
   });
-  const attachPromise = new Promise((resolve, reject) => {
-    chrome.debugger.attach({ tabId: tabId }, CDP_PROTOCOL_VERSION, () => {
-      if (cancelled) {
-        // Late attach after timeout: drop it so we do not leave a stuck debugger.
-        chrome.debugger.detach({ tabId: tabId }, () => {
-          attachedTabs.delete(tabId);
-        });
-        return;
-      }
-      const attachMs = Math.round(baNow() - t0);
-      if (chrome.runtime.lastError) {
-        baLog("error", "attachDebugger attach fail", {
-          tab_id: tabId,
-          attach_ms: attachMs,
-          error: chrome.runtime.lastError.message,
-        });
-        reject(new Error(chrome.runtime.lastError.message || "chrome.debugger.attach failed"));
-        return;
-      }
-      attachedTabs.set(tabId, true);
+
+  const enableRuntime = () =>
+    new Promise((resolve) => {
       const t1 = baNow();
       chrome.debugger.sendCommand({ tabId: tabId }, "Runtime.enable", {}, () => {
         if (cancelled) {
@@ -2246,7 +2304,7 @@ function attachDebugger(tabId) {
             : "";
         baLog("log", "attachDebugger done", {
           tab_id: tabId,
-          attach_ms: attachMs,
+          attach_ms: Math.round(baNow() - t0),
           runtime_enable_ms: enableMs,
           total_ms: totalMs,
           runtime_enable_error: enableErr || null,
@@ -2255,7 +2313,72 @@ function attachDebugger(tabId) {
         resolve(true);
       });
     });
-  });
+
+  const tryAttachOnce = () =>
+    new Promise((resolve, reject) => {
+      chrome.debugger.attach({ tabId: tabId }, CDP_PROTOCOL_VERSION, () => {
+        if (cancelled) {
+          // Late attach after timeout: drop it so we do not leave a stuck debugger.
+          chrome.debugger.detach({ tabId: tabId }, () => {
+            attachedTabs.delete(tabId);
+          });
+          return;
+        }
+        const attachMs = Math.round(baNow() - t0);
+        if (chrome.runtime.lastError) {
+          baLog("error", "attachDebugger attach fail", {
+            tab_id: tabId,
+            attach_ms: attachMs,
+            error: chrome.runtime.lastError.message,
+          });
+          reject(new Error(chrome.runtime.lastError.message || "chrome.debugger.attach failed"));
+          return;
+        }
+        attachedTabs.set(tabId, true);
+        enableRuntime().then(resolve, reject);
+      });
+    });
+
+  const attachPromise = (async () => {
+    // Adopt orphans before the first attach attempt (cheap getTargets).
+    await adoptDebuggerTargetsFromChrome("pre-attach");
+    if (cancelled) return true;
+    if (attachedTabs.has(tabId)) {
+      baLog("log", "attachDebugger reuse after adopt", { tab_id: tabId });
+      await enableRuntime();
+      return true;
+    }
+    try {
+      await tryAttachOnce();
+      return true;
+    } catch (err) {
+      if (cancelled) return true;
+      if (!isAnotherDebuggerAttachedError(err)) throw err;
+
+      // We may already own this target after SW restart but missed it on pre-attach.
+      await adoptDebuggerTargetsFromChrome("reclaim");
+      if (attachedTabs.has(tabId)) {
+        baLog("log", "attachDebugger reclaim via getTargets", { tab_id: tabId });
+        await enableRuntime();
+        return true;
+      }
+
+      // Best-effort detach + one retry (stale attach we can release).
+      await detachDebugger(tabId, true);
+      if (cancelled) return true;
+      try {
+        await tryAttachOnce();
+        baLog("log", "attachDebugger reclaim via detach+retry", { tab_id: tabId });
+        return true;
+      } catch (err2) {
+        if (isAnotherDebuggerAttachedError(err2)) {
+          throw new Error(anotherDebuggerAttachedHint(tabId));
+        }
+        throw err2;
+      }
+    }
+  })();
+
   return baWithTimeout(attachPromise, ATTACH_TIMEOUT_MS, "chrome.debugger.attach", () => {
     cancelled = true;
     baLog("error", "attachDebugger timeout cleanup", {

@@ -36,7 +36,17 @@ function loadBackground(overrides = {}) {
         onCreated: event(),
       },
       alarms: { create() {}, onAlarm: event() },
-      debugger: { onEvent: event(), onDetach: event() },
+      debugger: Object.assign(
+        {
+          onEvent: event(),
+          onDetach: event(),
+          getTargets: (cb) => cb([]),
+          attach: (_dbg, _proto, cb) => cb && cb(),
+          detach: (_dbg, cb) => cb && cb(),
+          sendCommand: (_dbg, _method, _params, cb) => cb && cb(),
+        },
+        overrides.debugger || {},
+      ),
       storage: {},
     },
   };
@@ -44,7 +54,7 @@ function loadBackground(overrides = {}) {
   vm.runInContext(
     source +
       ";globalThis.__backgroundTest = {" +
-      "isSessionGoPageURL, isSessionGoPageURLAtPort, parseGoSessionFromURL, validateHARUploadURL, handleRegisterMessage, sessions, snapshotHARTab, harTabResult, uploadHARTab, sendJobResult, flushPendingJobResults, handleResultAck, pendingHAREndCaptureIDs, claimJobExecution, finishJobExecution, isHAROwnedTab, idleDebuggerLeftoverTabIDs, harCaptures, attachedTabs" +
+      "isSessionGoPageURL, isSessionGoPageURLAtPort, parseGoSessionFromURL, validateHARUploadURL, handleRegisterMessage, sessions, snapshotHARTab, harTabResult, uploadHARTab, sendJobResult, flushPendingJobResults, handleResultAck, pendingHAREndCaptureIDs, claimJobExecution, finishJobExecution, isHAROwnedTab, idleDebuggerLeftoverTabIDs, harCaptures, attachedTabs, attachDebugger, adoptDebuggerTargetsFromChrome, isAnotherDebuggerAttachedError, anotherDebuggerAttachedHint, detachDebugger" +
       "};",
     context,
   );

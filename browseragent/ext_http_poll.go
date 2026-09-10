@@ -61,6 +61,43 @@ func (c *controlServer) writeMissingSessionID(w http.ResponseWriter) {
 	})
 }
 
+// handleExtAttach is POST /v1/ext/attach — page/content-script cold-start progress.
+func (c *controlServer) handleExtAttach(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req AttachEvent
+	if r.Body != nil {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&req); err != nil && err != io.EOF {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+	}
+	sid := strings.TrimSpace(req.SessionID)
+	if sid == "" {
+		c.writeMissingSessionID(w)
+		return
+	}
+	sess, ok := c.registry.Get(sid)
+	if !ok {
+		c.writeSessionNotFound(w)
+		return
+	}
+	sess.applyAttachEvent(req)
+	snap := sess.snapshot()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":         true,
+		"session_id": sid,
+		"attach":     snap.Attach,
+	})
+}
+
 // handleExtHello is POST /v1/ext/hello — mark extension connected without WebSocket.
 func (c *controlServer) handleExtHello(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

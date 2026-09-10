@@ -53,11 +53,11 @@ type SessionNewTestHooks = inj.SessionNewHooks
 
 // SessionNewConfig controls the session new operator flow (no agent-run).
 type SessionNewConfig struct {
-	BaseDir         string
-	Addr            string
-	SessionID       string
-	NoOpenChrome    bool
-	OpenChromeFn    func(sessionURL, extensionInstallPath string) error
+	BaseDir      string
+	Addr         string
+	SessionID    string
+	NoOpenChrome bool
+	OpenChromeFn func(sessionURL, extensionInstallPath string) error
 	// OpenFirefoxFn opens Firefox with the session URL only (no extension path).
 	// Used when Browser == "firefox". Tests inject this; production uses openFirefox.
 	OpenFirefoxFn   func(sessionURL string) error
@@ -75,8 +75,9 @@ type SessionNewConfig struct {
 	// (chrome) or EnsureCanonicalFirefoxExtension (firefox).
 	Home string
 
-	// WaitExtensionTimeout is how long to wait for extension connection.
-	// Default 30s. Zero means use default.
+	// WaitExtensionTimeout is the hard cap for extension wait.
+	// Zero means adaptive default: base 15s, +10s per attach stage advance, cap 45s.
+	// When set (e.g. doctests), that duration is the hard cap (and shrinks the base).
 	WaitExtensionTimeout time.Duration
 
 	// NoWait skips waiting entirely (new --no-wait flag).
@@ -446,11 +447,7 @@ func SessionNew(cfg SessionNewConfig) error {
 
 	// Then wait for extension connection (unless NoOpenChrome or NoWait).
 	if !cfg.NoOpenChrome && !cfg.NoWait {
-		timeout := cfg.WaitExtensionTimeout
-		if timeout == 0 {
-			timeout = 30 * time.Second
-		}
-		if err := waitForExtensionConnection(baseURL, result.SessionID, browser, extPath, timeout, stderr); err != nil {
+		if err := waitForExtensionConnection(baseURL, result.SessionID, browser, extPath, cfg.WaitExtensionTimeout, stderr); err != nil {
 			return err
 		}
 	}
@@ -714,50 +711,113 @@ func formatExtensionTimeoutHelp(browser, extPath, sessionID string) string {
 
 // waitForExtensionConnection polls GET /v1/session?session=<id> every 500ms until
 // the extension connects with browser-agent support, connects without support, or
-// timeout is reached. Progress ticks go to stderr. On timeout, a warning plus
-// install help (user-handling banner) is printed to stderr and nil is returned
-// (session remains usable).
-func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, timeout time.Duration, stderr io.Writer) error {
+// the adaptive deadline is reached. Deadline starts at base (15s default) and
+// extends by grant (10s) on each attach stage advance, hard-capped at cap (45s
+// default, or explicitTimeout when > 0). Progress ticks go to stderr. On stall,
+// a warning plus install help is printed and nil is returned (session usable).
+func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, explicitTimeout time.Duration, stderr io.Writer) error {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	deadline := time.Now().Add(timeout)
+	base, grant, cap := attachDeadline(explicitTimeout)
 	pollInterval := 500 * time.Millisecond
 	progressEvery := 5 * time.Second
 	started := time.Now()
 	nextProgress := started.Add(progressEvery)
+	deadline := started.Add(base)
+	lastStageRank := -1
+	lastStage := ""
 
-	timeoutLabel := timeout.Truncate(time.Second)
-	if timeoutLabel < time.Second {
-		timeoutLabel = timeout
+	capLabel := cap.Truncate(time.Second)
+	if capLabel < time.Second {
+		capLabel = cap
 	}
-	fmt.Fprintf(stderr, "Waiting for extension WebSocket (timeout %s)…\n", timeoutLabel)
+	baseLabel := base.Truncate(time.Second)
+	if baseLabel < time.Second {
+		baseLabel = base
+	}
+	fmt.Fprintf(stderr, "Waiting for extension (adaptive, base %s, cap %s)…\n", baseLabel, capLabel)
 
 	for {
-		connected, supports, err := pollSessionExtension(baseURL, sessionID)
+		snap, err := pollSessionSnapshot(baseURL, sessionID)
 		if err != nil {
 			return fmt.Errorf("daemon unreachable during extension wait: %w", err)
 		}
-		if connected {
-			if supports {
+		if snap.Extension.Connected {
+			if snap.Extension.SupportsBrowserAgent {
 				fmt.Fprintln(stderr, "Extension connected ✓")
 				return nil
 			}
 			return fmt.Errorf("Error: extension does not support browser-agent. Please install the bundled extension.")
 		}
 
+		stage := ""
+		attempts := 0
+		lastErr := ""
+		if snap.Attach != nil {
+			stage = snap.Attach.Stage
+			attempts = snap.Attach.RegisterAttempts
+			lastErr = snap.Attach.LastError
+		}
+		rank := attachStageRank(stage)
+		if rank > lastStageRank {
+			lastStageRank = rank
+			lastStage = stage
+			// Extend deadline on stage advance; never past hard cap.
+			extended := time.Now().Add(grant)
+			hardCap := started.Add(cap)
+			if extended.After(hardCap) {
+				extended = hardCap
+			}
+			if extended.After(deadline) {
+				deadline = extended
+			}
+			elapsed := time.Since(started).Truncate(time.Second)
+			if stage != "" {
+				if attempts > 0 {
+					fmt.Fprintf(stderr, "  … stage=%s register_attempts=%d (%s)\n", stage, attempts, elapsed)
+				} else {
+					fmt.Fprintf(stderr, "  … stage=%s (%s)\n", stage, elapsed)
+				}
+				nextProgress = time.Now().Add(progressEvery)
+			}
+		} else if stage != "" {
+			lastStage = stage
+		}
+
 		now := time.Now()
 		if now.After(deadline) {
-			fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", timeoutLabel)
+			elapsed := now.Sub(started).Truncate(time.Second)
+			if elapsed < time.Second {
+				elapsed = now.Sub(started)
+			}
+			if lastStage != "" && lastStage != AttachStageNoPage {
+				fmt.Fprintf(stderr, "warning: extension attach stalled at stage=%s after %s\n", lastStage, elapsed)
+				if lastErr != "" {
+					fmt.Fprintf(stderr, "  last_error: %s\n", lastErr)
+				}
+				if attempts > 0 {
+					fmt.Fprintf(stderr, "  register_attempts: %d\n", attempts)
+				}
+				// Keep legacy substring for existing doctests / agents.
+				fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", elapsed)
+			} else {
+				fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", elapsed)
+			}
 			fmt.Fprint(stderr, formatExtensionTimeoutHelp(browser, extPath, sessionID))
 			return nil
 		}
 		if !now.Before(nextProgress) {
 			elapsed := now.Sub(started).Truncate(time.Second)
-			fmt.Fprintf(stderr, "  … still waiting (%s)\n", elapsed)
+			if stage != "" {
+				msg := fmt.Sprintf("  … stage=%s (%s)", stage, elapsed)
+				if attempts > 0 {
+					msg = fmt.Sprintf("  … stage=%s register_attempts=%d (%s)", stage, attempts, elapsed)
+				}
+				fmt.Fprintln(stderr, msg)
+			} else {
+				fmt.Fprintf(stderr, "  … still waiting (%s)\n", elapsed)
+			}
 			nextProgress = now.Add(progressEvery)
 		}
 
@@ -765,31 +825,40 @@ func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, tim
 	}
 }
 
-// pollSessionExtension fetches a session snapshot and returns extension.connected
-// and extension.supports_browser_agent.
-func pollSessionExtension(baseURL, sessionID string) (connected, supports bool, err error) {
+// pollSessionSnapshot fetches GET /v1/session?session=<id>.
+func pollSessionSnapshot(baseURL, sessionID string) (sessionSnapshot, error) {
 	u := strings.TrimRight(baseURL, "/") + "/v1/session?session=" + url.QueryEscape(sessionID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return false, false, err
+		return sessionSnapshot{}, err
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return false, false, err
+		return sessionSnapshot{}, err
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return false, false, err
+		return sessionSnapshot{}, err
 	}
 	if res.StatusCode != http.StatusOK {
-		return false, false, fmt.Errorf("GET /v1/session status %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
+		return sessionSnapshot{}, fmt.Errorf("GET /v1/session status %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var snap sessionSnapshot
 	if err := json.Unmarshal(body, &snap); err != nil {
-		return false, false, fmt.Errorf("parse session snapshot: %w", err)
+		return sessionSnapshot{}, fmt.Errorf("parse session snapshot: %w", err)
+	}
+	return snap, nil
+}
+
+// pollSessionExtension fetches a session snapshot and returns extension.connected
+// and extension.supports_browser_agent.
+func pollSessionExtension(baseURL, sessionID string) (connected, supports bool, err error) {
+	snap, err := pollSessionSnapshot(baseURL, sessionID)
+	if err != nil {
+		return false, false, err
 	}
 	return snap.Extension.Connected, snap.Extension.SupportsBrowserAgent, nil
 }

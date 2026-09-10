@@ -75,6 +75,7 @@ func (c *controlServer) handler() http.Handler {
 	mux.HandleFunc("/v1/har/artifact", c.handleHARArtifact)
 	mux.HandleFunc("/v1/har/capture", c.handleHARCapture)
 	mux.HandleFunc("/v1/ext/hello", c.handleExtHello)
+	mux.HandleFunc("/v1/ext/attach", c.handleExtAttach)
 	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
 	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
 	mux.HandleFunc("/v1/ws", c.handleWS)
@@ -830,18 +831,45 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
   var connected = false;
   var burstTimer = null;
   var slowTimer = null;
+  var registerAttempts = 0;
+
+  function reportAttach(stage, lastError) {
+    try {
+      var body = {
+        session_id: SESSION_ID,
+        stage: stage,
+        register_attempts: registerAttempts
+      };
+      if (lastError) body.last_error = String(lastError);
+      fetch("/v1/ext/attach", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }).catch(function () {});
+    } catch (e) { /* ignore */ }
+  }
 
   function sendRegister() {
     if (connected) return;
     try {
       if (!chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") return;
       if (!EXT_ID) return;
+      registerAttempts += 1;
+      reportAttach("register_sent", null);
       chrome.runtime.sendMessage(EXT_ID, {
         type: "register",
         session_id: SESSION_ID,
         control_port: PORT
-      }, function () {
-        void (chrome.runtime && chrome.runtime.lastError);
+      }, function (resp) {
+        var err = chrome.runtime && chrome.runtime.lastError;
+        if (err) {
+          reportAttach("register_sent", err.message || String(err));
+          return;
+        }
+        if (resp && resp.ok) {
+          reportAttach("sw_ack", null);
+        }
       });
     } catch (e) { /* ignore */ }
   }
@@ -869,13 +897,12 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
     pollConnected();
   }
 
+  reportAttach("page_open", null);
   kick();
-  var n = 0;
+  // Burst until connected (covers cold SW wake for the full adaptive wait window).
   burstTimer = setInterval(function () {
     if (connected) { clearInterval(burstTimer); burstTimer = null; return; }
-    n++;
     kick();
-    if (n >= 40) { clearInterval(burstTimer); burstTimer = null; }
   }, 500);
   // Slow heartbeat while the page stays open (daemon/SW restart).
   slowTimer = setInterval(kick, 10000);

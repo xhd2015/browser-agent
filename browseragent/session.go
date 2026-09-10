@@ -60,6 +60,9 @@ type session struct {
 	sessionPages     []sessionPageTab
 	lastSeenAt       time.Time
 
+	// attach is ephemeral cold-start progress (page/SW/WS stages).
+	attach attachState
+
 	// harCapture owns the daemon-side private artifact spool for the active capture.
 	harCapture *harCapture
 }
@@ -95,6 +98,10 @@ func (s *session) markHello(version string, features []string, bundleMD5 string)
 	s.extBundleMD5 = strings.ToLower(strings.TrimSpace(bundleMD5))
 	s.supportsBA = computeSupportsBrowserAgent(version, features)
 	s.phase = PhaseExtensionConnected
+	s.setAttachStageLocked(AttachStageHello)
+	if s.supportsBA {
+		s.setAttachStageLocked(AttachStageReady)
+	}
 	embedded := BundleSum{Version: s.embeddedVersion, MD5: s.embeddedMD5}
 	loaded := BundleSum{Version: s.extVersion, MD5: s.extBundleMD5}
 	match := ComputeExtensionMatch(true, embedded, loaded)
@@ -129,6 +136,7 @@ func (s *session) markDisconnectedAfterGrace(c *wsConn) {
 		s.phase = PhaseWaitingExtension
 		q := s.queue
 		s.mu.Unlock()
+		s.resetAttachOnDisconnect()
 		if q != nil {
 			q.FailAllInflight("extension disconnected: reconnect grace period expired")
 		}
@@ -166,6 +174,7 @@ func (s *session) setWS(c *wsConn) {
 	s.ws = c
 	if c != nil {
 		s.disconnectGeneration++
+		s.setAttachStageLocked(AttachStageWSOpen)
 	}
 }
 
@@ -282,9 +291,15 @@ func (s *session) updateTelemetry(browserProduct string, pageCount *int, pages [
 	if pageCount != nil {
 		v := *pageCount
 		s.sessionPageCount = &v
+		if v > 0 {
+			s.setAttachStageLocked(AttachStagePageOpen)
+		}
 	}
 	if pages != nil {
 		s.sessionPages = append([]sessionPageTab(nil), pages...)
+		if len(pages) > 0 {
+			s.setAttachStageLocked(AttachStagePageOpen)
+		}
 	}
 	s.lastSeenAt = time.Now()
 }
@@ -360,6 +375,7 @@ func (s *session) snapshot() sessionSnapshot {
 		SessionURL:           s.sessionURL,
 		SessionPages:         pages,
 		LastSeenAt:           lastSeen,
+		Attach:               s.snapshotAttach(),
 		BundledExtension: bundledExtension{
 			Version: s.embeddedVersion,
 			MD5:     s.embeddedMD5,
@@ -398,6 +414,8 @@ type sessionSnapshot struct {
 	SessionURL        string           `json:"session_url,omitempty"`
 	SessionPages      []sessionPageTab `json:"session_pages,omitempty"`
 	LastSeenAt        time.Time        `json:"last_seen_at,omitempty"`
+	// Attach is ephemeral cold-start progress (omit when never reported).
+	Attach *sessionAttach `json:"attach,omitempty"`
 }
 
 type bundledExtension struct {

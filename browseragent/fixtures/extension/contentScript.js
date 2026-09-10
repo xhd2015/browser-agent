@@ -1,12 +1,12 @@
 // Session page content script — register tab with background for per-session WS.
-// Retries after SW cold start / extension reload so a single lost sendMessage
-// does not leave the open /go page permanently unbound.
+// All attach retries live in-page (this script + session-page boot). CLI must not
+// re-open the session URL.
 (function () {
   try {
     window.__BROWSER_AGENT_EXT__ = {
       product: "browser-agent",
       controlPort: 43761,
-      version: "1.0.7",
+      version: "1.0.16",
       features: ["browser-agent"],
     };
   } catch (e) {
@@ -51,14 +51,41 @@
   }
 
   var registeredAck = false;
+  var connected = false;
   var burstTimer = null;
+  var slowTimer = null;
+  var registerAttempts = 0;
+
+  function reportAttach(stage, lastError) {
+    const session_id = readSessionIdFromPage();
+    if (!session_id) return;
+    try {
+      var body = {
+        session_id: session_id,
+        stage: stage,
+        register_attempts: registerAttempts,
+      };
+      if (lastError) body.last_error = String(lastError);
+      fetch(location.origin + "/v1/ext/attach", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).catch(function () {});
+    } catch (e) {
+      /* ignore */
+    }
+  }
 
   function sendRegister() {
+    if (connected) return false;
     const session_id = readSessionIdFromPage();
     if (!session_id) return false;
 
     const control_port = readControlPortFromPage();
     try {
+      registerAttempts += 1;
+      reportAttach("register_sent", null);
       chrome.runtime.sendMessage(
         {
           type: "register",
@@ -69,14 +96,16 @@
         },
         function (resp) {
           if (chrome.runtime && chrome.runtime.lastError) {
+            reportAttach(
+              "register_sent",
+              chrome.runtime.lastError.message ||
+                String(chrome.runtime.lastError),
+            );
             return;
           }
           if (resp && resp.ok) {
             registeredAck = true;
-            if (burstTimer) {
-              clearInterval(burstTimer);
-              burstTimer = null;
-            }
+            reportAttach("sw_ack", null);
           }
         },
       );
@@ -87,41 +116,82 @@
     }
   }
 
+  function pollConnected() {
+    const session_id = readSessionIdFromPage();
+    if (!session_id) return;
+    try {
+      fetch(
+        location.origin +
+          "/v1/session?session=" +
+          encodeURIComponent(session_id),
+        { credentials: "same-origin" },
+      )
+        .then(function (r) {
+          return r.ok ? r.json() : null;
+        })
+        .then(function (data) {
+          if (!data) return;
+          const ext = data.extension || {};
+          const now =
+            !!(ext.connected || data.phase === "extension_connected");
+          connected = now;
+          if (now && burstTimer) {
+            clearInterval(burstTimer);
+            burstTimer = null;
+          }
+        })
+        .catch(function () {
+          /* ignore */
+        });
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  function kick() {
+    sendRegister();
+    pollConnected();
+  }
+
   if (!readSessionIdFromPage()) return;
 
-  // Immediate + short burst: covers SW cold start and mid-reload races.
-  sendRegister();
-  var burstAttempt = 0;
+  reportAttach("page_open", null);
+  // Immediate + burst until connected (covers SW cold start for adaptive wait).
+  kick();
   burstTimer = setInterval(function () {
-    if (registeredAck) {
+    if (connected) {
       clearInterval(burstTimer);
       burstTimer = null;
       return;
     }
-    burstAttempt += 1;
-    sendRegister();
-    if (burstAttempt >= 12) {
-      clearInterval(burstTimer);
-      burstTimer = null;
-    }
+    kick();
   }, 500);
 
-  // While the /go page stays open, re-register periodically so a later SW death
-  // or daemon restart can rebind without requiring a full page reload.
-  setInterval(function () {
-    sendRegister();
-  }, 15000);
+  // While the /go page stays open: re-register if daemon/SW dies later.
+  slowTimer = setInterval(function () {
+    if (!connected) {
+      kick();
+      return;
+    }
+    // Connected: only re-check; resume register if status drops.
+    pollConnected();
+    setTimeout(function () {
+      if (!connected) sendRegister();
+    }, 200);
+  }, 10000);
 
   try {
     window.addEventListener("pageshow", function () {
-      sendRegister();
+      connected = false;
+      registeredAck = false;
+      kick();
     });
   } catch (e) {
     /* ignore */
   }
   try {
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) sendRegister();
+      if (!document.hidden) kick();
     });
   } catch (e) {
     /* ignore */

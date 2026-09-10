@@ -54,6 +54,28 @@
   var connected = false;
   var burstTimer = null;
   var slowTimer = null;
+  var registerAttempts = 0;
+
+  function reportAttach(stage, lastError) {
+    const session_id = readSessionIdFromPage();
+    if (!session_id) return;
+    try {
+      var body = {
+        session_id: session_id,
+        stage: stage,
+        register_attempts: registerAttempts,
+      };
+      if (lastError) body.last_error = String(lastError);
+      fetch(location.origin + "/v1/ext/attach", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).catch(function () {});
+    } catch (e) {
+      /* ignore */
+    }
+  }
 
   function sendRegister() {
     if (connected) return false;
@@ -62,6 +84,8 @@
 
     const control_port = readControlPortFromPage();
     try {
+      registerAttempts += 1;
+      reportAttach("register_sent", null);
       chrome.runtime.sendMessage(
         {
           type: "register",
@@ -72,10 +96,16 @@
         },
         function (resp) {
           if (chrome.runtime && chrome.runtime.lastError) {
+            reportAttach(
+              "register_sent",
+              chrome.runtime.lastError.message ||
+                String(chrome.runtime.lastError),
+            );
             return;
           }
           if (resp && resp.ok) {
             registeredAck = true;
+            reportAttach("sw_ack", null);
           }
         },
       );
@@ -125,21 +155,16 @@
 
   if (!readSessionIdFromPage()) return;
 
-  // Immediate + burst while SW may still be starting.
+  reportAttach("page_open", null);
+  // Immediate + burst until connected (covers SW cold start for adaptive wait).
   kick();
-  var burstAttempt = 0;
   burstTimer = setInterval(function () {
     if (connected) {
       clearInterval(burstTimer);
       burstTimer = null;
       return;
     }
-    burstAttempt += 1;
     kick();
-    if (burstAttempt >= 40) {
-      clearInterval(burstTimer);
-      burstTimer = null;
-    }
   }, 500);
 
   // While the /go page stays open: re-register if daemon/SW dies later.

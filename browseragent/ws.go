@@ -67,6 +67,7 @@ func (s *controlServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sess.setAttachStage(AttachStageWSConnecting)
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("browseragent: ws upgrade: %v", err)

@@ -76,12 +76,17 @@ type SessionNewConfig struct {
 	Home string
 
 	// WaitExtensionTimeout is the hard cap for extension wait.
-	// Zero means adaptive default: base 15s, +10s per attach stage advance, cap 45s.
+	// Zero means adaptive default: base/cap 70s (1m+10s, covers chrome.alarms
+	// period), +10s per attach stage advance (still capped).
 	// When set (e.g. doctests), that duration is the hard cap (and shrinks the base).
 	WaitExtensionTimeout time.Duration
 
 	// NoWait skips waiting entirely (new --no-wait flag).
 	NoWait bool
+
+	// NoWakeupWorkaround, when true, skips the background wakeup tab on attach
+	// stall. Default false: open a quiet background wakeup tab when needed.
+	NoWakeupWorkaround bool
 }
 
 // EnsureDaemon returns daemon meta when the control plane at Addr is healthy and
@@ -399,6 +404,9 @@ func SessionNew(cfg SessionNewConfig) error {
 		return fmt.Errorf("daemon meta missing base URL")
 	}
 
+	// Agents often spam session new when attach is stuck; warn before creating another.
+	warnIfManyWaitingSessions(baseURL, stderr)
+
 	extPath, err := ensureSessionNewExtension(browser, cfg.Home)
 	if err != nil {
 		return err
@@ -415,26 +423,44 @@ func SessionNew(cfg SessionNewConfig) error {
 			if openFn == nil {
 				openFn = inj.SessionNewOpenFirefoxFn()
 			}
+			var openErr error
 			if openFn != nil {
-				if err := openFn(result.SessionURL); err != nil {
-					fmt.Fprintf(stderr, "browser-agent: warning: open firefox: %v\n", err)
-				}
-			} else if err := openFirefox(result.SessionURL); err != nil {
-				fmt.Fprintf(stderr, "browser-agent: warning: open firefox: %v\n", err)
+				openErr = openFn(result.SessionURL)
+			} else {
+				openErr = openFirefox(result.SessionURL)
+			}
+			if openErr != nil {
+				fmt.Fprintf(stderr, "browser-agent: warning: open firefox: %v\n", openErr)
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "warn", "firefox_open", map[string]any{
+					"url": result.SessionURL, "error": openErr.Error(),
+				})
+			} else {
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "info", "firefox_open", map[string]any{
+					"url": result.SessionURL,
+				})
 			}
 		} else {
 			openFn := cfg.OpenChromeFn
 			if openFn == nil {
 				openFn = inj.SessionNewOpenChromeFn()
 			}
+			var openErr error
 			if openFn != nil {
-				if err := openFn(result.SessionURL, extPath); err != nil {
-					fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
-				}
-			} else if err := openChrome(result.SessionURL, extPath); err != nil {
-				// Pass extPath for older Chrome --load-extension; Chrome 137+ ignores it.
-				// Default-profile Load-unpacked still applies when joining the running browser.
-				fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", err)
+				openErr = openFn(result.SessionURL, extPath)
+			} else {
+				// extPath is unused by BuildChromeArgs (no --load-extension on default
+				// profile). Operator Load-unpacked Chrome is the attach target.
+				openErr = openChrome(result.SessionURL, extPath)
+			}
+			if openErr != nil {
+				fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", openErr)
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "warn", "chrome_open", map[string]any{
+					"url": result.SessionURL, "error": openErr.Error(),
+				})
+			} else {
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "info", "chrome_open", map[string]any{
+					"url": result.SessionURL,
+				})
 			}
 		}
 	}
@@ -447,7 +473,7 @@ func SessionNew(cfg SessionNewConfig) error {
 
 	// Then wait for extension connection (unless NoOpenChrome or NoWait).
 	if !cfg.NoOpenChrome && !cfg.NoWait {
-		if err := waitForExtensionConnection(baseURL, result.SessionID, browser, extPath, cfg.WaitExtensionTimeout, stderr); err != nil {
+		if err := waitForExtensionConnection(cfg.BaseDir, baseURL, result.SessionID, browser, extPath, cfg.WaitExtensionTimeout, stderr, !cfg.NoWakeupWorkaround, nil); err != nil {
 			return err
 		}
 	}
@@ -599,6 +625,7 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		fmt.Sprintf("  browser-agent session info --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session eval --session-id %s 'document.title'", result.SessionID),
 		fmt.Sprintf("  browser-agent session run --session-id %s script.js", result.SessionID),
+		fmt.Sprintf("  browser-agent session log --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session logs --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session screenshot --session-id %s -o out.png", result.SessionID),
 		fmt.Sprintf("  browser-agent session cdp --session-id %s Page.navigate '{\"url\":\"https://example.com\"}'", result.SessionID),
@@ -648,6 +675,7 @@ func formatSessionNewFirefoxOutput(w io.Writer, result *postCreateSessionResult,
 		fmt.Sprintf("  browser-agent session info --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session eval --session-id %s 'document.title'", result.SessionID),
 		fmt.Sprintf("  browser-agent session run --session-id %s script.js", result.SessionID),
+		fmt.Sprintf("  browser-agent session log --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session logs --session-id %s", result.SessionID),
 		fmt.Sprintf("  browser-agent session screenshot --session-id %s -o out.png", result.SessionID),
 		fmt.Sprintf("  browser-agent session cdp --session-id %s Page.navigate '{\"url\":\"https://example.com\"}'", result.SessionID),
@@ -665,9 +693,21 @@ func formatSessionNewFirefoxOutput(w io.Writer, result *postCreateSessionResult,
 // timeout so agents/operators treat install as manual user handling.
 const extensionTimeoutUserHandling = "Please run or ask user to run manually: this needs user handling"
 
+// waitingExtensionWarnThreshold: session new warns when this many sessions are
+// already waiting for extension connection (agents tend to spam session new).
+const waitingExtensionWarnThreshold = 3
+
+// isReceivingEndError reports Chrome's classic "service worker not listening"
+// last_error from attach stage tracking.
+func isReceivingEndError(err string) bool {
+	return strings.Contains(strings.ToLower(err), "receiving end does not exist")
+}
+
 // formatExtensionTimeoutHelp returns stderr lines after the soft wait timeout
-// warning. browser is "chrome" or "firefox"; extPath and sessionID may be empty.
-func formatExtensionTimeoutHelp(browser, extPath, sessionID string) string {
+// warning. browser is "chrome" or "firefox"; extPath, sessionID, and lastError
+// may be empty. When lastError is Receiving end, Chrome guidance leads with
+// reload/popup (SW asleep) before install steps.
+func formatExtensionTimeoutHelp(browser, extPath, sessionID, lastError string) string {
 	browser = strings.ToLower(strings.TrimSpace(browser))
 	extPath = strings.TrimSpace(extPath)
 	sessionID = strings.TrimSpace(sessionID)
@@ -676,6 +716,14 @@ func formatExtensionTimeoutHelp(browser, extPath, sessionID string) string {
 	b.WriteString(extensionTimeoutUserHandling)
 	b.WriteByte('\n')
 	b.WriteByte('\n')
+
+	if browser != "firefox" && isReceivingEndError(lastError) {
+		b.WriteString("  Extension service worker looks asleep (Receiving end does not exist).\n")
+		b.WriteString("  Open the Browser Agent toolbar popup, or chrome://extensions → Browser Agent → Reload.\n")
+		b.WriteString("  Or omit --no-wakeup-workaround (background wakeup is on by default).\n")
+		b.WriteString("  Keep the /go?session= tab open; do not run session new again.\n")
+		b.WriteByte('\n')
+	}
 
 	if browser == "firefox" {
 		b.WriteString("  browser-agent install-firefox-extension\n")
@@ -709,15 +757,69 @@ func formatExtensionTimeoutHelp(browser, extPath, sessionID string) string {
 	return b.String()
 }
 
-// waitForExtensionConnection polls GET /v1/session?session=<id> every 500ms until
-// the extension connects with browser-agent support, connects without support, or
-// the adaptive deadline is reached. Deadline starts at base (15s default) and
-// extends by grant (10s) on each attach stage advance, hard-capped at cap (45s
-// default, or explicitTimeout when > 0). Progress ticks go to stderr. On stall,
-// a warning plus install help is printed and nil is returned (session usable).
-func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, explicitTimeout time.Duration, stderr io.Writer) error {
+// warnIfManyWaitingSessions prints a stderr warning when many daemon sessions
+// are already disconnected / waiting_extension. Best-effort; ignores fetch errors.
+func warnIfManyWaitingSessions(baseURL string, stderr io.Writer) {
 	if stderr == nil {
 		stderr = io.Discard
+	}
+	list, err := fetchDaemonSessions(strings.TrimRight(baseURL, "/"))
+	if err != nil {
+		return
+	}
+	waiting := 0
+	for _, snap := range list {
+		if !snap.Extension.Connected {
+			waiting++
+		}
+	}
+	if waiting < waitingExtensionWarnThreshold {
+		return
+	}
+	fmt.Fprintf(stderr, "warning: %d sessions are already waiting for extension connection; prefer reusing an open /go tab (session info / session list) instead of session new. If attach is stuck with Receiving end does not exist, open the Browser Agent toolbar popup or reload the extension.\n", waiting)
+}
+
+// SW wakeup during attach wait: open chrome-extension://…/wakeup.html once when
+// still stuck at register_sent (MV3 SW often ignores page sendMessage/Port).
+const (
+	swWakeupMinElapsed  = 2 * time.Second
+	swWakeupMinAttempts = 5
+)
+
+// shouldOpenSWWakeup reports whether the one-shot extension wakeup page should open.
+func shouldOpenSWWakeup(elapsed time.Duration, stage string, attempts int, alreadyOpened bool) bool {
+	if alreadyOpened {
+		return false
+	}
+	if stage != AttachStageRegisterSent {
+		return false
+	}
+	if elapsed < swWakeupMinElapsed {
+		return false
+	}
+	if attempts < swWakeupMinAttempts {
+		return false
+	}
+	return true
+}
+
+// waitForExtensionConnection polls GET /v1/session?session=<id> every 500ms until
+// the extension connects with browser-agent support, connects without support, or
+// the adaptive deadline is reached. Deadline starts at base (70s default) and
+// extends by grant (10s) on each attach stage advance, hard-capped at cap (70s
+// default, or explicitTimeout when > 0). Progress ticks go to stderr. On stall,
+// a warning plus install help is printed and nil is returned (session usable).
+//
+// When enableWakeup is true (default for session new), on attach stall threshold
+// opens a background wakeup tab once (openWakeup, default openExtensionWakeup).
+// When false (--no-wakeup-workaround), never opens wakeup.
+// Tests pass a recorder / no-op for openWakeup to avoid launching Chrome.
+func waitForExtensionConnection(baseDir, baseURL, sessionID, browser, extPath string, explicitTimeout time.Duration, stderr io.Writer, enableWakeup bool, openWakeup func(extensionInstallPath string) error) error {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	if openWakeup == nil {
+		openWakeup = openExtensionWakeup
 	}
 	base, grant, cap := attachDeadline(explicitTimeout)
 	pollInterval := 500 * time.Millisecond
@@ -727,6 +829,7 @@ func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, exp
 	deadline := started.Add(base)
 	lastStageRank := -1
 	lastStage := ""
+	wakeupOpened := false
 
 	capLabel := cap.Truncate(time.Second)
 	if capLabel < time.Second {
@@ -737,20 +840,16 @@ func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, exp
 		baseLabel = base
 	}
 	fmt.Fprintf(stderr, "Waiting for extension (adaptive, base %s, cap %s)…\n", baseLabel, capLabel)
+	_ = AppendSessionLog(baseDir, sessionID, "info", "wait_start", map[string]any{
+		"base_ms": base.Milliseconds(),
+		"cap_ms":  cap.Milliseconds(),
+	})
 
 	for {
 		snap, err := pollSessionSnapshot(baseURL, sessionID)
 		if err != nil {
 			return fmt.Errorf("daemon unreachable during extension wait: %w", err)
 		}
-		if snap.Extension.Connected {
-			if snap.Extension.SupportsBrowserAgent {
-				fmt.Fprintln(stderr, "Extension connected ✓")
-				return nil
-			}
-			return fmt.Errorf("Error: extension does not support browser-agent. Please install the bundled extension.")
-		}
-
 		stage := ""
 		attempts := 0
 		lastErr := ""
@@ -759,6 +858,37 @@ func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, exp
 			attempts = snap.Attach.RegisterAttempts
 			lastErr = snap.Attach.LastError
 		}
+
+		if snap.Extension.Connected {
+			if snap.Extension.SupportsBrowserAgent {
+				fmt.Fprintln(stderr, "Extension connected ✓")
+				_ = AppendSessionLog(baseDir, sessionID, "info", "wait_connected", map[string]any{
+					"elapsed_ms": time.Since(started).Milliseconds(),
+					"stage":      stage,
+				})
+				return nil
+			}
+			return fmt.Errorf("Error: extension does not support browser-agent. Please install the bundled extension.")
+		}
+
+		elapsedNow := time.Since(started)
+		if enableWakeup && shouldOpenSWWakeup(elapsedNow, stage, attempts, wakeupOpened) {
+			wakeupOpened = true
+			fmt.Fprintln(stderr, "  … waking extension service worker (background wakeup tab)")
+			fields := map[string]any{
+				"stage":      stage,
+				"attempts":   attempts,
+				"elapsed_ms": elapsedNow.Milliseconds(),
+			}
+			if err := openWakeup(extPath); err != nil {
+				fields["error"] = err.Error()
+				_ = AppendSessionLog(baseDir, sessionID, "warn", "sw_wakeup_open", fields)
+				fmt.Fprintf(stderr, "warning: extension wakeup open failed: %v\n", err)
+			} else {
+				_ = AppendSessionLog(baseDir, sessionID, "info", "sw_wakeup_open", fields)
+			}
+		}
+
 		rank := attachStageRank(stage)
 		if rank > lastStageRank {
 			lastStageRank = rank
@@ -804,7 +934,16 @@ func waitForExtensionConnection(baseURL, sessionID, browser, extPath string, exp
 			} else {
 				fmt.Fprintf(stderr, "warning: extension did not connect within %s\n", elapsed)
 			}
-			fmt.Fprint(stderr, formatExtensionTimeoutHelp(browser, extPath, sessionID))
+			fmt.Fprint(stderr, formatExtensionTimeoutHelp(browser, extPath, sessionID, lastErr))
+			fields := map[string]any{
+				"elapsed_ms": elapsed.Milliseconds(),
+				"stage":      lastStage,
+				"attempts":   attempts,
+			}
+			if lastErr != "" {
+				fields["last_error"] = lastErr
+			}
+			_ = AppendSessionLog(baseDir, sessionID, "warn", "wait_timeout", fields)
 			return nil
 		}
 		if !now.Before(nextProgress) {

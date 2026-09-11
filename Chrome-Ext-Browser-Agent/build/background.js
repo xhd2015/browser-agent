@@ -17,7 +17,7 @@ const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.17";
+    : "1.0.18";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 const FEATURES = ["browser-agent", "har-capture"];
@@ -45,6 +45,9 @@ const RECONNECT_MAX_MS = 2000;
 const RECONNECT_BASE_MS = 100;
 /** Keepalive ping while connected (keeps MV3 SW + WS alive). */
 const KEEPALIVE_MS = 15000;
+/** Offscreen document URL for SW idle keep-alive while sessions are connected. */
+const OFFSCREEN_URL = "offscreen.html";
+const OFFSCREEN_PORT_NAME = "ba-offscreen-keepalive";
 /**
  * Tabs with chrome.debugger currently attached (true CDP debuggees).
  *
@@ -95,6 +98,56 @@ function baLog(level, msg, detail) {
     if (level === "error") console.error(text);
     else if (level === "warn") console.warn(text);
     else console.log(text);
+  } catch (e) {
+    /* ignore */
+  }
+  // Persist to daemon (survives SW death). Fire-and-forget; never block jobs.
+  pushExtensionLogToDaemon(level, msg, detail);
+}
+
+/**
+ * POST /v1/ext/log — unified extension-chrome.log.jsonl on the control server.
+ * Optional session_id when a single session is bound or detail carries one.
+ */
+function pushExtensionLogToDaemon(level, msg, detail) {
+  try {
+    let controlPort = CONTROL_PORT;
+    let sessionId = "";
+    try {
+      if (sessions && sessions.size === 1) {
+        const only = sessions.values().next().value;
+        if (only) {
+          if (only.controlPort != null) controlPort = only.controlPort;
+          if (only.sessionId) sessionId = only.sessionId;
+        }
+      }
+    } catch (e) {
+      /* sessions may not exist yet during early boot */
+    }
+    if (
+      !sessionId &&
+      detail &&
+      typeof detail === "object" &&
+      (detail.session_id || detail.sessionId)
+    ) {
+      sessionId = detail.session_id || detail.sessionId;
+    }
+    const body = {
+      browser: "chrome",
+      level: level || "log",
+      msg: String(msg || ""),
+      source: "extension",
+      ts: new Date().toISOString(),
+    };
+    if (sessionId) body.session_id = sessionId;
+    if (detail != null && detail !== "") body.detail = detail;
+    fetch("http://127.0.0.1:" + controlPort + "/v1/ext/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(function () {
+      /* daemon down */
+    });
   } catch (e) {
     /* ignore */
   }
@@ -544,11 +597,22 @@ function handlePrepareReconnect(msg, sessionId, entry) {
 function connectSession(sessionId, reason) {
   if (!sessionId) return;
   const entry = getOrCreateSessionEntry(sessionId);
+  const why = reason || "";
 
   if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+    baLog("log", "connectSession skip", {
+      session_id: sessionId,
+      reason: why,
+      skip: "ws_already_open",
+    });
     return;
   }
   if (entry.ws && entry.ws.readyState === WebSocket.CONNECTING) {
+    baLog("log", "connectSession skip", {
+      session_id: sessionId,
+      reason: why,
+      skip: "ws_connecting",
+    });
     return;
   }
   if (entry.ws) {
@@ -561,9 +625,21 @@ function connectSession(sessionId, reason) {
   }
 
   let socket;
+  const wsURL = wsURLForSession(sessionId, entry.controlPort);
+  baLog("log", "connectSession start", {
+    session_id: sessionId,
+    reason: why,
+    control_port: entry.controlPort,
+    ws_url: wsURL,
+  });
   try {
-    socket = new WebSocket(wsURLForSession(sessionId, entry.controlPort));
+    socket = new WebSocket(wsURL);
   } catch (e) {
+    baLog("error", "connectSession WebSocket ctor fail", {
+      session_id: sessionId,
+      reason: why,
+      error: String(e && e.message ? e.message : e),
+    });
     scheduleReconnect(sessionId);
     return;
   }
@@ -584,10 +660,20 @@ function connectSession(sessionId, reason) {
   socket.onopen = () => {
     clearConnectTimeout(entry);
     entry.reconnectAttempt = 0;
+    baLog("log", "connectSession ws_open", {
+      session_id: sessionId,
+      reason: why,
+    });
     sendHello(sessionId, entry)
       .then(() => flushPendingJobResults(entry))
-      .catch(() => {});
+      .catch((e) => {
+        baLog("warn", "connectSession hello fail", {
+          session_id: sessionId,
+          error: String(e && e.message ? e.message : e),
+        });
+      });
     startKeepalive(sessionId, entry);
+    ensureOffscreenKeepAlive().catch(() => {});
   };
 
   socket.onmessage = (ev) => {
@@ -707,10 +793,22 @@ function parseGoSessionFromURL(url) {
   return { sessionId: sessionId, controlPort: controlPort };
 }
 
-function maybeRegisterGoTab(tabId, url, tab) {
+function maybeRegisterGoTab(tabId, url, tab, source) {
+  const src = source || "unknown";
   const parsed = parseGoSessionFromURL(url);
-  if (!parsed) return;
-  handleRegisterMessage(
+  if (!parsed) {
+    // Only note near-misses (looks like control host) — avoid spam on every tab.
+    if (url && (url.indexOf("/go") >= 0 || url.indexOf("43761") >= 0)) {
+      baLog("log", "maybeRegisterGoTab skip", {
+        source: src,
+        tab_id: tabId,
+        url: String(url).slice(0, 200),
+        reason: "not_go_session_url",
+      });
+    }
+    return false;
+  }
+  const ok = handleRegisterMessage(
     {
       type: "register",
       session_id: parsed.sessionId,
@@ -720,6 +818,15 @@ function maybeRegisterGoTab(tabId, url, tab) {
     },
     { tab: { id: tabId, windowId: tab && tab.windowId, url: url } },
   );
+  baLog(ok ? "log" : "warn", "maybeRegisterGoTab", {
+    source: src,
+    tab_id: tabId,
+    window_id: tab && tab.windowId,
+    session_id: parsed.sessionId,
+    url: String(url).slice(0, 200),
+    ok: !!ok,
+  });
+  return !!ok;
 }
 
 /**
@@ -808,10 +915,41 @@ function handleRegisterMessage(msg, sender) {
   const senderURL =
     (sender && sender.tab && sender.tab.url) || (sender && sender.url) || "";
   const parsed = parseGoSessionFromURL(senderURL);
-  if (!claimedSessionId || !parsed || parsed.sessionId !== claimedSessionId) return false;
+  if (!claimedSessionId) {
+    baLog("warn", "register reject", { reason: "empty_session_id", sender_url: String(senderURL || "").slice(0, 200) });
+    return false;
+  }
+  if (!parsed) {
+    baLog("warn", "register reject", {
+      reason: "sender_url_not_go",
+      session_id: claimedSessionId,
+      sender_url: String(senderURL || "").slice(0, 200),
+      has_tab: !!(sender && sender.tab),
+      tab_id: sender && sender.tab && sender.tab.id,
+    });
+    return false;
+  }
+  if (parsed.sessionId !== claimedSessionId) {
+    baLog("warn", "register reject", {
+      reason: "session_id_mismatch",
+      claimed: claimedSessionId,
+      url_session: parsed.sessionId,
+      sender_url: String(senderURL || "").slice(0, 200),
+    });
+    return false;
+  }
   const sessionId = parsed.sessionId;
   const senderTab = sender && sender.tab;
-  if (!senderTab || senderTab.id == null || senderTab.windowId == null) return false;
+  if (!senderTab || senderTab.id == null || senderTab.windowId == null) {
+    baLog("warn", "register reject", {
+      reason: "missing_tab_or_window",
+      session_id: sessionId,
+      tab_id: senderTab && senderTab.id,
+      window_id: senderTab && senderTab.windowId,
+      sender_url: String(senderURL || "").slice(0, 200),
+    });
+    return false;
+  }
   const entry = getOrCreateSessionEntry(sessionId);
   const tabId = senderTab.id;
   const windowId = senderTab.windowId;
@@ -825,7 +963,14 @@ function handleRegisterMessage(msg, sender) {
   // Attaching on /go register (and on every SW wake heal) freezes Chrome's UI and
   // delays/blocks the toolbar default_popup for tens of seconds. Content tabs still
   // eager-attach on create_tab / navigate (P2); jobs attach on demand.
+  baLog("log", "register ok", {
+    session_id: sessionId,
+    tab_id: tabId,
+    window_id: windowId,
+    control_port: entry.controlPort,
+  });
   connectSession(sessionId, "register");
+  ensureOffscreenKeepAlive().catch(() => {});
   return true;
 }
 
@@ -842,10 +987,223 @@ function handleRegisterFromMessage(msg, sender, sendResponse) {
   return true;
 }
 
+/**
+ * Long-lived Ports from /go content scripts and session-page boot keep the MV3
+ * service worker alive while a control tab is open. One-shot sendMessage often
+ * fails with "Receiving end does not exist" after SW idle kill; connect wakes
+ * and holds the worker so register + WS can complete.
+ *
+ * Port name: "ba-session:<sessionId>"
+ */
+const sessionKeepAlivePorts = new Set();
+
+function sessionIdFromPortName(name) {
+  const raw = String(name || "");
+  if (raw.indexOf("ba-session:") === 0) {
+    return raw.slice("ba-session:".length).trim();
+  }
+  return "";
+}
+
+function ackPortRegister(port, ok) {
+  try {
+    port.postMessage(
+      ok
+        ? { ok: true, type: "register_ack" }
+        : { ok: false, type: "register_rejected" },
+    );
+  } catch (e) {
+    /* channel closed */
+  }
+}
+
+/**
+ * Register from a keep-alive Port. When sender.tab is missing (common for
+ * externally_connectable connect before the tab binding is ready), resolve the
+ * /go tab via tabs.query so WS can still attach.
+ */
+function tryRegisterFromPort(port, msg) {
+  const claimed =
+    (msg && (msg.session_id || msg.sessionId)) ||
+    sessionIdFromPortName(port.name) ||
+    "";
+  if (!claimed) {
+    baLog("warn", "port register skip", {
+      reason: "empty_session_id",
+      port_name: port && port.name,
+    });
+    ackPortRegister(port, false);
+    return false;
+  }
+  const payload = Object.assign({}, msg || {}, {
+    type: "register",
+    session_id: claimed,
+  });
+  // Prefer tabs.query over port.sender.tab — sender.tab.url is often empty on
+  // the first externally_connectable connect, which caused silent register_rejected.
+  if (!chrome.tabs || typeof chrome.tabs.query !== "function") {
+    const sender = port.sender || {};
+    const result = handleRegisterMessage(payload, sender);
+    const ok = result === true || (result !== false && sessions.has(claimed));
+    baLog(ok ? "log" : "warn", "port register", {
+      session_id: claimed,
+      via: "sender_only",
+      ok: !!ok,
+    });
+    ackPortRegister(port, ok);
+    return ok;
+  }
+  chrome.tabs.query({}, (tabs) => {
+    if (chrome.runtime.lastError) {
+      baLog("warn", "port register tabs.query fail", {
+        session_id: claimed,
+        error: chrome.runtime.lastError.message,
+      });
+      ackPortRegister(port, false);
+      return;
+    }
+    for (const tab of tabs || []) {
+      if (!tab || tab.id == null) continue;
+      const parsed = parseGoSessionFromURL(tab.url || "");
+      if (!parsed || parsed.sessionId !== claimed) continue;
+      const tabSender = { tab: tab, url: tab.url || "" };
+      const r = handleRegisterMessage(payload, tabSender);
+      const success = r === true || (r !== false && sessions.has(claimed));
+      baLog(success ? "log" : "warn", "port register", {
+        session_id: claimed,
+        via: "tabs_query",
+        tab_id: tab.id,
+        ok: !!success,
+      });
+      ackPortRegister(port, success);
+      return;
+    }
+    // Fallback: sender.tab if query found nothing yet (tab still loading).
+    const sender = port.sender || {};
+    const result = handleRegisterMessage(payload, sender);
+    const ok = result === true || (result !== false && sessions.has(claimed));
+    baLog(ok ? "log" : "warn", "port register", {
+      session_id: claimed,
+      via: "sender_fallback",
+      tab_id: sender.tab && sender.tab.id,
+      sender_url: String(
+        (sender.tab && sender.tab.url) || sender.url || "",
+      ).slice(0, 200),
+      ok: !!ok,
+    });
+    ackPortRegister(port, ok);
+  });
+  return false;
+}
+
+function handleSessionKeepAlivePort(port) {
+  if (!port) return;
+  sessionKeepAlivePorts.add(port);
+  const drop = () => {
+    sessionKeepAlivePorts.delete(port);
+  };
+  try {
+    port.onDisconnect.addListener(drop);
+  } catch (e) {
+    /* ignore */
+  }
+
+  const portName = (port && port.name) || "";
+  // Offscreen keepalive Port — hold SW idle timer; no session register.
+  if (portName === OFFSCREEN_PORT_NAME || portName.indexOf("ba-offscreen") === 0) {
+    baLog("log", "offscreen port connect", {});
+    try {
+      port.onMessage.addListener((msg) => {
+        if (msg && msg.type === "keepalive") {
+          /* message receipt resets SW idle */
+        }
+      });
+    } catch (e) {
+      /* ignore */
+    }
+    return;
+  }
+
+  baLog("log", "port connect", {
+    port_name: portName,
+    has_tab: !!(port.sender && port.sender.tab),
+    tab_id: port.sender && port.sender.tab && port.sender.tab.id,
+    sender_url: String(
+      (port.sender && port.sender.tab && port.sender.tab.url) ||
+        (port.sender && port.sender.url) ||
+        "",
+    ).slice(0, 200),
+  });
+
+  // Only register on postMessage — NOT on connect. chrome.runtime.connect()
+  // delivers onConnect synchronously before the page attaches onMessage, so an
+  // immediate ack was lost and the page kept spinning on register_sent.
+  try {
+    port.onMessage.addListener((msg) => {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "register" || msg.type === "ping") {
+        tryRegisterFromPort(port, msg);
+      } else if (msg.type === "keepalive") {
+        /* /go page ping — resets SW idle while session connected */
+      }
+    });
+  } catch (e) {
+    /* ignore */
+  }
+
+  // Rediscover open /go tabs (tabs.onUpdated wake + register).
+  scheduleHealSessionsFromTabs("port-connect", 0);
+  ensureOffscreenKeepAlive().catch(() => {});
+}
+
+/**
+ * Ensure a hidden offscreen document exists to ping this SW every ~20s while
+ * sessions are connected (resets MV3 idle kill without a visible tab).
+ */
+async function ensureOffscreenKeepAlive() {
+  if (!chrome.offscreen || typeof chrome.offscreen.createDocument !== "function") {
+    return;
+  }
+  try {
+    const contexts =
+      chrome.runtime.getContexts &&
+      (await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+      }));
+    if (contexts && contexts.length > 0) return;
+  } catch (e) {
+    /* getContexts may be unavailable — try create anyway */
+  }
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: ["WORKERS"],
+      justification:
+        "Keep Browser Agent service worker alive while control sessions are connected",
+    });
+    baLog("log", "offscreen keepalive created", {});
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    // Already exists is fine.
+    if (/already exists|only one offscreen/i.test(msg)) return;
+    baLog("warn", "offscreen keepalive create failed", { error: msg });
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "register") {
     return handleRegisterFromMessage(msg, sender, sendResponse);
+  }
+  // Silent wakeup.html (session-new cold-start): force heal of open /go tabs.
+  if (msg.type === "wakeup") {
+    scheduleHealSessionsFromTabs("wakeup-page", 0);
+    try {
+      sendResponse({ ok: true, type: "wakeup_ack" });
+    } catch (e) {
+      /* channel closed */
+    }
+    return true;
   }
   // Popup progressive status API: status / getStatus / popupStatus.
   if (
@@ -879,6 +1237,15 @@ try {
   /* onMessageExternal unavailable in some fixtures */
 }
 
+// Port keep-alive — register listeners at top level (no try/catch around
+// addListener) so Chrome includes them in MV3 service-worker wake events.
+// onConnectExternal wakes from session-page chrome.runtime.connect(EXT_ID);
+// onConnect wakes from content-script connect({name}).
+chrome.runtime.onConnect.addListener(handleSessionKeepAlivePort);
+if (chrome.runtime.onConnectExternal) {
+  chrome.runtime.onConnectExternal.addListener(handleSessionKeepAlivePort);
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   closeHARTab(tabId);
   // Re-query remaining control tabs for every session (multi-tab safe).
@@ -898,7 +1265,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const url = (changeInfo && changeInfo.url) || (tab && tab.url) || "";
   if (url) {
     if (changeInfo.status === "loading" || changeInfo.status === "complete") {
-      maybeRegisterGoTab(tabId, url, tab);
+      // High-signal cold-start breadcrumb: did Chrome deliver onUpdated for /go?
+      if (url.indexOf("/go") >= 0 || url.indexOf("session=") >= 0) {
+        baLog("log", "tabs.onUpdated", {
+          tab_id: tabId,
+          status: changeInfo && changeInfo.status,
+          change_url: !!(changeInfo && changeInfo.url),
+          url: String(url).slice(0, 200),
+          window_id: tab && tab.windowId,
+        });
+      }
+      maybeRegisterGoTab(tabId, url, tab, "tabs.onUpdated");
     }
     // Navigate-away leave: when a bound control tab leaves /go?session=, recount.
     const leaveIds = [];
@@ -936,6 +1313,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.tabs.onCreated.addListener((tab) => {
   if (tab && tab.id != null) updateHARTabFromChrome(tab.id, {}, tab).catch(() => {});
+  // session new --new-window: register /go control tab as soon as it exists
+  // (onUpdated alone can miss the first commit in some Chrome builds).
+  if (tab && tab.id != null) {
+    const earlyURL = tab.url || tab.pendingUrl || "";
+    if (earlyURL) {
+      if (earlyURL.indexOf("/go") >= 0 || earlyURL.indexOf("session=") >= 0) {
+        baLog("log", "tabs.onCreated", {
+          tab_id: tab.id,
+          url: String(earlyURL).slice(0, 200),
+          pending: !!(tab.pendingUrl && !tab.url),
+          window_id: tab.windowId,
+        });
+      }
+      maybeRegisterGoTab(tab.id, earlyURL, tab, "tabs.onCreated");
+    }
+  }
   // P2 eager arm: auto-attach newly opened capturable tabs in armed session windows.
   if (!tab || tab.id == null || tab.windowId == null) return;
   const tabUrl = tab.url || tab.pendingUrl || "";
@@ -952,22 +1345,50 @@ chrome.tabs.onCreated.addListener((tab) => {
  * freezes Chrome UI and blocks toolbar default_popup (often 10–30s). Multi-tab
  * attach stays on create_tab / navigate / jobs only.
  */
+function shouldAdoptDebuggerOnHeal(reason) {
+  const r = String(reason || "");
+  // Only reconcile debugger ownership after SW (re)boot — not on every Port/alarm
+  // tick (that work can stall the worker while sessions are actively connected).
+  return (
+    r.indexOf("sw-boot") === 0 ||
+    r === "onInstalled" ||
+    r === "onStartup" ||
+    r === "wakeup-page"
+  );
+}
+
 async function healSessionsFromTabs(reason) {
   baLog("log", "healSessionsFromTabs start", { reason: reason || "" });
-  // Reconcile chrome.debugger ownership into attachedTabs after SW restart.
-  // Do not attach here — only adopt already-attached targets so later jobs can reuse.
   let adopted = 0;
-  try {
-    adopted = await adoptDebuggerTargetsFromChrome(reason || "heal");
-  } catch (e) {
-    baLog("warn", "healSessionsFromTabs adopt failed", {
-      reason: reason || "",
-      error: String(e && e.message ? e.message : e),
-    });
+  if (shouldAdoptDebuggerOnHeal(reason)) {
+    try {
+      adopted = await adoptDebuggerTargetsFromChrome(reason || "heal");
+    } catch (e) {
+      baLog("warn", "healSessionsFromTabs adopt failed", {
+        reason: reason || "",
+        error: String(e && e.message ? e.message : e),
+      });
+    }
   }
+  // Prefer known session control tabs; fall back to a full query only for /go URLs.
   let tabs = [];
   try {
-    tabs = await chrome.tabs.query({});
+    const known = [];
+    for (const entry of sessions.values()) {
+      if (entry && entry.tabId != null) {
+        try {
+          const t = await chrome.tabs.get(entry.tabId);
+          if (t) known.push(t);
+        } catch (e) {
+          /* tab gone */
+        }
+      }
+    }
+    if (known.length > 0) {
+      tabs = known;
+    } else {
+      tabs = await chrome.tabs.query({});
+    }
   } catch (e) {
     baLog("warn", "healSessionsFromTabs tabs.query failed", {
       reason: reason || "",
@@ -982,15 +1403,34 @@ async function healSessionsFromTabs(reason) {
     const parsed = parseGoSessionFromURL(url);
     if (!parsed) continue;
     found += 1;
-    // Bind + WS only — no maybeEagerAttach.
-    maybeRegisterGoTab(tab.id, url, tab);
+    // Bind + WS only — no maybeEagerAttach / debugger.
+    maybeRegisterGoTab(tab.id, url, tab, "heal:" + (reason || ""));
+  }
+  // If we only scanned known tabIds and found nothing, one full /go scan.
+  if (found === 0 && sessions.size > 0) {
+    try {
+      const all = await chrome.tabs.query({});
+      for (const tab of all || []) {
+        if (!tab || tab.id == null) continue;
+        const url = tab.url || "";
+        if (!parseGoSessionFromURL(url)) continue;
+        found += 1;
+        maybeRegisterGoTab(tab.id, url, tab, "heal-full:" + (reason || ""));
+      }
+    } catch (e) {
+      /* ignore */
+    }
   }
   baLog("log", "healSessionsFromTabs done", {
     reason: reason || "",
     control_tabs: found,
     attach: "skipped_for_popup_ux",
     adopted_debugger_tabs: adopted,
+    scoped: sessions.size > 0,
   });
+  if (found > 0 || sessions.size > 0) {
+    ensureOffscreenKeepAlive().catch(() => {});
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -2595,6 +3035,122 @@ function sendDebuggerCommand(tabId, method, params) {
   });
 }
 
+/** CDP -32000 when the tab navigates/closes while a debugger command is in flight. */
+function isTargetNavigatedOrClosedError(err) {
+  const msg = String((err && err.message) || err || "");
+  return /navigated or closed|Inspected target navigated|Cannot access|target closed|-32000/i.test(
+    msg,
+  );
+}
+
+/**
+ * Wait until the tab reaches status=complete (or timeout). Used after a
+ * mid-command navigation so we can re-attach and retry once.
+ */
+function waitTabComplete(tabId, timeoutMs) {
+  const ms = timeoutMs != null && timeoutMs > 0 ? timeoutMs : 15000;
+  const deadline = Date.now() + ms;
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (!t) {
+          reject(new Error("tab closed after navigation"));
+          return;
+        }
+        if (t.status === "complete" || Date.now() >= deadline) {
+          resolve(t);
+          return;
+        }
+      } catch (e) {
+        reject(new Error("tab closed after navigation"));
+        return;
+      }
+      setTimeout(tick, 200);
+    };
+    tick();
+  });
+}
+
+function clearDebuggerAttachBookkeeping(sessionId, tabId) {
+  attachedTabs.delete(tabId);
+  const state = sessionAttachState.get(sessionId);
+  if (state && state.attachedTabIds) state.attachedTabIds.delete(tabId);
+}
+
+/**
+ * Fail-fast: abort in-flight debugger work as soon as the target tab navigates,
+ * is removed, or the debugger detaches — instead of waiting for CLI job timeout.
+ * Returns { promise, cancel }.
+ */
+function createTabTargetAbort(tabId) {
+  let cleaned = false;
+  let onUpdated = null;
+  let onRemoved = null;
+  let onDetach = null;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      if (onUpdated) chrome.tabs.onUpdated.removeListener(onUpdated);
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      if (onRemoved) chrome.tabs.onRemoved.removeListener(onRemoved);
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      if (onDetach) chrome.debugger.onDetach.removeListener(onDetach);
+    } catch (e) {
+      /* ignore */
+    }
+  };
+  const promise = new Promise((_, reject) => {
+    const abort = (why) => {
+      cleanup();
+      reject(
+        new Error(
+          "Inspected target navigated or closed" + (why ? " (" + why + ")" : ""),
+        ),
+      );
+    };
+    onUpdated = (id, changeInfo) => {
+      if (id !== tabId) return;
+      // URL change or navigation start — CDP target is about to die / already dead.
+      if (changeInfo && (changeInfo.url != null || changeInfo.status === "loading")) {
+        abort(changeInfo.url != null ? "url changed" : "loading");
+      }
+    };
+    onRemoved = (id) => {
+      if (id === tabId) abort("tab removed");
+    };
+    onDetach = (source, reason) => {
+      if (source && source.tabId === tabId) {
+        abort("debugger detached" + (reason ? ": " + reason : ""));
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    try {
+      chrome.debugger.onDetach.addListener(onDetach);
+    } catch (e) {
+      /* ignore */
+    }
+  });
+  return { promise: promise, cancel: cleanup };
+}
+
+async function runWithTabTargetWatch(tabId, fn) {
+  const watch = createTabTargetAbort(tabId);
+  try {
+    return await Promise.race([fn(tabId), watch.promise]);
+  } finally {
+    watch.cancel();
+  }
+}
+
 async function withDebuggerForSession(sessionId, fn, opts) {
   const tabId = await pickTargetTabIdForSession(sessionId, opts || {});
   touchDebuggerActivity();
@@ -2619,7 +3175,31 @@ async function withDebuggerForSession(sessionId, fn, opts) {
   await attachDebuggerForSession(sessionId, tabId);
   touchDebuggerActivity();
   try {
-    return await fn(tabId);
+    try {
+      // Race CDP work against tab nav/close/detach so agents fail in ms, not at --timeout.
+      return await runWithTabTargetWatch(tabId, fn);
+    } catch (err) {
+      // Eval/run that does location.href / form submit kills the CDP target.
+      // Fail fast (above), then wait for load, re-attach, retry the job once.
+      if (!isTargetNavigatedOrClosedError(err)) throw err;
+      baLog("warn", "debugger target navigated; wait+reattach+retry once", {
+        session_id: sessionId,
+        tab_id: tabId,
+        error: err && err.message ? err.message : String(err),
+      });
+      clearDebuggerAttachBookkeeping(sessionId, tabId);
+      try {
+        await waitTabComplete(tabId, 15000);
+      } catch (e2) {
+        throw new Error(
+          "Inspected target navigated or closed (tab gone after navigation): " +
+            (e2 && e2.message ? e2.message : String(e2)),
+        );
+      }
+      await attachDebuggerForSession(sessionId, tabId);
+      touchDebuggerActivity();
+      return await runWithTabTargetWatch(tabId, fn);
+    }
   } finally {
     touchDebuggerActivity();
   }

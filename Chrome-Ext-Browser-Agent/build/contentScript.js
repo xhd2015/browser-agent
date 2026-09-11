@@ -6,7 +6,7 @@
     window.__BROWSER_AGENT_EXT__ = {
       product: "browser-agent",
       controlPort: 43761,
-      version: "1.0.17",
+      version: "1.0.18",
       features: ["browser-agent"],
     };
   } catch (e) {
@@ -54,7 +54,11 @@
   var connected = false;
   var burstTimer = null;
   var slowTimer = null;
+  var holdTimer = null;
   var registerAttempts = 0;
+  var keepAlivePort = null;
+  var keepAliveRetryTimer = null;
+  var PORT_PING_MS = 20000;
 
   function reportAttach(stage, lastError) {
     const session_id = readSessionIdFromPage();
@@ -77,10 +81,97 @@
     }
   }
 
+  function clearKeepAliveRetry() {
+    if (keepAliveRetryTimer) {
+      clearTimeout(keepAliveRetryTimer);
+      keepAliveRetryTimer = null;
+    }
+  }
+
+  function scheduleKeepAliveRetry(ms) {
+    clearKeepAliveRetry();
+    keepAliveRetryTimer = setTimeout(function () {
+      keepAliveRetryTimer = null;
+      ensureKeepAlivePort();
+    }, ms || 500);
+  }
+
+  /**
+   * Long-lived Port holds the MV3 service worker while /go stays open —
+   * including AFTER extension.connected (critical for agent job reliability).
+   */
+  function ensureKeepAlivePort() {
+    const session_id = readSessionIdFromPage();
+    if (!session_id) return;
+    if (keepAlivePort) {
+      try {
+        keepAlivePort.postMessage({ type: "keepalive", session_id: session_id });
+      } catch (e) {
+        keepAlivePort = null;
+      }
+      if (keepAlivePort) return;
+    }
+    try {
+      if (!chrome || !chrome.runtime || typeof chrome.runtime.connect !== "function") {
+        return;
+      }
+      const port = chrome.runtime.connect({
+        name: "ba-session:" + session_id,
+      });
+      keepAlivePort = port;
+      port.onMessage.addListener(function (resp) {
+        if (resp && resp.ok) {
+          registeredAck = true;
+          if (!connected) reportAttach("sw_ack", null);
+        } else if (resp && resp.ok === false && !connected) {
+          reportAttach("register_sent", "register_rejected");
+        }
+      });
+      setTimeout(function () {
+        if (!keepAlivePort) return;
+        try {
+          keepAlivePort.postMessage({
+            type: connected ? "keepalive" : "register",
+            session_id: session_id,
+            control_port: readControlPortFromPage(),
+          });
+        } catch (e) {
+          /* ignore */
+        }
+      }, 50);
+      port.onDisconnect.addListener(function () {
+        keepAlivePort = null;
+        if (!connected && chrome.runtime && chrome.runtime.lastError) {
+          reportAttach(
+            "register_sent",
+            chrome.runtime.lastError.message ||
+              String(chrome.runtime.lastError),
+          );
+        }
+        // Always retry — Port must stay up while this /go tab is open.
+        scheduleKeepAliveRetry(connected ? 1000 : 500);
+      });
+      if (!connected) {
+        registerAttempts += 1;
+        reportAttach("register_sent", null);
+      }
+      port.postMessage({
+        type: connected ? "keepalive" : "register",
+        session_id: session_id,
+        control_port: readControlPortFromPage(),
+      });
+    } catch (e) {
+      keepAlivePort = null;
+      scheduleKeepAliveRetry(connected ? 2000 : 1000);
+    }
+  }
+
   function sendRegister() {
     if (connected) return false;
     const session_id = readSessionIdFromPage();
     if (!session_id) return false;
+
+    ensureKeepAlivePort();
 
     const control_port = readControlPortFromPage();
     try {
@@ -101,17 +192,24 @@
               chrome.runtime.lastError.message ||
                 String(chrome.runtime.lastError),
             );
+            // Port path is the SW wake; retry connect when one-shot message fails.
+            if (!keepAlivePort) scheduleKeepAliveRetry(250);
             return;
           }
           if (resp && resp.ok) {
             registeredAck = true;
             reportAttach("sw_ack", null);
+          } else if (resp && resp.ok === false) {
+            reportAttach("register_sent", "register_rejected");
+          } else {
+            reportAttach("register_sent", "register_no_response");
           }
         },
       );
       return true;
     } catch (e) {
       /* extension context invalidated */
+      if (!keepAlivePort) scheduleKeepAliveRetry(500);
       return false;
     }
   }
@@ -139,6 +237,8 @@
             clearInterval(burstTimer);
             burstTimer = null;
           }
+          // Keep Port alive after connect — do not stop hold timer.
+          if (now) ensureKeepAlivePort();
         })
         .catch(function () {
           /* ignore */
@@ -149,8 +249,11 @@
   }
 
   function kick() {
-    sendRegister();
-    pollConnected();
+    ensureKeepAlivePort();
+    if (!connected) {
+      sendRegister();
+      pollConnected();
+    }
   }
 
   if (!readSessionIdFromPage()) return;
@@ -169,16 +272,22 @@
 
   // While the /go page stays open: re-register if daemon/SW dies later.
   slowTimer = setInterval(function () {
+    ensureKeepAlivePort();
     if (!connected) {
       kick();
       return;
     }
-    // Connected: only re-check; resume register if status drops.
+    // Connected: hold Port + re-check; resume register if status drops.
     pollConnected();
     setTimeout(function () {
       if (!connected) sendRegister();
     }, 200);
   }, 10000);
+
+  // Dedicated Port ping while connected (resets MV3 SW idle).
+  holdTimer = setInterval(function () {
+    ensureKeepAlivePort();
+  }, PORT_PING_MS);
 
   try {
     window.addEventListener("pageshow", function () {

@@ -158,9 +158,17 @@ func TestBuildFirefoxOpenArgs_newWindow(t *testing.T) {
 }
 
 func TestBuildChromeArgs_newWindow(t *testing.T) {
-	args := BuildChromeArgs("http://example.com/go?session=x", "")
+	args := BuildChromeArgs("http://example.com/go?session=x", "/tmp/ext")
 	if len(args) < 2 || args[0] != "--new-window" {
 		t.Fatalf("want --new-window first; args=%v", args)
+	}
+	if args[1] != "http://example.com/go?session=x" {
+		t.Fatalf("want session URL second; args=%v", args)
+	}
+	for _, a := range args {
+		if strings.Contains(a, "load-extension") {
+			t.Fatalf("default-profile args must not pass --load-extension; args=%v", args)
+		}
 	}
 }
 

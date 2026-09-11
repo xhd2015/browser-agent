@@ -4,7 +4,7 @@
 
 ```
 BuildChromeArgs(sessionURL, extensionInstallPath)
-  -> includes --load-extension=<path>
+  -> --new-window + URL; no --load-extension / --user-data-dir
   -> must NOT include --user-data-dir
 ```
 

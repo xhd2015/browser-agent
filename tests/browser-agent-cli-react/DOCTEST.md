@@ -10,7 +10,7 @@ Exercises the **operator-facing product shell** on top of the sealed
 | ProductConfig | browser-agent (43761) + browser-trace (43759) dual export |
 | SPA embed | GET `/go` or `/` React root + product hooks + install markers |
 | Extension extract | embed extract, re-extract, manifest 43761, install CLI stdout |
-| Chrome launch args | pure `--load-extension=…`; no `--user-data-dir` |
+| Chrome launch args | `--new-window` + URL; no `--load-extension` / `--user-data-dir` |
 | React source layout | `react/src/products`, apps entries, `InstallGuideline` on disk |
 | Ext shell on disk | `Chrome-Ext-Browser-Agent` manifest name + host **43761** |
 
@@ -126,7 +126,7 @@ browser-agent-cli-react
 │   ├── manifest-hosts-43761/                    E3 extracted manifest mentions 43761
 │   └── install-cli-stdout/                      E4 path + chrome://extensions + \n
 ├── chrome-launch-args/                        [pure arg builder]
-│   └── load-extension-no-user-data-dir/         F1 --load-extension; no user-data-dir
+│   └── load-extension-no-user-data-dir/         F1 --new-window+URL; no load-extension/user-data-dir
 ├── react-src/                                 [module filesystem layout]
 │   ├── products-browser-agent/                  G1 react/src/products/browser-agent.*
 │   ├── apps-entries/                            G2 session-page + popup main entries
@@ -163,7 +163,7 @@ browser-agent-cli-react
 | `extension-extract/re-extract-same-version` | (E2) second extract → same path/version |
 | `extension-extract/manifest-hosts-43761` | (E3) extracted manifest text mentions **43761** |
 | `extension-extract/install-cli-stdout` | (E4) InstallChromeExtension stdout: path + chrome://extensions + load unpacked; `\n` |
-| `chrome-launch-args/load-extension-no-user-data-dir` | (F1) `--load-extension=<path>`; no `--user-data-dir` |
+| `chrome-launch-args/load-extension-no-user-data-dir` | (F1) `--new-window` + URL; no `--load-extension` / `--user-data-dir` |
 | `react-src/products-browser-agent` | (G1) `react/src/products/browser-agent.{ts,tsx,js}` exists; contains `43761` + `browser-agent` |
 | `react-src/apps-entries` | (G2) session-page + popup app entry files under `react/src/apps/` |
 | `react-src/install-guideline-component` | (G3) `InstallGuideline` under `react/src/ui/` |
@@ -233,7 +233,7 @@ BuildChromeArgs(sessionURL, extensionPath string) []string
 ```
 
 - Layout `{BaseDir}/extension/{version}/manifest.json`
-- Chrome args: include `--load-extension=<path>`; **omit** `--user-data-dir`
+- Chrome args: `--new-window` + session URL; **omit** `--load-extension` and `--user-data-dir`
 - Install stdout: absolute path, Developer mode, Load unpacked, `chrome://extensions`; ends `\n`
 - Mini MV3 fixture embed OK for CI (`testdata/mini-extension/` shape)
 

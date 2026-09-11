@@ -200,27 +200,26 @@ func assertChromeArgsContract(t *testing.T, args []string, extPath, sessionURL s
 	if len(args) == 0 {
 		t.Fatal("ChromeArgs is empty")
 	}
-	hasLoad := false
-	for i, a := range args {
-		if a == "--load-extension" && i+1 < len(args) && args[i+1] == extPath {
-			hasLoad = true
-			break
-		}
-		if strings.HasPrefix(a, "--load-extension=") {
-			val := strings.TrimPrefix(a, "--load-extension=")
-			if val == extPath || strings.Contains(a, extPath) {
-				hasLoad = true
-				break
-			}
-		}
-	}
-	if !hasLoad {
-		t.Fatalf("ChromeArgs missing --load-extension=%s; args=%v", extPath, args)
-	}
+	// Default-profile session open must NOT pass --load-extension (joins the
+	// operator's Load-unpacked Chrome). Managed profiles use a different builder.
+	_ = extPath
 	for _, a := range args {
+		if a == "--load-extension" || strings.HasPrefix(a, "--load-extension=") {
+			t.Fatalf("ChromeArgs must not include --load-extension; args=%v", args)
+		}
 		if a == "--user-data-dir" || strings.HasPrefix(a, "--user-data-dir=") {
 			t.Fatalf("ChromeArgs must not include --user-data-dir; args=%v", args)
 		}
+	}
+	hasNewWindow := false
+	for _, a := range args {
+		if a == "--new-window" {
+			hasNewWindow = true
+			break
+		}
+	}
+	if !hasNewWindow {
+		t.Fatalf("ChromeArgs missing --new-window; args=%v", args)
 	}
 	if sessionURL != "" {
 		foundURL := false

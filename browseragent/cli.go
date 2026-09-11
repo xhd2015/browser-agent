@@ -24,6 +24,7 @@ const briefUsage = `Usage: browser-agent <command> [flags]
 Commands:
   serve       Blocking multi-session daemon host (default 127.0.0.1:43761)
   session     Session side-commands: session new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har|list
+  extension   Extension log: extension log [--browser chrome|firefox]
   har         Offline HAR inspect (summary|paths|entries|show); live capture is session har
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install embedded agent skills
@@ -55,13 +56,16 @@ Commands:
     session list [flags]               List live sessions from daemon registry
     session eval [flags] <expr>        POST an eval job and print the result
     session run [flags] <path.js>      Read a JS file and POST a run job
-    session logs [flags]               POST a logs job (optional --limit N)
+    session log [flags]                Print persisted sessions/<id>/log.jsonl (attach/WS debug)
+    session logs [flags]               POST a console logs job (optional --limit N)
     session screenshot [flags]         POST a screenshot job; optional -o file.png
     session cdp [flags] <Method> [json]
                                        POST a raw CDP job (method + optional params JSON)
     session create-tab [flags] [url]   POST a create_tab job (blank tab or optional URL)
     session har start [session-id]      Start Chrome HAR capture for all user tabs
     session har end [session-id]        End capture; export per-tab HARs and manifest.json
+  extension <cmd> [flags]    Extension-scoped commands (unified SW logs)
+    extension log [flags]              Print {baseDir}/extension-{chrome|firefox}.log.jsonl
   har inspect <cmd> <path>   Offline inspect of export dirs / .har files
     har inspect summary|paths|entries|show
   install-chrome-extension   Extract embedded extension; on TTY, Load unpacked via UI
@@ -102,6 +106,8 @@ session new flags:
   --browser chrome|firefox   Browser to open (default: chrome)
   --no-open-chrome           Do not launch the browser
   --no-wait                  Skip waiting for extension connection
+  --no-wakeup-workaround     Do not open the background wakeup tab on attach stall.
+                             Default: open a quiet background wakeup tab when needed.
 
 open-managed-chrome flags:
   --root <dir>               Managed Chrome root (default: ~/.browser-agent/managed-chrome)
@@ -136,7 +142,19 @@ session delete / eval / run / logs / screenshot / cdp / create-tab flags:
 screenshot flags:
   -o, --output <file.png>    Write decoded PNG (from result base64) to path
 
-logs flags:
+session log flags:
+  --session-id <id>          Session id (or env BROWSER_AGENT_SESSION_ID)
+  --base-dir <path>          Session parent directory (default: ~/.tmp/browser-agent)
+  --tail <N>                 Show only the last N lines
+  --json                     Emit raw JSONL (default: pretty one line per event)
+
+extension log flags:
+  --browser chrome|firefox   Log file selector (default: chrome)
+  --base-dir <path>          Daemon base directory (default: ~/.tmp/browser-agent)
+  --tail <N>                 Show only the last N lines
+  --json                     Emit raw JSONL (default: pretty one line per event)
+
+logs flags (console job; requires connected extension):
   --limit <N>                Optional max log entries
   --level <level>            Optional log level filter
 
@@ -243,6 +261,8 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliServe(rest, env, stdout, stderr)
 	case "session":
 		return cliSession(rest, env, stdout, stderr)
+	case "extension":
+		return cliExtension(rest, env, stdout, stderr)
 	case "har":
 		return cliHAR(rest, env, stdout, stderr)
 	case "install-chrome-extension":
@@ -261,7 +281,7 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, har, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, extension, har, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
 	}
 }
 
@@ -329,7 +349,7 @@ func cliVersion(args []string, env map[string]string, stdout, stderr io.Writer) 
 func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|logs|screenshot|cdp|create-tab|har|list")
+		return fmt.Errorf("session requires a subcommand: new|info|delete|eval|run|log|logs|screenshot|cdp|create-tab|har|list")
 	}
 	sub := args[0]
 	rest := args[1:]
@@ -346,6 +366,8 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return cliEval(rest, env, stdout, stderr)
 	case "run":
 		return cliRun(rest, env, stdout, stderr)
+	case "log":
+		return cliSessionLog(rest, env, stdout, stderr)
 	case "logs":
 		return cliLogs(rest, env, stdout, stderr)
 	case "screenshot":
@@ -364,7 +386,7 @@ func cliSession(args []string, env map[string]string, stdout, stderr io.Writer) 
 		return nil
 	default:
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, logs, screenshot, cdp, create-tab, or har", sub)
+		return fmt.Errorf("unknown session subcommand %q; try new, info, delete, list, eval, run, log, logs, screenshot, cdp, create-tab, or har", sub)
 	}
 }
 
@@ -426,6 +448,7 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	sessionID := flagString(args, "--session-id")
 	noOpenChrome := flagBool(args, "--no-open-chrome")
 	noWait := flagBool(args, "--no-wait")
+	noWakeupWorkaround := flagBool(args, "--no-wakeup-workaround")
 	browserFlag := flagString(args, "--browser")
 	addr := sessionNewAddrFromFlags(args)
 
@@ -443,14 +466,15 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	}
 
 	cfg := SessionNewConfig{
-		BaseDir:      baseDir,
-		Addr:         addr,
-		SessionID:    sessionID,
-		Browser:      browser,
-		NoOpenChrome: noOpenChrome,
-		NoWait:       noWait,
-		Stdout:       stdout,
-		Stderr:       stderr,
+		BaseDir:            baseDir,
+		Addr:               addr,
+		SessionID:          sessionID,
+		Browser:            browser,
+		NoOpenChrome:       noOpenChrome,
+		NoWait:             noWait,
+		NoWakeupWorkaround: noWakeupWorkaround,
+		Stdout:             stdout,
+		Stderr:             stderr,
 	}
 	// Isolate ensure path when callers pass HOME via env (CLI doctests).
 	if env != nil {
@@ -1043,6 +1067,121 @@ func cliRun(args []string, env map[string]string, stdout, stderr io.Writer) erro
 		"expression": source,
 		"path":       path,
 	}, jobTimeoutMS(args, 60000), stdout, stderr, nil)
+}
+
+func cliExtension(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		_, _ = io.WriteString(stderr, briefUsage)
+		return fmt.Errorf("extension requires a subcommand: log")
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "log":
+		return cliExtensionLog(rest, env, stdout, stderr)
+	case "-h", "--help":
+		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
+		return nil
+	default:
+		_, _ = io.WriteString(stderr, briefUsage)
+		return fmt.Errorf("unknown extension subcommand %q; try log", sub)
+	}
+}
+
+func cliExtensionLog(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if hasHelpFlag(args) {
+		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
+		return nil
+	}
+	baseDir := resolveCLIBaseDir(args)
+	browser := flagString(args, "--browser")
+	if browser == "" {
+		browser = "chrome"
+	}
+	browser = NormalizeExtensionLogBrowser(browser)
+	tail := 0
+	if t := flagString(args, "--tail"); t != "" {
+		n, err := strconv.Atoi(t)
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid --tail %q", t)
+		}
+		tail = n
+	}
+	asJSON := hasFlag(args, "--json")
+	path := ExtensionLogPath(baseDir, browser)
+	lines, err := ReadExtensionLogLines(baseDir, browser, tail)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "  path  %s\n", path)
+	if len(lines) == 0 {
+		fmt.Fprintln(stdout, "(empty)")
+		return nil
+	}
+	fmt.Fprintln(stdout)
+	for _, ln := range lines {
+		if asJSON {
+			fmt.Fprintln(stdout, ln)
+		} else {
+			fmt.Fprintln(stdout, FormatSessionLogPretty(ln))
+		}
+	}
+	return nil
+}
+
+func cliSessionLog(args []string, env map[string]string, stdout, stderr io.Writer) error {
+	if hasHelpFlag(args) {
+		_, _ = io.WriteString(stdout, fullHelp)
+		if !strings.HasSuffix(fullHelp, "\n") {
+			_, _ = io.WriteString(stdout, "\n")
+		}
+		return nil
+	}
+	sessionID, err := resolveCLISession(args, env)
+	if err != nil {
+		return err
+	}
+	baseDir := strings.TrimSpace(flagString(args, "--base-dir"))
+	if baseDir == "" {
+		baseDir = defaultCLIBaseDir()
+	}
+	if !SessionDirExists(baseDir, sessionID) {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+	tail := 0
+	if t := flagString(args, "--tail"); t != "" {
+		n, err := strconv.Atoi(t)
+		if err != nil || n < 0 {
+			return fmt.Errorf("invalid --tail %q", t)
+		}
+		tail = n
+	}
+	asJSON := hasFlag(args, "--json")
+	path := SessionLogPath(baseDir, sessionID)
+	lines, err := ReadSessionLogLines(baseDir, sessionID, tail)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "  path  %s\n", path)
+	if len(lines) == 0 {
+		fmt.Fprintln(stdout, "(empty)")
+		return nil
+	}
+	fmt.Fprintln(stdout)
+	for _, ln := range lines {
+		if asJSON {
+			fmt.Fprintln(stdout, ln)
+		} else {
+			fmt.Fprintln(stdout, FormatSessionLogPretty(ln))
+		}
+	}
+	return nil
 }
 
 func cliLogs(args []string, env map[string]string, stdout, stderr io.Writer) error {

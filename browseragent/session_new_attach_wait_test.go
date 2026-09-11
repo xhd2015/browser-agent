@@ -24,7 +24,7 @@ func TestWaitForExtensionConnection_AdaptiveStallNoProgress(t *testing.T) {
 
 	var stderr bytes.Buffer
 	start := time.Now()
-	err := waitForExtensionConnection(srv.URL, "sess-stall", "chrome", "/tmp/ext", 2*time.Second, &stderr)
+	err := waitForExtensionConnection(t.TempDir(), srv.URL, "sess-stall", "chrome", "/tmp/ext", 2*time.Second, &stderr, false, func(string) error { return nil })
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func TestWaitForExtensionConnection_StageProgressExtendsThenConnects(t *testing.
 	defer srv.Close()
 
 	var stderr bytes.Buffer
-	err := waitForExtensionConnection(srv.URL, "sess-prog", "chrome", "/tmp/ext", 5*time.Second, &stderr)
+	err := waitForExtensionConnection(t.TempDir(), srv.URL, "sess-prog", "chrome", "/tmp/ext", 5*time.Second, &stderr, false, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestWaitForExtensionConnection_StalledWithStageDiagnosis(t *testing.T) {
 	defer srv.Close()
 
 	var stderr bytes.Buffer
-	err := waitForExtensionConnection(srv.URL, "sess-diag", "chrome", "/tmp/ext", 1500*time.Millisecond, &stderr)
+	err := waitForExtensionConnection(t.TempDir(), srv.URL, "sess-diag", "chrome", "/tmp/ext", 1500*time.Millisecond, &stderr, false, func(string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,5 +117,11 @@ func TestWaitForExtensionConnection_StalledWithStageDiagnosis(t *testing.T) {
 	}
 	if !strings.Contains(out, "register_attempts: 12") {
 		t.Fatalf("want attempts:\n%s", out)
+	}
+	if !strings.Contains(out, "service worker looks asleep") {
+		t.Fatalf("want Receiving-end SW wake hint:\n%s", out)
+	}
+	if !strings.Contains(out, "toolbar popup") {
+		t.Fatalf("want toolbar popup hint:\n%s", out)
 	}
 }

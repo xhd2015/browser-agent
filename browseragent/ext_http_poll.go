@@ -61,6 +61,57 @@ func (c *controlServer) writeMissingSessionID(w http.ResponseWriter) {
 	})
 }
 
+// handleExtLog is POST /v1/ext/log — extension baLog persistence (unified per browser).
+func (c *controlServer) handleExtLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ExtensionLogEvent
+	if r.Body != nil {
+		dec := json.NewDecoder(r.Body)
+		if err := dec.Decode(&req); err != nil && err != io.EOF {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+	}
+	if strings.TrimSpace(req.Msg) == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "msg is required"})
+		return
+	}
+	baseDir := strings.TrimSpace(c.baseDir)
+	if baseDir == "" {
+		// Fallback: registry base dir when handler constructed without BaseDir.
+		if c.registry != nil {
+			baseDir = c.registry.BaseDir()
+		}
+	}
+	if baseDir == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "baseDir unset"})
+		return
+	}
+	if err := AppendExtensionLog(baseDir, req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	browser := NormalizeExtensionLogBrowser(req.Browser)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":      true,
+		"browser": browser,
+		"path":    ExtensionLogPath(baseDir, browser),
+	})
+}
+
 // handleExtAttach is POST /v1/ext/attach — page/content-script cold-start progress.
 func (c *controlServer) handleExtAttach(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

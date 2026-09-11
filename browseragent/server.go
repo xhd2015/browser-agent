@@ -76,6 +76,7 @@ func (c *controlServer) handler() http.Handler {
 	mux.HandleFunc("/v1/har/capture", c.handleHARCapture)
 	mux.HandleFunc("/v1/ext/hello", c.handleExtHello)
 	mux.HandleFunc("/v1/ext/attach", c.handleExtAttach)
+	mux.HandleFunc("/v1/ext/log", c.handleExtLog)
 	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
 	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
 	mux.HandleFunc("/v1/ws", c.handleWS)
@@ -832,6 +833,10 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
   var burstTimer = null;
   var slowTimer = null;
   var registerAttempts = 0;
+  var keepAlivePort = null;
+  var keepAliveRetryTimer = null;
+  var holdTimer = null;
+  var PORT_PING_MS = 20000;
 
   function reportAttach(stage, lastError) {
     try {
@@ -850,11 +855,80 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
     } catch (e) { /* ignore */ }
   }
 
+  function clearKeepAliveRetry() {
+    if (keepAliveRetryTimer) {
+      clearTimeout(keepAliveRetryTimer);
+      keepAliveRetryTimer = null;
+    }
+  }
+
+  function scheduleKeepAliveRetry(ms) {
+    clearKeepAliveRetry();
+    keepAliveRetryTimer = setTimeout(function () {
+      keepAliveRetryTimer = null;
+      ensureKeepAlivePort();
+    }, ms || 500);
+  }
+
+  // Long-lived Port holds the MV3 SW while this /go tab stays open (also after connected).
+  function ensureKeepAlivePort() {
+    if (!EXT_ID) return;
+    if (keepAlivePort) {
+      try {
+        keepAlivePort.postMessage({ type: "keepalive", session_id: SESSION_ID });
+      } catch (e) {
+        keepAlivePort = null;
+      }
+      if (keepAlivePort) return;
+    }
+    try {
+      if (!chrome || !chrome.runtime || typeof chrome.runtime.connect !== "function") return;
+      var port = chrome.runtime.connect(EXT_ID, { name: "ba-session:" + SESSION_ID });
+      keepAlivePort = port;
+      port.onMessage.addListener(function (resp) {
+        if (resp && resp.ok) {
+          if (!connected) reportAttach("sw_ack", null);
+        } else if (resp && resp.ok === false && !connected) {
+          reportAttach("register_sent", "register_rejected");
+        }
+      });
+      port.onDisconnect.addListener(function () {
+        keepAlivePort = null;
+        var err = chrome.runtime && chrome.runtime.lastError;
+        if (!connected && err) reportAttach("register_sent", err.message || String(err));
+        scheduleKeepAliveRetry(connected ? 1000 : 500);
+      });
+      if (!connected) {
+        registerAttempts += 1;
+        reportAttach("register_sent", null);
+      }
+      port.postMessage({
+        type: connected ? "keepalive" : "register",
+        session_id: SESSION_ID,
+        control_port: PORT
+      });
+      setTimeout(function () {
+        if (!keepAlivePort) return;
+        try {
+          keepAlivePort.postMessage({
+            type: connected ? "keepalive" : "register",
+            session_id: SESSION_ID,
+            control_port: PORT
+          });
+        } catch (e) { /* ignore */ }
+      }, 50);
+    } catch (e) {
+      keepAlivePort = null;
+      scheduleKeepAliveRetry(connected ? 2000 : 1000);
+    }
+  }
+
   function sendRegister() {
     if (connected) return;
     try {
       if (!chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") return;
       if (!EXT_ID) return;
+      ensureKeepAlivePort();
       registerAttempts += 1;
       reportAttach("register_sent", null);
       chrome.runtime.sendMessage(EXT_ID, {
@@ -865,10 +939,15 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
         var err = chrome.runtime && chrome.runtime.lastError;
         if (err) {
           reportAttach("register_sent", err.message || String(err));
+          if (!keepAlivePort) scheduleKeepAliveRetry(250);
           return;
         }
         if (resp && resp.ok) {
           reportAttach("sw_ack", null);
+        } else if (resp && resp.ok === false) {
+          reportAttach("register_sent", "register_rejected");
+        } else {
+          reportAttach("register_sent", "register_no_response");
         }
       });
     } catch (e) { /* ignore */ }
@@ -884,7 +963,7 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
           if (ext.connected || data.phase === "extension_connected") {
             connected = true;
             if (burstTimer) { clearInterval(burstTimer); burstTimer = null; }
-            if (slowTimer) { clearInterval(slowTimer); slowTimer = null; }
+            ensureKeepAlivePort();
           }
         })
         .catch(function () { /* daemon down; keep retrying register */ });
@@ -892,6 +971,7 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
   }
 
   function kick() {
+    ensureKeepAlivePort();
     if (connected) return;
     sendRegister();
     pollConnected();
@@ -904,8 +984,15 @@ func injectSessionBoot(htmlBody, sessionID string, snap sessionSnapshot) string 
     if (connected) { clearInterval(burstTimer); burstTimer = null; return; }
     kick();
   }, 500);
-  // Slow heartbeat while the page stays open (daemon/SW restart).
-  slowTimer = setInterval(kick, 10000);
+  // Slow heartbeat while the page stays open (daemon/SW restart + Port hold).
+  slowTimer = setInterval(function () {
+    ensureKeepAlivePort();
+    if (!connected) kick();
+    else pollConnected();
+  }, 10000);
+  holdTimer = setInterval(function () {
+    ensureKeepAlivePort();
+  }, PORT_PING_MS);
   try { window.addEventListener("pageshow", kick); } catch (e) {}
   try {
     document.addEventListener("visibilitychange", function () {

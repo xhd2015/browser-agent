@@ -6,7 +6,7 @@
     window.__BROWSER_AGENT_EXT__ = {
       product: "browser-agent",
       controlPort: 43761,
-      version: "1.0.16",
+      version: "1.0.18",
       features: ["browser-agent"],
     };
   } catch (e) {
@@ -55,6 +55,8 @@
   var burstTimer = null;
   var slowTimer = null;
   var registerAttempts = 0;
+  var keepAlivePort = null;
+  var keepAliveRetryTimer = null;
 
   function reportAttach(stage, lastError) {
     const session_id = readSessionIdFromPage();
@@ -77,10 +79,76 @@
     }
   }
 
+  function clearKeepAliveRetry() {
+    if (keepAliveRetryTimer) {
+      clearTimeout(keepAliveRetryTimer);
+      keepAliveRetryTimer = null;
+    }
+  }
+
+  function scheduleKeepAliveRetry(ms) {
+    clearKeepAliveRetry();
+    keepAliveRetryTimer = setTimeout(function () {
+      keepAliveRetryTimer = null;
+      ensureKeepAlivePort();
+    }, ms || 500);
+  }
+
+  /**
+   * Long-lived Port wakes + holds the MV3 service worker while /go is open.
+   * sendMessage alone often hits "Receiving end does not exist" after SW idle kill.
+   */
+  function ensureKeepAlivePort() {
+    if (connected) return;
+    const session_id = readSessionIdFromPage();
+    if (!session_id) return;
+    if (keepAlivePort) return;
+    try {
+      if (!chrome || !chrome.runtime || typeof chrome.runtime.connect !== "function") {
+        return;
+      }
+      const port = chrome.runtime.connect({
+        name: "ba-session:" + session_id,
+      });
+      keepAlivePort = port;
+      port.onMessage.addListener(function (resp) {
+        if (resp && resp.ok) {
+          registeredAck = true;
+          reportAttach("sw_ack", null);
+        } else if (resp && resp.ok === false) {
+          reportAttach("register_sent", "register_rejected");
+        }
+      });
+      port.onDisconnect.addListener(function () {
+        keepAlivePort = null;
+        if (chrome.runtime && chrome.runtime.lastError) {
+          reportAttach(
+            "register_sent",
+            chrome.runtime.lastError.message ||
+              String(chrome.runtime.lastError),
+          );
+        }
+        if (!connected) scheduleKeepAliveRetry(500);
+      });
+      registerAttempts += 1;
+      reportAttach("register_sent", null);
+      port.postMessage({
+        type: "register",
+        session_id: session_id,
+        control_port: readControlPortFromPage(),
+      });
+    } catch (e) {
+      keepAlivePort = null;
+      if (!connected) scheduleKeepAliveRetry(1000);
+    }
+  }
+
   function sendRegister() {
     if (connected) return false;
     const session_id = readSessionIdFromPage();
     if (!session_id) return false;
+
+    ensureKeepAlivePort();
 
     const control_port = readControlPortFromPage();
     try {
@@ -101,17 +169,22 @@
               chrome.runtime.lastError.message ||
                 String(chrome.runtime.lastError),
             );
+            // Port path is the SW wake; retry connect when one-shot message fails.
+            if (!keepAlivePort) scheduleKeepAliveRetry(250);
             return;
           }
           if (resp && resp.ok) {
             registeredAck = true;
             reportAttach("sw_ack", null);
+          } else if (resp && resp.ok === false) {
+            reportAttach("register_sent", "register_rejected");
           }
         },
       );
       return true;
     } catch (e) {
       /* extension context invalidated */
+      if (!keepAlivePort) scheduleKeepAliveRetry(500);
       return false;
     }
   }
@@ -139,6 +212,7 @@
             clearInterval(burstTimer);
             burstTimer = null;
           }
+          if (now) clearKeepAliveRetry();
         })
         .catch(function () {
           /* ignore */
@@ -149,6 +223,7 @@
   }
 
   function kick() {
+    ensureKeepAlivePort();
     sendRegister();
     pollConnected();
   }

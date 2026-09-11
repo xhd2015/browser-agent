@@ -15,6 +15,8 @@ function loadBackground(overrides = {}) {
       lastError: null,
       onMessage: event(),
       onMessageExternal: event(),
+      onConnect: event(),
+      onConnectExternal: event(),
       onInstalled: event(),
       onStartup: event(),
     },

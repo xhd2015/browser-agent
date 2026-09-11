@@ -1,35 +1,11 @@
-# Scenario
+# SETUP
 
-**Feature**: --load-extension without --user-data-dir (F1)
+**Feature**: default-profile Chrome args — new window + URL, no load-extension / user-data-dir (F1)
 
-```
+**Flow**:
 BuildChromeArgs(url, extractedPath)
-  --load-extension=<path> present
-  --user-data-dir absent
-  session URL present
-```
+  --new-window + session URL
+  no --load-extension (ignored param; Load unpacked is operator Chrome)
+  no --user-data-dir
 
-## Preconditions
-
-- ExtensionPath empty → Run extracts first.
-
-## Steps
-
-1. Clear ExtensionPath override.
-2. Keep default SessionURL from parent.
-
-## Context
-
-- Pure argv only.
-
-```go
-import (
-	"testing"
-)
-
-func Setup(t *testing.T, d *session.Doctest, req *Request) error {
-	t.Helper()
-	req.ExtensionPath = ""
-	return nil
-}
-```
+**Leaf**: chrome-launch-args/load-extension-no-user-data-dir (name kept for history).

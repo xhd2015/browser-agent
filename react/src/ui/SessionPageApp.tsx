@@ -36,6 +36,17 @@ interface SessionSnap {
     bundle_md5?: string;
     supports_browser_agent?: boolean;
   };
+  attach?: {
+    stage?: string;
+    last_error?: string;
+    register_attempts?: number;
+  };
+}
+
+function isReceivingEndError(err?: string): boolean {
+  return String(err || "")
+    .toLowerCase()
+    .includes("receiving end does not exist");
 }
 
 function dash(v?: string) {
@@ -393,6 +404,19 @@ export function SessionPageApp({
               </>
             ) : (
               <>
+                {isReceivingEndError(snap?.attach?.last_error) ? (
+                  <p
+                    style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}
+                    data-browser-agent-sw-asleep
+                  >
+                    Extension service worker looks asleep (
+                    <code>Receiving end does not exist</code>). Open the{" "}
+                    <strong>Browser Agent</strong> toolbar popup, or go to{" "}
+                    <code>chrome://extensions</code> → Browser Agent →{" "}
+                    <strong>Reload</strong>. Keep this <code>/go</code> tab open —
+                    do not run <code>session new</code> again.
+                  </p>
+                ) : null}
                 <p style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
                   Chrome 137+ ignores <code>--load-extension</code>. Load unpacked
                   once from the path above (chrome://extensions → Developer mode →

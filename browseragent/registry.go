@@ -207,6 +207,12 @@ func (r *SessionRegistry) CreateWithOpts(id string, opts CreateOpts) (*CreateSes
 	}
 	r.sessions[id] = sess
 
+	sess.sessionLog("info", "session_created", map[string]any{
+		"control_port": controlPort,
+		"session_url":  sessionURL,
+		"browser":      browser,
+	})
+
 	return &CreateSessionResult{
 		SessionID:  id,
 		SessionDir: absSessionDir,
@@ -243,6 +249,14 @@ func (r *SessionRegistry) List() []sessionSnapshot {
 }
 
 // Addr returns the registry listen address metadata (host:port).
+// BaseDir returns the daemon session parent directory.
+func (r *SessionRegistry) BaseDir() string {
+	if r == nil {
+		return ""
+	}
+	return r.baseDir
+}
+
 func (r *SessionRegistry) Addr() string {
 	return r.addr
 }

@@ -1,6 +1,8 @@
 // Install rebuilds extension + React session-page into browseragent embed trees,
-// stages a signed Firefox .xpi when possible, then installs browser-agent into
-// $GOBIN or $GOPATH/bin via `go install`.
+// stages a signed Firefox .xpi when possible, then installs browser-agent with
+// gotool/localbin/install (LookPath or ~/.local/bin → go build -o, refresh
+// existing GOPATH/GOBIN/.local copies, EnsureOnPATH, macOS codesign). Prefer
+// this over bare `go install` / `go build`.
 //
 // Usage (from module root):
 //
@@ -24,11 +26,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/xhd2015/browser-agent/browseragent"
+	localinstall "github.com/xhd2015/dot-pkgs/go-pkgs/gotool/localbin/install"
 	"github.com/xhd2015/xgo/support/cmd"
 	"golang.org/x/term"
 )
@@ -161,19 +163,19 @@ func handle(args []string) error {
 		return fmt.Errorf("embed placeholders: %w", err)
 	}
 
-	// 2) go install into GOBIN / GOPATH/bin (embeds browseragent/embedded/**).
-	fmt.Println("==> Installing browser-agent (go install; embeds staged session-page + firefox xpi)")
-	if err := cmd.Debug().Dir(root).Run("go", "install", pkgPath); err != nil {
-		return fmt.Errorf("go install %s failed: %w", pkgPath, err)
-	}
-
-	dest, err := installDest()
+	// 2) PATH-aware install (embeds browseragent/embedded/** via go build -o).
+	fmt.Println("==> Installing browser-agent (localbin; embeds staged session-page + firefox xpi)")
+	res, err := localinstall.Install(localinstall.Options{
+		Dir:     root,
+		Package: pkgPath,
+		BinName: binName,
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+	})
 	if err != nil {
-		fmt.Printf("\nInstalled %s via go install %s\n", binName, pkgPath)
-	} else {
-		fmt.Printf("\nInstalled %s\n", dest)
-		fmt.Printf("Ensure %s is on your PATH.\n", filepath.Dir(dest))
+		return err
 	}
+	_ = res
 	if !fixture {
 		fmt.Println()
 		fmt.Println("Session page: React SPA embedded (not the mini fixture).")
@@ -325,11 +327,17 @@ func printHelp() {
 	fmt.Print(`Usage: go run ./script/browser-agent/install [options]
 
 Always rebuilds a full embed (Chrome extension + React session-page via vite)
-into browseragent/embedded/**, stages a signed Firefox .xpi when possible, then:
+into browseragent/embedded/**, stages a signed Firefox .xpi when possible, then
+installs with gotool/localbin/install so //go:embed includes a fresh SPA +
+Firefox xpi — not a leftover mini fixture.
 
-  go install ./cmd/browser-agent
+Install destination:
+  1. Existing browser-agent on PATH (LookPath), else ~/.local/bin/browser-agent
+  2. Also refresh existing copies under ~/.local/bin, GOBIN, and GOPATH/bin
+  3. Ensure ~/.local/bin is on PATH in shell rc when writing there
+  4. On macOS, ad-hoc codesign every written binary
 
-so the binary //go:embed includes a fresh SPA + Firefox xpi — not a leftover mini fixture.
+Prefer this script over bare go install / go build (see AGENTS.md).
 
 Options:
   --fixture, --mini        Stage mini fixtures only (no vite / no AMO sign).
@@ -343,7 +351,7 @@ Default (recommended):
   2. stage Chrome + Firefox extensions → browseragent/embedded/
   3. stage Firefox .xpi only when package version == VERSION.txt
      (TTY: prompt to AMO-sign on mismatch; non-TTY: skip with warnings)
-  4. go install ./cmd/browser-agent
+  4. localbin install ./cmd/browser-agent
 
 Firefox sign needs .firefox-secretes.txt (AMO JWT). Install never reuses a
 dist/signed or embed .xpi whose version differs from VERSION.txt.
@@ -373,23 +381,4 @@ func findModuleRoot() (string, error) {
 	}
 }
 
-func installDest() (string, error) {
-	if gobin := strings.TrimSpace(os.Getenv("GOBIN")); gobin != "" {
-		return filepath.Join(gobin, binName), nil
-	}
-	gopath := strings.TrimSpace(os.Getenv("GOPATH"))
-	if gopath == "" {
-		out, err := exec.Command("go", "env", "GOPATH").Output()
-		if err != nil {
-			return "", err
-		}
-		gopath = strings.TrimSpace(string(out))
-	}
-	if gopath == "" {
-		return "", fmt.Errorf("GOPATH empty")
-	}
-	if i := strings.IndexByte(gopath, filepath.ListSeparator); i >= 0 {
-		gopath = gopath[:i]
-	}
-	return filepath.Join(gopath, "bin", binName), nil
-}
+

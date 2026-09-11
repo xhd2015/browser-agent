@@ -83,6 +83,49 @@ function baLog(level, msg, detail) {
   } catch (e) {
     /* ignore */
   }
+  pushExtensionLogToDaemon(level, msg, detail);
+}
+
+function pushExtensionLogToDaemon(level, msg, detail) {
+  try {
+    let controlPort = CONTROL_PORT;
+    let sessionId = "";
+    try {
+      if (sessions && sessions.size === 1) {
+        const only = sessions.values().next().value;
+        if (only) {
+          if (only.controlPort != null) controlPort = only.controlPort;
+          if (only.sessionId) sessionId = only.sessionId;
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    if (
+      !sessionId &&
+      detail &&
+      typeof detail === "object" &&
+      (detail.session_id || detail.sessionId)
+    ) {
+      sessionId = detail.session_id || detail.sessionId;
+    }
+    const body = {
+      browser: "chrome",
+      level: level || "log",
+      msg: String(msg || ""),
+      source: "extension",
+      ts: new Date().toISOString(),
+    };
+    if (sessionId) body.session_id = sessionId;
+    if (detail != null && detail !== "") body.detail = detail;
+    fetch("http://127.0.0.1:" + controlPort + "/v1/ext/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch(function () {});
+  } catch (e) {
+    /* ignore */
+  }
 }
 
 function baDebugEnabled() {
@@ -765,10 +808,119 @@ function handleRegisterFromMessage(msg, sender, sendResponse) {
   return true;
 }
 
+/**
+ * Long-lived Ports from /go content scripts and session-page boot keep the MV3
+ * service worker alive while a control tab is open. One-shot sendMessage often
+ * fails with "Receiving end does not exist" after SW idle kill; connect wakes
+ * and holds the worker so register + WS can complete.
+ *
+ * Port name: "ba-session:<sessionId>"
+ */
+const sessionKeepAlivePorts = new Set();
+
+function sessionIdFromPortName(name) {
+  const raw = String(name || "");
+  if (raw.indexOf("ba-session:") === 0) {
+    return raw.slice("ba-session:".length).trim();
+  }
+  return "";
+}
+
+function ackPortRegister(port, ok) {
+  try {
+    port.postMessage(
+      ok
+        ? { ok: true, type: "register_ack" }
+        : { ok: false, type: "register_rejected" },
+    );
+  } catch (e) {
+    /* channel closed */
+  }
+}
+
+function tryRegisterFromPort(port, msg) {
+  const claimed =
+    (msg && (msg.session_id || msg.sessionId)) ||
+    sessionIdFromPortName(port.name) ||
+    "";
+  if (!claimed) {
+    ackPortRegister(port, false);
+    return false;
+  }
+  const payload = Object.assign({}, msg || {}, {
+    type: "register",
+    session_id: claimed,
+  });
+  if (!chrome.tabs || typeof chrome.tabs.query !== "function") {
+    const sender = port.sender || {};
+    const result = handleRegisterMessage(payload, sender);
+    const ok = result === true || (result !== false && sessions.has(claimed));
+    ackPortRegister(port, ok);
+    return ok;
+  }
+  chrome.tabs.query({}, (tabs) => {
+    if (chrome.runtime.lastError) {
+      ackPortRegister(port, false);
+      return;
+    }
+    for (const tab of tabs || []) {
+      if (!tab || tab.id == null) continue;
+      const parsed = parseGoSessionFromURL(tab.url || "");
+      if (!parsed || parsed.sessionId !== claimed) continue;
+      const tabSender = { tab: tab, url: tab.url || "" };
+      const r = handleRegisterMessage(payload, tabSender);
+      const success = r === true || (r !== false && sessions.has(claimed));
+      ackPortRegister(port, success);
+      return;
+    }
+    const sender = port.sender || {};
+    const result = handleRegisterMessage(payload, sender);
+    const ok = result === true || (result !== false && sessions.has(claimed));
+    ackPortRegister(port, ok);
+  });
+  return false;
+}
+
+function handleSessionKeepAlivePort(port) {
+  if (!port) return;
+  sessionKeepAlivePorts.add(port);
+  const drop = () => {
+    sessionKeepAlivePorts.delete(port);
+  };
+  try {
+    port.onDisconnect.addListener(drop);
+  } catch (e) {
+    /* ignore */
+  }
+
+  // Only register on postMessage — NOT on connect (ack race with page listener).
+  try {
+    port.onMessage.addListener((msg) => {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "register" || msg.type === "ping") {
+        tryRegisterFromPort(port, msg);
+      }
+    });
+  } catch (e) {
+    /* ignore */
+  }
+
+  scheduleHealSessionsFromTabs("port-connect", 0);
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "register") {
     return handleRegisterFromMessage(msg, sender, sendResponse);
+  }
+  if (msg.type === "wakeup") {
+    scheduleHealSessionsFromTabs("wakeup-page", 0);
+    try {
+      sendResponse({ ok: true, type: "wakeup_ack" });
+    } catch (e) {
+      /* channel closed */
+    }
+    return true;
   }
   // Popup progressive status API: status / getStatus / popupStatus.
   if (
@@ -800,6 +952,11 @@ try {
   });
 } catch (e) {
   /* onMessageExternal unavailable in some fixtures */
+}
+
+chrome.runtime.onConnect.addListener(handleSessionKeepAlivePort);
+if (chrome.runtime.onConnectExternal) {
+  chrome.runtime.onConnectExternal.addListener(handleSessionKeepAlivePort);
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {

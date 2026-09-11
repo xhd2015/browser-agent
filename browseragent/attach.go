@@ -19,10 +19,12 @@ const (
 )
 
 // Default adaptive wait for session new (when WaitExtensionTimeout is unset).
+// Base/cap are 1m+10s so a cold MV3 SW can be woken by the extension's 1-minute
+// chrome.alarms heal before soft timeout (tab events alone do not start the SW).
 const (
-	DefaultAttachWaitBase  = 15 * time.Second
+	DefaultAttachWaitBase  = 70 * time.Second // 1m + 10s
 	DefaultAttachWaitGrant = 10 * time.Second
-	DefaultAttachWaitCap   = 45 * time.Second
+	DefaultAttachWaitCap   = 70 * time.Second // 1m + 10s
 )
 
 // attachState is ephemeral per-session cold-start progress (not persisted).
@@ -86,7 +88,6 @@ func normalizeAttachStage(stage string) string {
 func (s *session) applyAttachEvent(ev AttachEvent) {
 	stage := normalizeAttachStage(ev.Stage)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.attach.Stage == "" {
 		s.attach.Stage = AttachStageNoPage
 	}
@@ -112,38 +113,63 @@ func (s *session) applyAttachEvent(ev AttachEvent) {
 		s.attach.LastError = ""
 		changed = true
 	}
+	var snap attachState
 	if changed {
 		s.attach.UpdatedAt = time.Now()
+		snap = s.attach
+	}
+	s.mu.Unlock()
+	if changed {
+		fields := map[string]any{
+			"stage":    snap.Stage,
+			"attempts": snap.RegisterAttempts,
+		}
+		level := "info"
+		if snap.LastError != "" {
+			fields["last_error"] = snap.LastError
+			level = "warn"
+		}
+		s.sessionLog(level, "attach", fields)
 	}
 }
 
 // setAttachStageLocked promotes stage if higher. Caller holds s.mu.
-func (s *session) setAttachStageLocked(stage string) {
+// Returns true when the stage string changed.
+func (s *session) setAttachStageLocked(stage string) bool {
 	stage = normalizeAttachStage(stage)
 	if stage == "" {
-		return
+		return false
 	}
 	if s.attach.Stage == "" {
 		s.attach.Stage = AttachStageNoPage
 	}
-	if attachStageRank(stage) >= attachStageRank(s.attach.Stage) {
-		s.attach.Stage = stage
-		if attachStageRank(stage) >= attachStageRank(AttachStageSWAck) {
-			s.attach.LastError = ""
-		}
-		s.attach.UpdatedAt = time.Now()
+	if attachStageRank(stage) < attachStageRank(s.attach.Stage) {
+		return false
 	}
+	changed := s.attach.Stage != stage
+	s.attach.Stage = stage
+	if attachStageRank(stage) >= attachStageRank(AttachStageSWAck) {
+		s.attach.LastError = ""
+	}
+	s.attach.UpdatedAt = time.Now()
+	return changed
 }
 
 func (s *session) setAttachStage(stage string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.setAttachStageLocked(stage)
+	changed := s.setAttachStageLocked(stage)
+	snap := s.attach
+	s.mu.Unlock()
+	if changed {
+		s.sessionLog("info", "attach", map[string]any{
+			"stage":    snap.Stage,
+			"attempts": snap.RegisterAttempts,
+		})
+	}
 }
 
 func (s *session) resetAttachOnDisconnect() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Keep page_open if we already saw a page; otherwise no_page.
 	prev := s.attach.Stage
 	attempts := s.attach.RegisterAttempts
@@ -157,6 +183,13 @@ func (s *session) resetAttachOnDisconnect() {
 	} else {
 		s.attach.Stage = AttachStageNoPage
 	}
+	snap := s.attach
+	s.mu.Unlock()
+	s.sessionLog("warn", "attach_reset", map[string]any{
+		"stage":    snap.Stage,
+		"attempts": snap.RegisterAttempts,
+		"prev":     prev,
+	})
 }
 
 func (s *session) snapshotAttach() *sessionAttach {

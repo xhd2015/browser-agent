@@ -1,12 +1,13 @@
 ## Expected
 
-Requirement **F1**:
+Requirement **F1** (default-profile session open):
 
 - No error; ExitCode 0.
 - ChromeArgs non-empty.
-- Contains `--load-extension=<InstallPath>` (or split form).
-- Does **not** contain `--user-data-dir`.
+- Contains `--new-window`.
 - Contains the request SessionURL.
+- Does **not** contain `--load-extension` (joins Load-unpacked Chrome).
+- Does **not** contain `--user-data-dir`.
 
 ## Side Effects
 
@@ -14,7 +15,7 @@ Requirement **F1**:
 
 ## Errors
 
-- Including `--user-data-dir` is a hard fail.
+- Including `--user-data-dir` or `--load-extension` is a hard fail.
 
 ## Exit Code
 
@@ -31,7 +32,7 @@ func Assert(t *testing.T, d *session.Doctest, req *Request, resp *Response, err 
 	}
 	assertExitZero(t, resp)
 	if resp.InstallPath == "" {
-		t.Fatal("InstallPath empty; need extract path for --load-extension assert")
+		t.Fatal("InstallPath empty; extract path still required for operator install hints")
 	}
 	assertChromeArgsContract(t, resp.ChromeArgs, resp.InstallPath, req.SessionURL)
 }

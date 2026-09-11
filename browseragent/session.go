@@ -107,7 +107,15 @@ func (s *session) markHello(version string, features []string, bundleMD5 string)
 	match := ComputeExtensionMatch(true, embedded, loaded)
 	installPath := s.extensionInstallPath
 	onHello := s.onHello
+	stage := s.attach.Stage
+	supports := s.supportsBA
 	s.mu.Unlock()
+	s.sessionLog("info", "ws_hello", map[string]any{
+		"stage":                  stage,
+		"extension_version":      version,
+		"supports_browser_agent": supports,
+		"extension_match":        match,
+	})
 	if onHello != nil {
 		onHello(match, embedded, loaded, installPath)
 	}
@@ -136,6 +144,9 @@ func (s *session) markDisconnectedAfterGrace(c *wsConn) {
 		s.phase = PhaseWaitingExtension
 		q := s.queue
 		s.mu.Unlock()
+		s.sessionLog("warn", "ws_disconnect", map[string]any{
+			"reason": "reconnect_grace_expired",
+		})
 		s.resetAttachOnDisconnect()
 		if q != nil {
 			q.FailAllInflight("extension disconnected: reconnect grace period expired")
@@ -170,11 +181,16 @@ func (s *session) getEmbeddedIdentity() BundleSum {
 
 func (s *session) setWS(c *wsConn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.ws = c
+	changed := false
 	if c != nil {
 		s.disconnectGeneration++
-		s.setAttachStageLocked(AttachStageWSOpen)
+		changed = s.setAttachStageLocked(AttachStageWSOpen)
+	}
+	stage := s.attach.Stage
+	s.mu.Unlock()
+	if c != nil && changed {
+		s.sessionLog("info", "ws_open", map[string]any{"stage": stage})
 	}
 }
 
@@ -275,7 +291,7 @@ func (s *session) setSessionURL(url string) {
 
 func (s *session) updateTelemetry(browserProduct string, pageCount *int, pages []sessionPageTab) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	stageChanged := false
 	if browserProduct != "" {
 		found := false
 		for _, b := range s.browsers {
@@ -292,16 +308,28 @@ func (s *session) updateTelemetry(browserProduct string, pageCount *int, pages [
 		v := *pageCount
 		s.sessionPageCount = &v
 		if v > 0 {
-			s.setAttachStageLocked(AttachStagePageOpen)
+			stageChanged = s.setAttachStageLocked(AttachStagePageOpen)
 		}
 	}
 	if pages != nil {
 		s.sessionPages = append([]sessionPageTab(nil), pages...)
 		if len(pages) > 0 {
-			s.setAttachStageLocked(AttachStagePageOpen)
+			if s.setAttachStageLocked(AttachStagePageOpen) {
+				stageChanged = true
+			}
 		}
 	}
 	s.lastSeenAt = time.Now()
+	stage := s.attach.Stage
+	attempts := s.attach.RegisterAttempts
+	s.mu.Unlock()
+	if stageChanged {
+		s.sessionLog("info", "attach", map[string]any{
+			"stage":    stage,
+			"attempts": attempts,
+			"source":   "telemetry",
+		})
+	}
 }
 
 func (s *session) inflightJobs() int {

@@ -200,13 +200,17 @@ func extractEmbeddedExtensionUnder(baseDir, intermediateDir string) (installPath
 // install_chrome.go (optional UI Load unpacked via computer-use/macos/chrome).
 
 // BuildChromeArgs returns Chrome argv (without the binary name) for a
-// best-effort launch: new window, load-extension, session URL.
-// Does not include --user-data-dir (uses the default profile).
+// best-effort launch into the **default profile**: --new-window + session URL.
+//
+// extensionPath is ignored. Do not pass --load-extension here: on modern Chrome
+// it either no-ops when joining a running browser or starts a separate instance
+// that is not the Load-unpacked Chrome operators use, so later session new
+// opens fail to attach. Managed profiles still use --load-extension via
+// managed_chrome.go. Operators load the extension once with
+// install-chrome-extension / chrome://extensions.
 func BuildChromeArgs(sessionURL, extensionPath string) []string {
+	_ = extensionPath
 	args := []string{"--new-window"}
-	if strings.TrimSpace(extensionPath) != "" {
-		args = append(args, "--load-extension="+extensionPath)
-	}
 	if strings.TrimSpace(sessionURL) != "" {
 		args = append(args, sessionURL)
 	}

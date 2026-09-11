@@ -20,6 +20,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.137
-
-replace github.com/xhd2015/dot-pkgs/go-pkgs => /Users/xhd2015/.wrk/worktrees/browser-agent-master-2026-09-10-so-many-new-sessions-remains-unconnected/external/dot-pkgs/go-pkgs
+require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.171

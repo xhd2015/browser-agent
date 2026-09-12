@@ -28,6 +28,7 @@ Commands:
   har         Offline HAR inspect (summary|paths|entries|show); live capture is session har
   open-managed-chrome Open managed Chrome profile with embedded extension
   skill       Show/list/install embedded agent skills
+  how-to      Print agent playbooks (e.g. how-to credentials/export)
   install-chrome-extension   Extract Chrome extension; TTY drives Load unpacked UI
   install-firefox-extension  Extract signed .xpi (open in Firefox) + temporary add-on help
   assets      Ensure/status hydrated session-page + extension assets
@@ -73,6 +74,7 @@ Commands:
   open-managed-chrome [url]  Open managed Chrome profile (isolated user-data-dir + extension)
   skill --list|--show|--install …
                              Embedded agent skills (see: browser-agent skill --help)
+  how-to [<topic>]           Print agent playbooks (list topics, or how-to credentials/export)
   assets ensure|status       Hydrate / report session-page + extension assets
 
 Global flags:
@@ -104,6 +106,10 @@ session new flags:
   --host <host>              Control server host (default: 127.0.0.1)
   --server-port <port>       Control server port (default: 43761; reads server.json when omitted)
   --browser chrome|firefox   Browser to open (default: chrome)
+  --adhoc-browser-profile    Chrome only: isolated /tmp user-data-dir profile
+                             (does not touch default Chrome). Prefer for
+                             Firefox cookie import / HAR without polluting
+                             the operator profile.
   --no-open-chrome           Do not launch the browser
   --no-wait                  Skip waiting for extension connection
   --no-wakeup-workaround     Do not open the background wakeup tab on attach stall.
@@ -273,6 +279,8 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 		return cliOpenManagedChrome(rest, env, stdout, stderr)
 	case "skill":
 		return cliSkill(rest, env, stdout, stderr)
+	case "how-to":
+		return cliHowTo(rest, env, stdout, stderr)
 	case "assets":
 		return cliAssets(rest, env, stdout, stderr)
 	case "-h", "--help":
@@ -281,7 +289,7 @@ func HandleCLI(args []string, env map[string]string, stdout, stderr io.Writer) e
 	default:
 		// Flat side-commands (info/eval/…) are not handlers after the nested refactor.
 		_, _ = io.WriteString(stderr, briefUsage)
-		return fmt.Errorf("unknown command %q; try serve, session, extension, har, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, or assets", cmd)
+		return fmt.Errorf("unknown command %q; try serve, session, extension, har, open-managed-chrome, install-chrome-extension, install-firefox-extension, skill, how-to, or assets", cmd)
 	}
 }
 
@@ -449,6 +457,7 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	noOpenChrome := flagBool(args, "--no-open-chrome")
 	noWait := flagBool(args, "--no-wait")
 	noWakeupWorkaround := flagBool(args, "--no-wakeup-workaround")
+	adhocBrowserProfile := flagBool(args, "--adhoc-browser-profile")
 	browserFlag := flagString(args, "--browser")
 	addr := sessionNewAddrFromFlags(args)
 
@@ -466,15 +475,16 @@ func cliSessionNew(args []string, env map[string]string, stdout, stderr io.Write
 	}
 
 	cfg := SessionNewConfig{
-		BaseDir:            baseDir,
-		Addr:               addr,
-		SessionID:          sessionID,
-		Browser:            browser,
-		NoOpenChrome:       noOpenChrome,
-		NoWait:             noWait,
-		NoWakeupWorkaround: noWakeupWorkaround,
-		Stdout:             stdout,
-		Stderr:             stderr,
+		BaseDir:             baseDir,
+		Addr:                addr,
+		SessionID:           sessionID,
+		Browser:             browser,
+		NoOpenChrome:        noOpenChrome,
+		NoWait:              noWait,
+		NoWakeupWorkaround:  noWakeupWorkaround,
+		AdhocBrowserProfile: adhocBrowserProfile,
+		Stdout:              stdout,
+		Stderr:              stderr,
 	}
 	// Isolate ensure path when callers pass HOME via env (CLI doctests).
 	if env != nil {

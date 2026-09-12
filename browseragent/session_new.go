@@ -87,6 +87,11 @@ type SessionNewConfig struct {
 	// NoWakeupWorkaround, when true, skips the background wakeup tab on attach
 	// stall. Default false: open a quiet background wakeup tab when needed.
 	NoWakeupWorkaround bool
+
+	// AdhocBrowserProfile, when true, launches Chrome with an isolated
+	// /tmp user-data-dir profile (--load-extension) so cookie import / HAR
+	// do not touch the operator's default Chrome. Chrome-only; fatal with firefox.
+	AdhocBrowserProfile bool
 }
 
 // EnsureDaemon returns daemon meta when the control plane at Addr is healthy and
@@ -388,6 +393,9 @@ func SessionNew(cfg SessionNewConfig) error {
 	if err != nil {
 		return err
 	}
+	if cfg.AdhocBrowserProfile && browser != "chrome" {
+		return fmt.Errorf("--adhoc-browser-profile requires chrome (got %s)", browser)
+	}
 
 	meta, err := EnsureDaemon(EnsureDaemonConfig{
 		BaseDir:     cfg.BaseDir,
@@ -415,6 +423,14 @@ func SessionNew(cfg SessionNewConfig) error {
 	result, err := postCreateSessionHTTP(baseURL, strings.TrimSpace(cfg.SessionID), browser)
 	if err != nil {
 		return err
+	}
+
+	adhocDataDir := ""
+	if cfg.AdhocBrowserProfile {
+		adhocDataDir = AdhocBrowserProfileDataDir(result.SessionID)
+		if err := os.MkdirAll(adhocDataDir, 0o755); err != nil {
+			return fmt.Errorf("create adhoc chrome profile: %w", err)
+		}
 	}
 
 	if !cfg.NoOpenChrome {
@@ -447,6 +463,8 @@ func SessionNew(cfg SessionNewConfig) error {
 			var openErr error
 			if openFn != nil {
 				openErr = openFn(result.SessionURL, extPath)
+			} else if cfg.AdhocBrowserProfile {
+				openErr = openAdhocChrome(result.SessionURL, extPath, adhocDataDir)
 			} else {
 				// extPath is unused by BuildChromeArgs (no --load-extension on default
 				// profile). Operator Load-unpacked Chrome is the attach target.
@@ -454,20 +472,24 @@ func SessionNew(cfg SessionNewConfig) error {
 			}
 			if openErr != nil {
 				fmt.Fprintf(stderr, "browser-agent: warning: open chrome: %v\n", openErr)
-				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "warn", "chrome_open", map[string]any{
-					"url": result.SessionURL, "error": openErr.Error(),
-				})
+				logFields := map[string]any{"url": result.SessionURL, "error": openErr.Error()}
+				if adhocDataDir != "" {
+					logFields["adhoc_user_data_dir"] = adhocDataDir
+				}
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "warn", "chrome_open", logFields)
 			} else {
-				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "info", "chrome_open", map[string]any{
-					"url": result.SessionURL,
-				})
+				logFields := map[string]any{"url": result.SessionURL}
+				if adhocDataDir != "" {
+					logFields["adhoc_user_data_dir"] = adhocDataDir
+				}
+				_ = AppendSessionLog(cfg.BaseDir, result.SessionID, "info", "chrome_open", logFields)
 			}
 		}
 	}
 
 	// Always print operator instructions first so URL / install path are visible
 	// before any wait (or if the wait times out).
-	if err := formatSessionNewOutput(stdout, result, baseURL, extPath, browser); err != nil {
+	if err := formatSessionNewOutput(stdout, result, baseURL, extPath, browser, adhocDataDir); err != nil {
 		return err
 	}
 
@@ -595,7 +617,7 @@ func postCreateSessionHTTP(baseURL, sessionID, browser string) (*postCreateSessi
 	return result, nil
 }
 
-func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseURL, extPath, browser string) error {
+func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseURL, extPath, browser, adhocDataDir string) error {
 	if w == nil {
 		w = io.Discard
 	}
@@ -612,14 +634,28 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		"",
 		fmt.Sprintf("Session URL: %s", result.SessionURL),
 		fmt.Sprintf("Control:     %s", baseURL),
-		"",
-		"Extension:",
-		fmt.Sprintf("  path    %s", extPath),
-		"  install browser-agent install-chrome-extension",
-		"",
-		"Note:",
-		"  Chrome 137+ cannot auto-load extensions. Load unpacked once in your Chrome",
-		"  (chrome://extensions → Developer mode → Load unpacked → path above).",
+	}
+	if strings.TrimSpace(adhocDataDir) != "" {
+		lines = append(lines,
+			fmt.Sprintf("profile:     adhoc  %s", adhocDataDir),
+			"",
+			"Extension:",
+			fmt.Sprintf("  path    %s", extPath),
+			"  loaded  via --load-extension (adhoc profile; no Load unpacked needed)",
+		)
+	} else {
+		lines = append(lines,
+			"",
+			"Extension:",
+			fmt.Sprintf("  path    %s", extPath),
+			"  install browser-agent install-chrome-extension",
+			"",
+			"Note:",
+			"  Chrome 137+ cannot auto-load extensions. Load unpacked once in your Chrome",
+			"  (chrome://extensions → Developer mode → Load unpacked → path above).",
+		)
+	}
+	lines = append(lines,
 		"",
 		"Next:",
 		fmt.Sprintf("  browser-agent session info --session-id %s", result.SessionID),
@@ -630,7 +666,7 @@ func formatSessionNewOutput(w io.Writer, result *postCreateSessionResult, baseUR
 		fmt.Sprintf("  browser-agent session screenshot --session-id %s -o out.png", result.SessionID),
 		fmt.Sprintf("  browser-agent session cdp --session-id %s Page.navigate '{\"url\":\"https://example.com\"}'", result.SessionID),
 		"",
-	}
+	)
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(w, strings.TrimRight(line, "\n")); err != nil {
 			return err

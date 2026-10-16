@@ -7,6 +7,7 @@
 //   - clean git worktree
 //   - HEAD is a v* tag (git describe --tags HEAD)
 //   - .upload-credentials.json {token, owner, repo}
+//     A linked worktree uses the main checkout's file when this checkout has none.
 //   - node/npm for full SPA bundle (unless --skip-prebuild with fat embeds)
 //   - AMO-signed Firefox .xpi matching VERSION.txt under dist/signed or embed
 //     (run go run ./script/browser-agent/firefox/sign first; AMO may take hours)
@@ -15,6 +16,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -54,6 +56,7 @@ Options:
 Credentials (live only):
   .upload-credentials.json
     {"token":"ghp_...","owner":"xhd2015","repo":"browser-agent"}
+  A linked worktree uses the main checkout's file when this checkout has none.
 
 Install published binaries:
   curl -fsSL https://raw.githubusercontent.com/xhd2015/browser-agent/master/install.sh | bash
@@ -100,7 +103,7 @@ func handle() error {
 		}
 	}
 
-	creds, err := release.LoadCredentials(".upload-credentials.json")
+	creds, err := loadUploadCredentials()
 	if err != nil {
 		if !dryRun {
 			return err
@@ -177,6 +180,63 @@ func handle() error {
 	fmt.Printf("Release %s: https://github.com/%s/%s/releases/tag/%s\n",
 		result.Tag, creds.Owner, creds.Repo, result.Tag)
 	return nil
+}
+
+const uploadCredentialsFile = ".upload-credentials.json"
+
+// loadUploadCredentials reads .upload-credentials.json from the current
+// directory. A linked worktree with no file reads the main checkout's copy.
+// A file that exists but cannot be used is returned as that file's error.
+func loadUploadCredentials() (*release.Credentials, error) {
+	if _, err := os.Stat(uploadCredentialsFile); os.IsNotExist(err) {
+		if mainRoot, linked := linkedMainCheckout(); linked {
+			fallback := filepath.Join(mainRoot, uploadCredentialsFile)
+			if _, ferr := os.Stat(fallback); ferr == nil {
+				return release.LoadCredentials(fallback)
+			}
+		}
+	}
+	return release.LoadCredentials(uploadCredentialsFile)
+}
+
+// linkedMainCheckout reports the main checkout when cwd is a linked worktree.
+// git worktree list prints that checkout first.
+func linkedMainCheckout() (string, bool) {
+	topOut, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", false
+	}
+	listOut, err := exec.Command("git", "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return "", false
+	}
+	var main string
+	for _, line := range strings.Split(string(listOut), "\n") {
+		if rest, ok := strings.CutPrefix(line, "worktree "); ok {
+			main = strings.TrimSpace(rest)
+			break
+		}
+	}
+	if main == "" {
+		return "", false
+	}
+	top := strings.TrimSpace(string(topOut))
+	if samePath(top, main) {
+		return main, false
+	}
+	return main, true
+}
+
+func samePath(a, b string) bool {
+	return filepath.Clean(evalSymlink(a)) == filepath.Clean(evalSymlink(b))
+}
+
+func evalSymlink(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
 }
 
 // packHydrateArchives runs release-assets pack into a temp dir and returns paths.

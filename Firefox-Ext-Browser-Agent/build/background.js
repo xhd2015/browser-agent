@@ -17,7 +17,7 @@ const api =
 let EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.18";
+    : "1.0.19";
 let EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
 let bundleSumLoadPromise = null;
@@ -1216,9 +1216,63 @@ async function handleScreenshotJob(params, sessionId, targetOpts) {
   };
 }
 
+const CREATE_TAB_CAPTURABLE_TIMEOUT_MS = 5000;
+const CREATE_TAB_CAPTURABLE_POLL_MS = 50;
+
+function createTabURLText(url) {
+  const text = url != null ? String(url).trim() : "";
+  return text || "(empty)";
+}
+
+function isTransitionalTabURL(url) {
+  const text = url != null ? String(url).trim() : "";
+  if (!text) return true;
+  return text.toLowerCase().startsWith("about:");
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForCapturableTabURL(tabId, timeoutMs) {
+  const ms =
+    timeoutMs != null && timeoutMs >= 0 ? timeoutMs : CREATE_TAB_CAPTURABLE_TIMEOUT_MS;
+  const deadline = Date.now() + ms;
+  let lastURL = "";
+  if (!api || !api.tabs || typeof api.tabs.get !== "function") {
+    throw new Error("tabs.get not available");
+  }
+  for (;;) {
+    let tab;
+    try {
+      tab = await api.tabs.get(tabId);
+    } catch (e) {
+      throw new Error("create-tab tab closed before URL was capturable (tab " + tabId + ")");
+    }
+    if (!tab) {
+      throw new Error("create-tab tab closed before URL was capturable (tab " + tabId + ")");
+    }
+    lastURL = tab.url || "";
+    if (isCapturableTabURL(lastURL)) {
+      return tab;
+    }
+    const timedOut = Date.now() >= deadline;
+    if (!isTransitionalTabURL(lastURL) || timedOut) {
+      const why = !isTransitionalTabURL(lastURL)
+        ? "create-tab URL is not capturable"
+        : "create-tab timed out waiting for a capturable URL";
+      throw new Error(
+        why + " (tab " + tabId + ", last url " + createTabURLText(lastURL) + ")",
+      );
+    }
+    await sleepMs(CREATE_TAB_CAPTURABLE_POLL_MS);
+  }
+}
+
 /**
  * Shared create path for job create_tab.
  * Always scopes to the session window (entry.windowId). Default active: true.
+ * When a URL is requested, the result waits until tab.url is capturable.
  */
 async function createTabInSession(sessionId, opts) {
   opts = opts || {};
@@ -1244,10 +1298,14 @@ async function createTabInSession(sessionId, opts) {
     createProps.url = url;
   }
   const tab = await api.tabs.create(createProps);
+  let ready = tab;
+  if (url && ready && ready.id != null && !isCapturableTabURL(ready.url || "")) {
+    ready = await waitForCapturableTabURL(ready.id);
+  }
   return {
     type: "create_tab",
-    tab_id: tab && tab.id != null ? tab.id : null,
-    url: (tab && tab.url) || url || "",
+    tab_id: ready && ready.id != null ? ready.id : null,
+    url: (ready && ready.url) || url || "",
     window_id: entry.windowId,
   };
 }

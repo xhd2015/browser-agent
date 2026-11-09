@@ -95,7 +95,9 @@ func FormatBundleSumJS(version, md5hex string) string {
 }
 
 // ComputeExtensionContentMD5 hashes extension dir contents with sorted relative
-// paths. Basename bundle-sum.js is excluded so the sum file does not change the digest.
+// paths. Basename bundle-sum.js is excluded so the sum file does not change the
+// digest. The tracked embed placeholder.txt at the extension root is also
+// excluded: it keeps git/embed dirs non-empty and is not extension content.
 //
 // Digest stream per file (slash-normalized relative path):
 //
@@ -138,6 +140,9 @@ func ComputeExtensionContentMD5(dir string) (string, error) {
 		}
 		// Normalize to slash paths for cross-platform stability.
 		rel = filepath.ToSlash(rel)
+		if rel == "placeholder.txt" {
+			return nil
+		}
 		paths = append(paths, rel)
 		return nil
 	})
@@ -229,5 +234,3 @@ func ColorOrangeIfTTY(s string, isTTY bool) string {
 	}
 	return "\x1b[38;5;208m" + s + "\x1b[0m"
 }
-
-

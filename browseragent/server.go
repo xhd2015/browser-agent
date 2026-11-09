@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -21,6 +22,9 @@ type controlServer struct {
 	onShutdown          func()
 	baseDir             string
 	daemonVersion       string
+	// direct holds instance-level connections that address windows and tabs
+	// without a session; see direct.go.
+	direct *directRegistry
 }
 
 // RegistryHandlerConfig configures extended health metadata on registry handlers.
@@ -51,6 +55,7 @@ func NewRegistryControlHandlerConfig(registry *SessionRegistry, cfg RegistryHand
 		onShutdown:          cfg.OnShutdown,
 		baseDir:             cfg.BaseDir,
 		daemonVersion:       cfg.DaemonVersion,
+		direct:              newDirectRegistry(),
 	}
 	return cs.handler()
 }
@@ -60,6 +65,7 @@ func newRunControlHandler(registry *SessionRegistry) http.Handler {
 		registry:            registry,
 		requireSessionParam: false,
 		fastFailNoExtension: false,
+		direct:              newDirectRegistry(),
 	}
 	return cs.handler()
 }
@@ -80,6 +86,8 @@ func (c *controlServer) handler() http.Handler {
 	mux.HandleFunc("/v1/ext/poll", c.handleExtPoll)
 	mux.HandleFunc("/v1/ext/result", c.handleExtResult)
 	mux.HandleFunc("/v1/ws", c.handleWS)
+	mux.HandleFunc("/v1/windows", c.handleWindows)
+	mux.HandleFunc("/v1/connections", c.handleConnections)
 	mux.HandleFunc(FirefoxXPIHTTPPath, c.handleFirefoxXPI)
 	mux.HandleFunc("/go", c.handleGo)
 	mux.HandleFunc("/assets/", c.handleAssets)
@@ -181,10 +189,11 @@ func (c *controlServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		dv = ClientVersion()
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok":             true,
-		"product":        ProductName,
-		"daemon_version": dv,
-		"base_dir":       c.baseDir,
+		"ok":               true,
+		"product":          ProductName,
+		"daemon_version":   dv,
+		"base_dir":         c.baseDir,
+		"direct_supported": true,
 	})
 }
 
@@ -380,11 +389,16 @@ func (c *controlServer) handleSessionDelete(w http.ResponseWriter, r *http.Reque
 }
 
 type jobsRequest struct {
-	SessionID string         `json:"session_id"`
-	Type      string         `json:"type"`
-	TabID     int64          `json:"tab_id"`
-	Params    map[string]any `json:"params"`
-	TimeoutMS int64          `json:"timeout_ms"`
+	SessionID string `json:"session_id"`
+	Type      string `json:"type"`
+	TabID     int64  `json:"tab_id"`
+	// WindowID addresses a whole window in direct mode (no session_id).
+	WindowID int64 `json:"window_id"`
+	// InstanceID selects among several connected extension instances; empty
+	// means the only connected instance.
+	InstanceID string         `json:"instance_id,omitempty"`
+	Params     map[string]any `json:"params"`
+	TimeoutMS  int64          `json:"timeout_ms"`
 }
 
 func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
@@ -402,6 +416,53 @@ func (c *controlServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 	sid := strings.TrimSpace(req.SessionID)
 	if sid == "" {
 		sid = strings.TrimSpace(r.URL.Query().Get("session"))
+	}
+	if sid == "" {
+		// Direct rail: no session identity; address by window_id/tab_id over an
+		// instance connection. HAR is session-scoped and stays unavailable.
+		jobType := req.Type
+		if jobType == "" {
+			jobType = "eval"
+		}
+		if _, isHAR := map[string]bool{JobTypeHARStart: true, JobTypeHAREnd: true}[jobType]; isHAR {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(JobResult{OK: false, Error: "HAR capture requires a session (direct mode does not keep a session spool)"})
+			return
+		}
+		if req.TimeoutMS <= 0 {
+			req.TimeoutMS = 30000
+		}
+		if req.Params == nil {
+			req.Params = make(map[string]any)
+		}
+		if req.InstanceID != "" {
+			r.URL.RawQuery = "instance=" + url.QueryEscape(req.InstanceID)
+		}
+		conn, directErr := c.resolveDirectConn(r)
+		if directErr != "" {
+			namedInstance := req.InstanceID != "" || strings.TrimSpace(r.URL.Query().Get("instance")) != ""
+			if !namedInstance && len(c.registry.List()) == 0 {
+				// No sessions and no usable instance link: keep the historical
+				// missing-session wording so old clients see a familiar error.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":   "missing session_id",
+					"message": "session_id is required",
+				})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": directErr})
+			return
+		}
+		res := c.runDirectJob(r, conn, jobType, req.WindowID, req.TabID, req.Params, req.TimeoutMS)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(res)
+		return
 	}
 	if sid == "" && !c.requireSessionParam {
 		if only, ok := c.registry.onlySessionID(); ok {

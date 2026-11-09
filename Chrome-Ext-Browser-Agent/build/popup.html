@@ -64,6 +64,17 @@
       <strong>Debugger</strong>
       <span id="status-debugger" data-phase="debugger" class="muted">…</span>
     </div>
+    <div class="row">
+      <strong>Direct window control</strong>
+      <label style="margin-left: 6px">
+        <input type="checkbox" id="direct-toggle" />
+        <span id="direct-state" class="muted">off</span>
+      </label>
+    </div>
+    <div class="row">
+      <strong>Direct channel</strong>
+      <span id="status-direct" data-phase="direct" class="muted">…</span>
+    </div>
     <p class="muted" data-connection-status id="conn-hint">
       Open a /go?session= page so the extension can attach via WebSocket.
     </p>

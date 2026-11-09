@@ -11,9 +11,12 @@ import (
 
 // Job is a unit of work for the extension agent.
 type Job struct {
-	ID        string         `json:"id"`
-	SessionID string         `json:"session_id,omitempty"`
-	Type      string         `json:"type"`
+	ID        string `json:"id"`
+	SessionID string `json:"session_id,omitempty"`
+	Type      string `json:"type"`
+	// WindowID addresses a whole Chrome window (direct mode). Zero means the
+	// extension resolves the target itself (session window or active tab).
+	WindowID  int64          `json:"window_id,omitempty"`
 	TabID     int64          `json:"tab_id,omitempty"`
 	Params    map[string]any `json:"params,omitempty"`
 	TimeoutMS int64          `json:"timeout_ms,omitempty"`

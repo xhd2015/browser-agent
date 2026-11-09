@@ -1609,13 +1609,9 @@ async function polyfillCloseTarget(params, sessionId) {
   } catch (e) {
     throw new Error("closeTarget: tab_id " + tabId + " not found");
   }
-  // Never close the session control page (/go?session=<id>).
-  if (isSessionGoPageURL(tab.url || "", sessionId)) {
-    throw new Error("refusing to close session control page (/go?session=)");
-  }
-  if (entry && entry.tabId != null && entry.tabId === tabId) {
-    throw new Error("refusing to close session-page tab_id " + tabId);
-  }
+  // A tab is a tab: the session control page (/go?session=<id>) closes like any
+  // other tab. Chrome's tabs.onRemoved recount cleans the session up, and the
+  // caller owns the "this drops the mirror" warning.
   if (entry && entry.windowId != null && tab.windowId !== entry.windowId) {
     throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
   }

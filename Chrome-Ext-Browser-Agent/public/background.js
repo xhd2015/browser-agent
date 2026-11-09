@@ -12,19 +12,36 @@ try {
 } catch (e) {
   console.error("browser-agent: har-recorder.js not loaded", e);
 }
+try {
+  importScripts("tab-close-confirm.js");
+} catch (e) {
+  console.error("browser-agent: tab-close-confirm.js not loaded", e);
+}
 const CONTROL_PORT = 43761;
 const WS_PATH = "/v1/ws";
 const EXT_VERSION =
   typeof BROWSER_AGENT_BUNDLE_VERSION === "string" && BROWSER_AGENT_BUNDLE_VERSION
     ? BROWSER_AGENT_BUNDLE_VERSION
-    : "1.0.19";
+    : "1.0.30";
 const EXT_BUNDLE_MD5 =
   typeof BROWSER_AGENT_BUNDLE_MD5 === "string" ? BROWSER_AGENT_BUNDLE_MD5 : "";
-const FEATURES = ["browser-agent", "har-capture"];
+const FEATURES = ["browser-agent", "har-capture", "all-windows", "window-close", "direct-window-v1", "all-windows-v2", "js-dialog"];
+if (typeof globalThis.createTabCloseController === "function") FEATURES.push("tab-close-confirm-v1");
 const CDP_PROTOCOL_VERSION = "1.3";
 const HAR_BODY_SETTLE_MS = 2000;
 const HAR_UPLOAD_TIMEOUT_MS = 30000;
 const HAR_NETWORK_BUFFER_SIZE = 10 * 1024 * 1024;
+
+// --- Direct mode: address windows/tabs by id with no session and no /go page. ---
+// One instance-level WS (per extension, not per session) rides the same envelope
+// protocol; the daemon routes jobs carrying window_id/tab_id to it. Consent is an
+// explicit popup toggle (default off), so the extension never debugs windows the
+// user did not opt in; capturable-URL checks still apply per tab.
+const DIRECT_SESSION_KEY = "__direct__";
+const DIRECT_ENABLED_KEY = "directWindowControlEnabled";
+const DIRECT_INSTANCE_KEY = "directInstanceId";
+const DIRECT_PORT_KEY = "directControlPort";
+const DIRECT_HEALTH_TIMEOUT_MS = 1500;
 
 /** Active HAR capture keyed by Browser Agent session id. */
 const harCaptures = new Map();
@@ -59,6 +76,13 @@ const OFFSCREEN_PORT_NAME = "ba-offscreen-keepalive";
  */
 /** @type {Map<number, true>} */
 const attachedTabs = new Map();
+/**
+ * Open JS dialogs (alert / confirm / prompt / beforeunload) keyed by tab id.
+ * The page is suspended while a dialog is open, so this state is the only way
+ * an agent or the mirror can see and answer it. Cleared on
+ * javascriptDialogClosed, debugger detach, and explicit handle jobs.
+ */
+const tabDialogs = new Map();
 /**
  * Per-session debugger attach state (serialize attach via attachLock).
  * Policy B multi-tab set: jobs may attach multiple tabIds; peers stay attached
@@ -177,7 +201,7 @@ function baShouldLogJob(jobType, params) {
   if (jobType === "cdp") {
     const method =
       (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
-    return method === "Page.navigate" || String(method).startsWith("Target.");
+    return method === "Page.navigate" || String(method).startsWith("Target.") || String(method).startsWith("BrowserAgent.");
   }
   return false;
 }
@@ -294,6 +318,8 @@ function startKeepalive(sessionId, entry) {
   entry.keepaliveTimer = setInterval(() => {
     if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
       sendJSON(entry, { v: 1, type: "ping", id: "ka-" + sessionId + "-" + Date.now() });
+    } else if (entry.kind === "direct") {
+      connectInstance("keepalive").catch(() => {});
     } else {
       connectSession(sessionId, "keepalive");
     }
@@ -443,6 +469,7 @@ function buildPopupStatus() {
   const attachedTabCount = attachedTabs.size;
   const totalAttached = Math.max(attachCount, attachedTabCount);
   const armed = totalAttached > 0 || sessionsConnected > 0;
+  const directWs = directEntry.ws ? directEntry.ws.readyState : WebSocket.CLOSED;
   return {
     ok: true,
     type: "popupStatus",
@@ -456,6 +483,13 @@ function buildPopupStatus() {
     armed: armed,
     ws: sessionsConnected > 0 ? "connected" : sessions.size > 0 ? "waiting" : "none",
     debugger: totalAttached > 0 ? "armed" : "idle",
+    direct:
+      directWs === WebSocket.OPEN
+        ? "connected"
+        : directWs === WebSocket.CONNECTING
+          ? "connecting"
+          : "none",
+    directSupported: directSupported,
     updatedAt: Date.now(),
   };
 }
@@ -524,6 +558,266 @@ function handleGetStatus(msg, sendResponse) {
   }, 0);
   return true;
 }
+
+// =============================================================================
+// Direct channel: instance-level WS for window_id/tab_id jobs (no session).
+//
+// The link is opt-in (popup toggle), negotiated against /v1/health so an old
+// daemon is never sent an ?instance= URL it would misread, and reconnects with
+// the same aggressive backoff as session links. Jobs arrive as regular job
+// envelopes with payload.direct=true and are executed through the shared
+// handleJob path with a windowId-capable target resolver.
+// =============================================================================
+
+const directEntry = {
+  kind: "direct",
+  ws: null,
+  tabId: null,
+  windowId: null,
+  controlPort: CONTROL_PORT,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  connectTimeoutTimer: null,
+  keepaliveTimer: null,
+  prepareReconnectBaseMS: 0,
+  prepareReconnectMaxMS: 0,
+  pendingResults: new Map(),
+  activeJobIds: new Set(),
+  completedJobIds: new Set(),
+};
+/** Cached positive health probe so repeated schedules do not re-probe. */
+let directSupported = false;
+let directConnecting = false;
+
+function directStorageGet(key) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([key], (items) => {
+        resolve(items ? items[key] : undefined);
+      });
+    } catch (e) {
+      resolve(undefined);
+    }
+  });
+}
+
+function directStorageSet(key, value) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set({ [key]: value }, () => resolve());
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+async function directModeEnabled() {
+  const enabled = await directStorageGet(DIRECT_ENABLED_KEY);
+  // Default ON: only an explicit popup opt-out (false) disables the direct
+  // rail, so an untouched install connects the instance channel right away.
+  // A failed storage read behaves like an untouched install.
+  return enabled !== false;
+}
+
+/** Stable per-install identity so the daemon can tell extensions apart. */
+async function directInstanceId() {
+  let id = await directStorageGet(DIRECT_INSTANCE_KEY);
+  if (typeof id === "string" && id) return id;
+  const bytes = new Uint8Array(8);
+  try {
+    crypto.getRandomValues(bytes);
+  } catch (e) {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  id = "inst-" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  await directStorageSet(DIRECT_INSTANCE_KEY, id);
+  return id;
+}
+
+async function directPort() {
+  const saved = await directStorageGet(DIRECT_PORT_KEY);
+  const port = Number(saved);
+  if (Number.isFinite(port) && port > 0) return port;
+  return CONTROL_PORT;
+}
+
+/**
+ * Ask the daemon whether it speaks direct-window-v1. Only a positive probe
+ * opens an ?instance= link: an old daemon resolves any unknown query to a
+ * session and could otherwise adopt our socket into a session slot.
+ */
+async function directDaemonSupports() {
+  if (directSupported) return true;
+  const port = await directPort();
+  let ok = false;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DIRECT_HEALTH_TIMEOUT_MS);
+    const response = await fetch("http://127.0.0.1:" + port + "/v1/health", {
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (response.ok) {
+      const body = await response.json().catch(() => null);
+      ok = !!(body && body.direct_supported === true);
+    }
+  } catch (e) {
+    ok = false;
+  }
+  if (ok) {
+    directSupported = true;
+    await directStorageSet(DIRECT_PORT_KEY, port);
+  }
+  return ok;
+}
+
+function isDirectSocketLive() {
+  return directEntry.ws && directEntry.ws.readyState === WebSocket.OPEN;
+}
+
+function scheduleDirectConnect(reason) {
+  if (directEntry.reconnectTimer) return;
+  if (isDirectSocketLive()) return;
+  const base = RECONNECT_BASE_MS;
+  const delay = Math.min(RECONNECT_MAX_MS, base * Math.pow(2, directEntry.reconnectAttempt));
+  directEntry.reconnectAttempt += 1;
+  directEntry.reconnectTimer = setTimeout(() => {
+    directEntry.reconnectTimer = null;
+    connectInstance(reason || "reconnect");
+  }, delay);
+}
+
+async function sendDirectHello() {
+  return sendJSON(directEntry, {
+    v: 1,
+    type: "hello",
+    payload: {
+      version: EXT_VERSION,
+      features: FEATURES,
+      browser_product: "Chrome",
+      direct: true,
+    },
+  });
+}
+
+async function connectInstance(reason) {
+  if (directConnecting) return;
+  if (isDirectSocketLive()) return;
+  if (!(await directModeEnabled())) return;
+  if (!(await directDaemonSupports())) {
+    // Old daemon or serve down; retry on the next alarm/heal kick.
+    return;
+  }
+  directConnecting = true;
+  try {
+    const port = await directPort();
+    const instanceId = await directInstanceId();
+    if (directEntry.ws) {
+      try {
+        directEntry.ws.close();
+      } catch (e) {
+        /* ignore */
+      }
+      directEntry.ws = null;
+    }
+    directEntry.controlPort = port;
+    const wsURL =
+      "ws://127.0.0.1:" + port + WS_PATH + "?instance=" + encodeURIComponent(instanceId);
+    baLog("log", "connectInstance start", { reason: reason || "", ws_url: wsURL });
+    let socket;
+    try {
+      socket = new WebSocket(wsURL);
+    } catch (e) {
+      baLog("warn", "connectInstance ctor fail", { error: String(e && e.message ? e.message : e) });
+      scheduleDirectConnect(reason);
+      return;
+    }
+    directEntry.ws = socket;
+    directEntry.connectTimeoutTimer = setTimeout(() => {
+      directEntry.connectTimeoutTimer = null;
+      if (directEntry.ws && directEntry.ws.readyState === WebSocket.CONNECTING) {
+        try {
+          directEntry.ws.close();
+        } catch (e) {
+          /* ignore */
+        }
+      }
+    }, CONNECT_TIMEOUT_MS);
+
+    socket.onopen = () => {
+      if (directEntry.connectTimeoutTimer) {
+        clearTimeout(directEntry.connectTimeoutTimer);
+        directEntry.connectTimeoutTimer = null;
+      }
+      directEntry.reconnectAttempt = 0;
+      baLog("log", "connectInstance ws_open", { reason: reason || "" });
+      notifyDirectChannelStatus("connected");
+      sendDirectHello()
+        .then(() => flushPendingJobResults(directEntry))
+        .catch((e) => {
+          baLog("warn", "connectInstance hello fail", {
+            error: String(e && e.message ? e.message : e),
+          });
+        });
+      startKeepalive(DIRECT_SESSION_KEY, directEntry);
+      ensureOffscreenKeepAlive().catch(() => {});
+    };
+    socket.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch (e) {
+        return;
+      }
+      handleMessage(msg, DIRECT_SESSION_KEY, directEntry);
+    };
+    socket.onclose = () => {
+      if (directEntry.connectTimeoutTimer) {
+        clearTimeout(directEntry.connectTimeoutTimer);
+        directEntry.connectTimeoutTimer = null;
+      }
+      stopKeepalive(directEntry);
+      directEntry.ws = null;
+      notifyDirectChannelStatus("disconnected");
+      scheduleDirectConnect("close");
+    };
+    socket.onerror = () => {
+      try {
+        if (directEntry.ws && directEntry.ws !== socket) return;
+        socket.close();
+      } catch (e) {
+        /* ignore */
+      }
+    };
+  } finally {
+    directConnecting = false;
+  }
+}
+
+/** Broadcast direct channel state to any open popup. */
+function notifyDirectChannelStatus(state) {
+  try {
+    chrome.runtime.sendMessage({ type: "direct_channel_status", state: state }, () => {
+      void chrome.runtime.lastError; // popup may be closed; ignore
+    });
+  } catch (e) {
+    /* runtime optional in test stubs */
+  }
+}
+
+/** startKeepalive/stopKeepalive are keyed by session id; direct uses the reserved key. */
+function directAlarmKick() {
+  if (isDirectSocketLive()) return;
+  connectInstance("alarm").catch(() => {});
+}
+
+// Boot kicks: same staggering rationale as session heal (SW may cold-start
+// before serve is reachable, and storage reads are async).
+[250, 1000, 3000, 8000].forEach((delay, index) => {
+  setTimeout(() => {
+    connectInstance("sw-boot-" + (index + 1)).catch(() => {});
+  }, delay);
+});
 
 function scheduleReconnect(sessionId) {
   const entry = sessions.get(sessionId);
@@ -1205,6 +1499,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     return true;
   }
+  // Popup toggle flipped: open or tear down the direct channel right away.
+  if (msg.type === "direct_mode_changed") {
+    directSupported = false; // re-probe on next enable
+    if (msg.enabled === true) {
+      directEntry.reconnectAttempt = 0;
+      connectInstance("popup-toggle").catch(() => {});
+    } else if (directEntry.ws) {
+      try {
+        directEntry.ws.close();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    try {
+      sendResponse({ ok: true, type: "direct_mode_ack" });
+    } catch (e) {
+      /* channel closed */
+    }
+    return true;
+  }
   // Popup progressive status API: status / getStatus / popupStatus.
   if (
     msg.type === "status" ||
@@ -1438,12 +1752,14 @@ chrome.runtime.onInstalled.addListener(() => {
   // Defer WS rediscover; never run debugger work on the install critical path.
   setTimeout(() => {
     healSessionsFromTabs("onInstalled").catch(() => {});
+    connectInstance("onInstalled").catch(() => {});
   }, 1000);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   setTimeout(() => {
     healSessionsFromTabs("onStartup").catch(() => {});
+    connectInstance("onStartup").catch(() => {});
   }, 1000);
 });
 
@@ -1502,6 +1818,8 @@ try {
           connectSession(sessionId, "alarm");
         }
       }
+      // Direct rail rides the same alarm cadence.
+      directAlarmKick();
     }
   });
 } catch (e) {
@@ -1998,7 +2316,8 @@ function closeHARTab(tabId) {
 
 async function handleJob(msg, sessionId, entry) {
   const payload = msg.payload || {};
-  const jobSessionId = payload.session_id || payload.sessionId || sessionId || "";
+  const isDirect = payload.direct === true || (entry && entry.kind === "direct");
+  const jobSessionId = isDirect ? "" : payload.session_id || payload.sessionId || sessionId || "";
   const jobId = payload.job_id || payload.id || msg.id || "";
   const jobType = payload.type || payload.job_type || "eval";
   const params = payload.params || {};
@@ -2009,6 +2328,13 @@ async function handleJob(msg, sessionId, entry) {
     tabId: payload.tab_id != null ? payload.tab_id : params.tab_id,
     tabIndex: payload.tab_index != null ? payload.tab_index : params.tab_index,
   };
+  // Direct jobs address windows without a session page; window_id rides the
+  // payload (never params) so session callers cannot be confused by it.
+  if (isDirect && payload.window_id != null) {
+    targetOpts.windowId = payload.window_id;
+  }
+  targetOpts.direct = isDirect;
+  targetOpts.entry = entry;
 
   const t0 = Date.now();
   if (baShouldLogJob(jobType, params)) {
@@ -2018,16 +2344,25 @@ async function handleJob(msg, sessionId, entry) {
       type: jobType,
       tab_id: targetOpts.tabId,
       tab_index: targetOpts.tabIndex,
-      window_id: entry && entry.windowId,
+      window_id: (targetOpts.windowId != null ? targetOpts.windowId : (entry && entry.windowId)),
+      direct: isDirect,
       params: baSummarizeParams(jobType, params),
     });
   }
 
   try {
     let data;
+    if (isDirect && (jobType === "har_start" || jobType === "har_end")) {
+      // HAR is a session spool feature; direct has no session dir to write to.
+      throw new Error("HAR capture requires a session (direct mode has no session spool)");
+    }
     switch (jobType) {
       case "info":
-        data = await handleInfoJob(params, jobSessionId);
+        if (isDirect) {
+          data = await handleInfoJobDirect(params, targetOpts);
+        } else {
+          data = await handleInfoJob(params, jobSessionId);
+        }
         break;
       case "eval":
         data = await handleEvalJob(params, payload, jobSessionId, targetOpts);
@@ -2044,8 +2379,17 @@ async function handleJob(msg, sessionId, entry) {
       case "cdp":
         data = await handleCdpJob(params, jobSessionId, targetOpts);
         break;
+      case "dialog":
+        data = await handleDialogJob(params, payload, jobSessionId, targetOpts);
+        break;
       case "create_tab":
-        data = await handleCreateTabJob(params, jobSessionId);
+        data = await handleCreateTabJob(params, jobSessionId, entry, targetOpts);
+        break;
+      case "window":
+        data = await handleWindowJob(params, jobSessionId, entry, targetOpts);
+        break;
+      case "windows":
+        data = await handleWindowsJob();
         break;
       case "har_start":
         data = await handleHARStartJob(params, jobSessionId);
@@ -2103,6 +2447,7 @@ async function handleInfoJob(_params, sessionId) {
     title: t.title || "",
     active: !!t.active,
     role: isSessionGoPageURL(t.url || "", sessionId) ? "session_page" : "user",
+    dialog: tabDialogs.get(t.id) || null,
   }));
 
   let jobTarget = { tab_id: null, tab_index: null, reason: "session_page_fallback" };
@@ -2135,6 +2480,31 @@ async function handleInfoJob(_params, sessionId) {
     tabs: tabsOut,
     job_target: jobTarget,
     recommended_cli: recommendedCLI,
+  };
+}
+
+/**
+ * Answer a JS dialog (alert / confirm / prompt / beforeunload) on the
+ * session's target tab. The page is suspended while the dialog is open, so
+ * nothing else on that tab runs until this lands.
+ */
+async function handleDialogJob(params, payload, sessionId, targetOpts) {
+  const accept = !!(params && (params.accept != null ? params.accept : params.ok));
+  const hasPrompt = params && params.prompt_text != null;
+  const promptText = hasPrompt ? String(params.prompt_text) : undefined;
+  const result = await withDebuggerForSession(sessionId, async (tabId) => {
+    const response = await sendDebuggerCommand(tabId, "Page.handleJavaScriptDialog", {
+      accept: accept,
+      promptText: promptText,
+    });
+    tabDialogs.delete(tabId);
+    return response;
+  }, targetOpts);
+  return {
+    type: "dialog",
+    op: "handle",
+    accept: accept,
+    result: result,
   };
 }
 
@@ -2215,10 +2585,14 @@ async function handleLogsJob(params, sessionId, targetOpts) {
 async function handleScreenshotJob(params, sessionId, targetOpts) {
   const format = (params && params.format) || "png";
   const fullPage = !!(params && params.full_page);
+  const qualityRaw = params && params.quality != null ? Math.round(Number(params.quality)) : null;
   const result = await withDebuggerForSession(sessionId, async (tabId) => {
     const cdpParams = { format: format === "jpeg" ? "jpeg" : "png" };
     if (fullPage) {
       cdpParams.captureBeyondViewport = true;
+    }
+    if (format === "jpeg" && qualityRaw != null && qualityRaw >= 1 && qualityRaw <= 100) {
+      cdpParams.quality = qualityRaw;
     }
     return await sendDebuggerCommand(tabId, "Page.captureScreenshot", cdpParams);
   }, targetOpts);
@@ -2230,12 +2604,37 @@ async function handleScreenshotJob(params, sessionId, targetOpts) {
   };
 }
 
+const tabCloseController = typeof globalThis.createTabCloseController === "function"
+  ? globalThis.createTabCloseController({
+      chrome,
+      validate: validateRemoteCloseTab,
+      attach: attachDebuggerForSession,
+      send: sendDebuggerCommand,
+      newId: () => crypto.randomUUID(),
+    })
+  : null;
+
+async function validateRemoteCloseTab(sessionId, tabId) {
+  const entry = requireSessionWindowId(sessionId);
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab || tab.windowId !== entry.windowId) throw new Error("tab is not in the session window");
+  // No control-page carve-out: /go closes like any tab. The confirmation flow
+  // still guards pages that carry unsaved state.
+}
+
 async function handleCdpJob(params, sessionId, targetOpts) {
   const method = (params && (params.method || params.cdp_method || params.cdpMethod)) || "";
   if (!method) {
     throw new Error("cdp job requires params.method");
   }
   const cdpParams = (params && params.params) || {};
+  if (method === "BrowserAgent.closeTab" || method === "BrowserAgent.resolveCloseTab") {
+    if (!tabCloseController) throw new Error("remote tab close confirmation is not supported");
+    const result = method === "BrowserAgent.closeTab"
+      ? await tabCloseController.start(sessionId, cdpParams.tab_id)
+      : await tabCloseController.decide(sessionId, cdpParams.operation_id, cdpParams.accept);
+    return { result, method, type: "cdp", polyfilled: true };
+  }
   if (baShouldLogJob("cdp", params)) {
     baLog("log", "cdp begin", {
       session_id: sessionId,
@@ -2325,21 +2724,35 @@ async function waitForCapturableTabURL(tabId, timeoutMs) {
 
 /**
  * Shared create path for job create_tab and Target.createTarget.
- * Always scopes to the session window (entry.windowId). Default active: true.
+ * Defaults to the session window (entry.windowId); opts.window_id may target
+ * another existing window for explicit window adoption. Default active: true.
  * Public identity: tab_id only (no targetId).
  * When a URL is requested, the result waits until tab.url is capturable.
  */
-async function createTabInSession(sessionId, opts) {
+async function createTabInSession(sessionId, opts, createOpts) {
   opts = opts || {};
+  const direct = !!(createOpts && createOpts.direct);
   const entry = sessions.get(sessionId);
-  if (!entry || entry.windowId == null) {
+  if (!direct && (!entry || entry.windowId == null)) {
     baLog("error", "create_tab no windowId", { session_id: sessionId });
     throw new Error(
       "session page not bound (windowId missing); open /go?session=" + (sessionId || ""),
     );
   }
+  let targetWindowId = entry && entry.windowId != null ? entry.windowId : null;
+  const requestedWindow = opts.window_id != null ? opts.window_id : opts.windowId;
+  if (requestedWindow != null && requestedWindow !== "") {
+    const parsedWindowId = parseInt(requestedWindow, 10);
+    if (!Number.isNaN(parsedWindowId) && parsedWindowId > 0) {
+      targetWindowId = parsedWindowId;
+    }
+  }
+  if (targetWindowId == null) {
+    // Direct create_tab must name a window: never guess into the user's windows.
+    throw new Error("create_tab needs window_id in direct mode");
+  }
   const createProps = {
-    windowId: entry.windowId,
+    windowId: targetWindowId,
   };
   // Default active:true when unspecified.
   if (opts.active === false || opts.active === "false" || opts.active === 0) {
@@ -2353,7 +2766,7 @@ async function createTabInSession(sessionId, opts) {
   }
   baLog("log", "create_tab chrome.tabs.create", {
     session_id: sessionId,
-    window_id: entry.windowId,
+    window_id: targetWindowId,
     url: url,
     active: createProps.active,
   });
@@ -2379,21 +2792,565 @@ async function createTabInSession(sessionId, opts) {
   // P2 eager arm: attach only after the committed URL is known.
   if (ready && ready.id != null) {
     const createdUrl = (ready && ready.url) || url || (ready && ready.pendingUrl) || "";
-    maybeEagerAttach(sessionId, ready.id, createdUrl, entry.windowId);
+    if (direct) {
+      maybeEagerAttachDirect(ready.id, createdUrl, targetWindowId);
+    } else {
+      maybeEagerAttach(sessionId, ready.id, createdUrl, targetWindowId);
+    }
   }
   return {
     type: "create_tab",
     tab_id: ready && ready.id != null ? ready.id : null,
     url: (ready && ready.url) || url || "",
-    window_id: entry.windowId,
+    window_id: targetWindowId,
+    direct: direct || undefined,
   };
 }
 
-async function handleCreateTabJob(params, sessionId) {
+async function handleCreateTabJob(params, sessionId, entry, targetOpts) {
+  const direct = !!(targetOpts && targetOpts.direct);
+  if (direct) {
+    // window_id comes from the job payload (targetOpts), params.window_id is
+    // honored for explicit overrides.
+    return await createTabInSession(sessionId, {
+      url: params && (params.url || params.URL || params.href),
+      active: params && params.active,
+      window_id: params && params.window_id != null
+        ? params.window_id
+        : targetOpts && targetOpts.windowId,
+    }, { direct: true });
+  }
   return await createTabInSession(sessionId, {
     url: params && (params.url || params.URL || params.href),
     active: params && params.active,
+    window_id: params && (params.window_id != null ? params.window_id : params.windowId),
   });
+}
+
+function baChromeWindowsGet(windowId) {
+  return new Promise((resolve, reject) => {
+    chrome.windows.get(windowId, { populate: false }, (w) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.windows.get failed"));
+        return;
+      }
+      resolve(w || null);
+    });
+  });
+}
+
+function baChromeWindowsUpdate(windowId, info) {
+  return new Promise((resolve, reject) => {
+    chrome.windows.update(windowId, info || {}, (w) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.windows.update failed"));
+        return;
+      }
+      resolve(w || null);
+    });
+  });
+}
+
+function baChromeWindowsRemove(windowId) {
+  return new Promise((resolve, reject) => {
+    if (!chrome.windows || typeof chrome.windows.remove !== "function") {
+      reject(new Error("chrome.windows.remove is unavailable"));
+      return;
+    }
+    chrome.windows.remove(windowId, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.windows.remove failed"));
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+function baChromeWindowsGetAll(populate) {
+  return new Promise((resolve) => {
+    chrome.windows.getAll({ populate: !!populate }, (ws) => {
+      if (chrome.runtime.lastError) {
+        resolve([]);
+        return;
+      }
+      resolve(Array.isArray(ws) ? ws : []);
+    });
+  });
+}
+
+function baChromeWindowsGetAllPopulated() {
+  return new Promise((resolve, reject) => {
+    if (!chrome.windows || typeof chrome.windows.getAll !== "function") {
+      reject(new Error("chrome.windows.getAll is unavailable"));
+      return;
+    }
+    chrome.windows.getAll({ populate: true }, (ws) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || "chrome.windows.getAll failed"));
+        return;
+      }
+      resolve(Array.isArray(ws) ? ws : []);
+    });
+  });
+}
+
+function baWindowInfo(w) {
+  if (!w) return null;
+  return {
+    id: w.id,
+    left: w.left,
+    top: w.top,
+    width: w.width,
+    height: w.height,
+    state: w.state,
+    focused: w.focused,
+    type: w.type,
+    incognito: w.incognito,
+  };
+}
+
+/** Outer window minus page viewport, in CSS px (title bar + tab strip + borders). */
+async function baMeasureViewportMetrics(tabId) {
+  const res = await sendDebuggerCommand(tabId, "Runtime.evaluate", {
+    expression:
+      "JSON.stringify({iw:innerWidth,ih:innerHeight,ow:outerWidth,oh:outerHeight,dpr:devicePixelRatio,sx:screenX,sy:screenY,sw:screen.width,sh:screen.height})",
+    returnByValue: true,
+  });
+  const raw = res && res.result && res.result.value;
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function baActiveTabIdInWindow(windowId) {
+  const tabs = await chrome.tabs.query({ windowId: windowId, active: true });
+  const t = Array.isArray(tabs) && tabs.length ? tabs[0] : null;
+  return t && t.id != null ? t.id : null;
+}
+
+async function baResolveWindowIdForJob(params, sessionId, entry, targetOpts) {
+  params = params || {};
+  const explicit = params.window_id != null ? params.window_id : params.windowId;
+  if (explicit != null && explicit !== "") {
+    const n = parseInt(explicit, 10);
+    if (!Number.isNaN(n) && n > 0) return n;
+  }
+  if (entry && entry.windowId != null) return entry.windowId;
+  const tabId = targetOpts && targetOpts.tabId != null ? targetOpts.tabId : null;
+  if (tabId != null) {
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (t && t.windowId != null) return t.windowId;
+  }
+  const wins = await baChromeWindowsGetAll(false);
+  const chosen = wins.find((w) => w && w.focused) || wins[0];
+  if (!chosen) throw new Error("no chrome window available");
+  return chosen.id;
+}
+
+/**
+ * Workareas of every connected display, in window-API coordinates. Returns
+ * null when display info is unavailable (Firefox, or the permission is
+ * missing) so callers fall back to the unclamped legacy behavior.
+ */
+async function baDisplayWorkareas() {
+  try {
+    const api = chrome.system && chrome.system.display && chrome.system.display.getInfo;
+    if (!api) return null;
+    const infos = await new Promise((resolve) => {
+      try {
+        api.call(chrome.system.display, (items) => resolve(items || []));
+      } catch (e) {
+        resolve(null);
+      }
+    });
+    if (!infos || !infos.length) return null;
+    return infos.map((d) => {
+      const r = d.workArea || d.bounds || {};
+      return {
+        left: Number(r.left) || 0,
+        top: Number(r.top) || 0,
+        width: Number(r.width) || 0,
+        height: Number(r.height) || 0,
+      };
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Chrome rejects chrome.windows.update when the resulting bounds keep less
+ * than half the window inside the visible screen ("Bounds must be at least
+ * 50% within visible screen space."). A window dragged mostly off-screen — or
+ * remembered bounds captured in that state — makes every later API restore or
+ * resize fail with that raw error, with no way back through the same API.
+ *
+ * Clamp the target into the workarea of the display hosting the window:
+ * keep the requested size and move the window first, shrink only when the
+ * size itself cannot fit. Non-geometry keys (focused/state/drawAttention)
+ * pass through; without display info the info is returned unchanged.
+ */
+async function baClampWindowBounds(windowId, info) {
+  const geometry = {};
+  const other = {};
+  for (const k of ["left", "top", "width", "height"]) {
+    if (info[k] != null) geometry[k] = info[k];
+  }
+  for (const k of ["focused", "state", "drawAttention"]) {
+    if (info[k] != null) other[k] = info[k];
+  }
+  if (Object.keys(geometry).length === 0) return info;
+  let current = null;
+  try {
+    current = await baChromeWindowsGet(windowId);
+  } catch (e) {
+    return info;
+  }
+  if (!current) return info;
+  const displays = await baDisplayWorkareas();
+  const target = {
+    left: Math.round(Number(geometry.left != null ? geometry.left : current.left) || 0),
+    top: Math.round(Number(geometry.top != null ? geometry.top : current.top) || 0),
+    width: Math.round(Number(geometry.width != null ? geometry.width : current.width) || 0),
+    height: Math.round(Number(geometry.height != null ? geometry.height : current.height) || 0),
+  };
+  if (!(target.width > 0) || !(target.height > 0)) return info;
+  if (!displays) return Object.assign({}, target, other);
+  let display = displays[0];
+  let bestOverlap = -1;
+  for (const d of displays) {
+    const ox = Math.max(0, Math.min(current.left + current.width, d.left + d.width) - Math.max(current.left, d.left));
+    const oy = Math.max(0, Math.min(current.top + current.height, d.top + d.height) - Math.max(current.top, d.top));
+    if (ox * oy > bestOverlap) {
+      bestOverlap = ox * oy;
+      display = d;
+    }
+  }
+  const wa = display;
+  if (!(wa.width > 0) || !(wa.height > 0)) return Object.assign({}, target, other);
+  const width = Math.min(target.width, wa.width);
+  const height = Math.min(target.height, wa.height);
+  let left = target.left;
+  let top = target.top;
+  if (left + width > wa.left + wa.width) left = wa.left + wa.width - width;
+  if (left < wa.left) left = wa.left;
+  if (top + height > wa.top + wa.height) top = wa.top + wa.height - height;
+  if (top < wa.top) top = wa.top;
+  return Object.assign(
+    { left: Math.round(left), top: Math.round(top), width: Math.round(width), height: Math.round(height) },
+    other,
+  );
+}
+
+/** Augment Chrome's raw bounds rejection with an actionable hint. */
+function baBoundsError(e) {
+  const msg = e && e.message ? e.message : String(e);
+  if (/bounds/i.test(msg) && /50%|visible screen/i.test(msg)) {
+    return new Error(
+      msg + " — the window sits mostly off-screen; it could not be auto-fitted, drag it back into view and retry",
+    );
+  }
+  return e;
+}
+
+/**
+ * Window jobs: chrome.windows.* (Browser-domain window control).
+ *
+ * `resize` targets the *page viewport* rather than the outer window: it
+ * measures the outer-minus-inner chrome delta on the target tab, sets the
+ * outer size accordingly, then reports the achieved viewport (macOS clamps
+ * windows taller than the screen, so the achieved size may be smaller).
+ */
+async function handleWindowJob(params, sessionId, entry, targetOpts) {
+  params = params || {};
+  const op = String(params.op || params.operation || "get").toLowerCase();
+  const windowId = await baResolveWindowIdForJob(params, sessionId, entry, targetOpts);
+
+  if (op === "get") {
+    const w = await baChromeWindowsGet(windowId);
+    return { type: "window", op: op, window_id: windowId, window: baWindowInfo(w) };
+  }
+
+  if (op === "close") {
+    const wins = await baChromeWindowsGetAll(false);
+    const normal = wins.filter((w) => w && w.type === "normal");
+    if (!normal.some((w) => w.id === windowId)) {
+      throw new Error("that Chrome window is already closed");
+    }
+    if (normal.length <= 1) {
+      throw new Error("cannot close the last Chrome window");
+    }
+    await baChromeWindowsRemove(windowId);
+    return { type: "window", op: op, window_id: windowId, closed: true };
+  }
+
+  if (op === "update") {
+    const info = {};
+    for (const k of ["left", "top", "width", "height", "focused", "state", "drawAttention"]) {
+      if (params[k] != null) info[k] = params[k];
+    }
+    const current = await baChromeWindowsGet(windowId);
+    if (current && current.state && current.state !== "normal" && (info.width || info.height)) {
+      await baChromeWindowsUpdate(windowId, { state: "normal" });
+    }
+    // Stale remembered bounds (e.g. the Mac preset restoring a window that has
+    // since been dragged half off-screen) would be rejected outright; clamp
+    // the target into the workarea so the restore self-heals.
+    let w;
+    try {
+      w = await baChromeWindowsUpdate(windowId, await baClampWindowBounds(windowId, info));
+    } catch (e) {
+      throw baBoundsError(e);
+    }
+    return { type: "window", op: op, window_id: windowId, window: baWindowInfo(w) };
+  }
+
+  if (op !== "resize") {
+    throw new Error("unknown window op: " + op + " (want get|update|resize|close)");
+  }
+
+  const wantW = Math.round(Number(params.width || params.viewport_width || 0));
+  const wantH = Math.round(Number(params.height || params.viewport_height || 0));
+  if (!(wantW > 0) || !(wantH > 0)) {
+    throw new Error("window resize requires params.width and params.height (viewport CSS px)");
+  }
+  const settleMs = Math.max(0, Math.round(Number(params.settle_ms != null ? params.settle_ms : 200)));
+
+  const tabId =
+    (targetOpts && targetOpts.tabId != null ? targetOpts.tabId : null) ||
+    (await baActiveTabIdInWindow(windowId));
+  if (tabId == null) throw new Error("window resize needs a tab in window " + windowId);
+
+  return await withDebuggerForSession(
+    sessionId,
+    async (attachedTabId) => {
+      const passes = [];
+      let metrics = await baMeasureViewportMetrics(attachedTabId);
+      if (!metrics) throw new Error("could not measure viewport on tab " + attachedTabId);
+      passes.push(metrics);
+
+      const current = await baChromeWindowsGet(windowId);
+      // A tab driven through a debugger can report a viewport frozen in an
+      // older rendering state (inner larger than its own outer, or larger
+      // than the window Chrome reports). Delta math on such a reading aims
+      // the resize below Chrome's window floor and the window never moves;
+      // re-measure once, then refuse rather than mis-size.
+      const insane = (m, w) => !w || m.iw > w.width || m.ih > w.height || m.ow < m.iw || m.oh < m.ih;
+      if (current && insane(metrics, current)) {
+        await new Promise((r) => setTimeout(r, settleMs));
+        const remeasured = await baMeasureViewportMetrics(attachedTabId);
+        if (remeasured) {
+          metrics = remeasured;
+          passes.push(metrics);
+        }
+        if (insane(metrics, current)) {
+          throw new Error(
+            `viewport measurement (inner ${metrics.iw}x${metrics.ih}) disagrees with the window (outer ${current.width}x${current.height}); the tab may be driven by another debugger. Retry once it settles.`,
+          );
+        }
+      }
+      if (current && current.state && current.state !== "normal") {
+        await baChromeWindowsUpdate(windowId, { state: "normal" });
+        await new Promise((r) => setTimeout(r, settleMs));
+        metrics = await baMeasureViewportMetrics(attachedTabId);
+        if (metrics) passes.push(metrics);
+      }
+
+      // Chrome UI adds outer size on top of the page viewport; a negative
+      // delta is always a bad measurement, never a real window.
+      let deltaW = Math.max(0, metrics.ow - metrics.iw);
+      let deltaH = Math.max(0, metrics.oh - metrics.ih);
+      let applied = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const targetW = Math.max(200, wantW + deltaW);
+        const targetH = Math.max(200, wantH + deltaH);
+        // A size-only update on a window parked half off-screen would be
+        // rejected; clamp to the workarea (moving the window up/left as
+        // needed) so viewport resizes always land somewhere valid.
+        let appliedInfo;
+        try {
+          appliedInfo = await baChromeWindowsUpdate(
+            windowId,
+            await baClampWindowBounds(windowId, { width: targetW, height: targetH }),
+          );
+        } catch (e) {
+          throw baBoundsError(e);
+        }
+        applied = appliedInfo;
+        await new Promise((r) => setTimeout(r, settleMs));
+        const after = await baMeasureViewportMetrics(attachedTabId);
+        if (!after) break;
+        passes.push(after);
+        const offW = wantW - after.iw;
+        const offH = wantH - after.ih;
+        // chrome.windows.get reports the achieved (possibly clamped) outer size;
+        // when it differs from what we asked for, the OS refused that axis
+        // (macOS Chrome floors windows at 500x~200 and caps them at the display
+        // work area), and retrying cannot help.
+        const clampedW = !!(applied && Math.abs(applied.width - targetW) > 1);
+        const clampedH = !!(applied && Math.abs(applied.height - targetH) > 1);
+        if ((Math.abs(offW) <= 2 || clampedW) && (Math.abs(offH) <= 2 || clampedH)) break;
+        // Re-derive the chrome delta from the achieved pair, then retry.
+        deltaW = Math.max(0, after.ow - after.iw);
+        deltaH = Math.max(0, after.oh - after.ih);
+      }
+
+      const finalMetrics = passes[passes.length - 1];
+      return {
+        type: "window",
+        op: "resize",
+        window_id: windowId,
+        requested: { width: wantW, height: wantH },
+        viewport: { width: finalMetrics.iw, height: finalMetrics.ih },
+        outer: { width: finalMetrics.ow, height: finalMetrics.oh },
+        delta: { width: finalMetrics.ow - finalMetrics.iw, height: finalMetrics.oh - finalMetrics.ih },
+        display: { width: finalMetrics.sw, height: finalMetrics.sh },
+        dpr: finalMetrics.dpr,
+        window: baWindowInfo(await baChromeWindowsGet(windowId)),
+        passes: passes.length,
+        clamped: finalMetrics.iw !== wantW || finalMetrics.ih !== wantH,
+      };
+    },
+    { tabId: tabId },
+  );
+}
+
+function baCleanWindowTitle(title) {
+  return String(title || "").replace(/\s+/g, " ").trim();
+}
+
+function baIsTitlePageURL(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(String(url));
+    return (
+      parsed.protocol === "http:" ||
+      parsed.protocol === "https:" ||
+      parsed.protocol === "file:"
+    );
+  } catch (e) {
+    return false;
+  }
+}
+
+function baFallbackTitleForURL(url) {
+  try {
+    const parsed = new URL(String(url || ""));
+    if (parsed.hostname) return parsed.hostname;
+    if (parsed.protocol === "file:") {
+      const name = decodeURIComponent(parsed.pathname || "").split("/").filter(Boolean).pop();
+      if (name) return name;
+    }
+    return parsed.protocol ? parsed.protocol.replace(":", "") : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * A window's title comes from its first (lowest-index) real page, never from
+ * the active tab. Session control pages are skipped; if a window only contains
+ * a session page, the session id is the best available label.
+ */
+function baWindowTitleFromTabs(tabs) {
+  const ordered = (tabs || []).slice().sort((a, b) => {
+    const ai = a && a.index != null ? a.index : Number.MAX_SAFE_INTEGER;
+    const bi = b && b.index != null ? b.index : Number.MAX_SAFE_INTEGER;
+    return ai - bi;
+  });
+  const isSessionTab = (tab) => parseSessionGoPageURL((tab && (tab.url || tab.pendingUrl)) || "") != null;
+  const firstPage = ordered.find(
+    (tab) => tab && tab.id != null && !isSessionTab(tab) && baIsTitlePageURL(tab.url || tab.pendingUrl),
+  );
+  if (firstPage) {
+    const url = firstPage.url || firstPage.pendingUrl || "";
+    return {
+      title: baCleanWindowTitle(firstPage.title) || baFallbackTitleForURL(url) || "Untitled window",
+      title_source: "tab",
+      title_tab_id: firstPage.id,
+    };
+  }
+  const firstTitled = ordered.find(
+    (tab) => tab && tab.id != null && !isSessionTab(tab) && baCleanWindowTitle(tab.title),
+  );
+  if (firstTitled) {
+    return {
+      title: baCleanWindowTitle(firstTitled.title),
+      title_source: "tab",
+      title_tab_id: firstTitled.id,
+    };
+  }
+  const firstSession = ordered.find((tab) => tab && isSessionTab(tab));
+  if (firstSession) {
+    const parsed = parseSessionGoPageURL(firstSession.url || firstSession.pendingUrl || "");
+    if (parsed && parsed.searchParams.get("session")) {
+      return {
+        title: parsed.searchParams.get("session"),
+        title_source: "session",
+        title_tab_id: null,
+      };
+    }
+  }
+  return { title: "Untitled window", title_source: "none", title_tab_id: null };
+}
+
+async function handleWindowsJob() {
+  const wins = await baChromeWindowsGetAllPopulated();
+  const windows = [];
+  for (const w of wins) {
+    // Every window type is reported (normal, popup, devtools, app, panel):
+    // a browser is half an operating system, and consumers filter by type.
+    if (!w || w.id == null) continue;
+    const tabs = (Array.isArray(w.tabs) ? w.tabs : []).slice().sort((a, b) => {
+      const ai = a && a.index != null ? a.index : Number.MAX_SAFE_INTEGER;
+      const bi = b && b.index != null ? b.index : Number.MAX_SAFE_INTEGER;
+      return ai - bi;
+    });
+    const sessionIds = [];
+    for (const tab of tabs) {
+      const parsed = parseSessionGoPageURL((tab && (tab.url || tab.pendingUrl)) || "");
+      const sessionId = parsed && parsed.searchParams.get("session");
+      if (sessionId && !sessionIds.includes(sessionId)) sessionIds.push(sessionId);
+    }
+    const title = baWindowTitleFromTabs(tabs);
+    windows.push({
+      window_id: w.id,
+      type: w.type,
+      focused: !!w.focused,
+      width: w.width,
+      height: w.height,
+      state: w.state,
+      title: title.title,
+      title_source: title.title_source,
+      title_tab_id: title.title_tab_id,
+      session_ids: sessionIds,
+      tabs: tabs.map((tab) => {
+        const url = (tab && (tab.url || tab.pendingUrl)) || "";
+        const isSessionPage = parseSessionGoPageURL(url) != null;
+        return {
+          tab_id: tab && tab.id != null ? tab.id : null,
+          index: tab && tab.index != null ? tab.index : null,
+          title: baCleanWindowTitle(tab && tab.title),
+          url: url,
+          active: !!(tab && tab.active),
+          capturable: isCapturableTabURL(url),
+          role: isSessionPage ? "session" : "user",
+          opener_tab_id: tab && tab.openerTabId != null ? tab.openerTabId : null,
+        };
+      }),
+    });
+  }
+  windows.sort((a, b) => a.window_id - b.window_id);
+  return {
+    type: "windows",
+    version: EXT_VERSION,
+    features: FEATURES,
+    windows: windows,
+  };
 }
 
 /** Resolve tab_id from extension-shaped params or decimal CDP targetId. */
@@ -2516,13 +3473,9 @@ async function polyfillCloseTarget(params, sessionId) {
   } catch (e) {
     throw new Error("closeTarget: tab_id " + tabId + " not found");
   }
-  // Never close the session control page (/go?session=<id>).
-  if (isSessionGoPageURL(tab.url || "", sessionId)) {
-    throw new Error("refusing to close session control page (/go?session=)");
-  }
-  if (entry && entry.tabId != null && entry.tabId === tabId) {
-    throw new Error("refusing to close session-page tab_id " + tabId);
-  }
+  // A tab is a tab: the session control page (/go?session=<id>) closes like any
+  // other tab. Chrome's tabs.onRemoved recount cleans the session up, and the
+  // caller owns the "this drops the mirror" warning.
   if (entry && entry.windowId != null && tab.windowId !== entry.windowId) {
     throw new Error("tab_id " + tabId + " is not in session window " + entry.windowId);
   }
@@ -2614,6 +3567,12 @@ async function listCapturableTabsInSessionWindow(sessionId, entry) {
  */
 async function pickTargetTabIdForSession(sessionId, opts) {
   opts = opts || {};
+  // Direct jobs (window_id/tab_id addressing, no session page) resolve in their
+  // own branch: explicit tab_id, then the active capturable tab of the named
+  // window. No /go page is required or consulted.
+  if (opts.direct) {
+    return pickTargetTabIdDirect(opts);
+  }
   const entry = sessions.get(sessionId);
   const explicitTabId =
     opts.tabId != null ? opts.tabId : opts.tab_id != null ? opts.tab_id : null;
@@ -2684,6 +3643,91 @@ async function pickTargetTabIdForSession(sessionId, opts) {
   throw new Error("no capturable tab for session " + sessionId);
 }
 
+/**
+ * Direct-mode target resolution. Consent (popup toggle, default on) is
+ * enforced here so direct jobs fail cleanly when the user opted out.
+ * chrome:// and extension pages are excluded by isCapturableTabURL.
+ */
+async function pickTargetTabIdDirect(opts) {
+  if (!(await directModeEnabled())) {
+    throw new Error("direct mode disabled in extension (enable it from the toolbar popup)");
+  }
+  const explicitTabId = opts.tabId != null ? opts.tabId : opts.tab_id != null ? opts.tab_id : null;
+  if (explicitTabId != null) {
+    const tabId = parseInt(explicitTabId, 10);
+    const tab = await chrome.tabs.get(tabId);
+    if (!isCapturableTabURL(tab.url || "")) {
+      throw new Error("tab_id " + tabId + " is not capturable");
+    }
+    return tab.id;
+  }
+  const windowIdRaw = opts.windowId != null ? opts.windowId : opts.window_id;
+  if (windowIdRaw == null) {
+    throw new Error("direct job needs tab_id or window_id to pick a target tab");
+  }
+  const windowId = parseInt(windowIdRaw, 10);
+  if (Number.isNaN(windowId) || windowId <= 0) {
+    throw new Error("invalid window_id " + windowIdRaw);
+  }
+  const activeTabs = await chrome.tabs.query({ active: true, windowId: windowId });
+  const active = activeTabs && activeTabs[0];
+  if (active && active.id != null && isCapturableTabURL(active.url || "")) {
+    return active.id;
+  }
+  const wins = await chrome.windows.getAll({ populate: true });
+  const win = (wins || []).find((w) => w && w.id === windowId);
+  const fallback = win && (win.tabs || []).find((t) => t.id != null && isCapturableTabURL(t.url || ""));
+  if (fallback) return fallback.id;
+  throw new Error("no capturable tab in window " + windowId);
+}
+
+/** info for direct callers: window + tabs of the addressed window (no session). */
+async function handleInfoJobDirect(_params, targetOpts) {
+  const windowIdRaw = targetOpts && targetOpts.windowId != null
+    ? targetOpts.windowId
+    : targetOpts && targetOpts.window_id;
+  if (windowIdRaw == null) {
+    throw new Error("direct info job needs window_id");
+  }
+  const windowId = parseInt(windowIdRaw, 10);
+  const w = await new Promise((resolve) => {
+    try {
+      chrome.windows.get(windowId, { populate: true }, (win) => {
+        if (chrome.runtime.lastError || !win) {
+          resolve(null);
+          return;
+        }
+        resolve(win);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+  if (!w) {
+    throw new Error("window " + windowId + " not found (already closed?)");
+  }
+  const tabsOut = (w.tabs || []).map((t, i) => ({
+    index: i + 1,
+    id: t.id,
+    url: t.url || "",
+    title: t.title || "",
+    active: !!t.active,
+    role: "user",
+    dialog: tabDialogs.get(t.id) || null,
+  }));
+  const active = (w.tabs || []).find((t) => t.active);
+  return {
+    type: "info",
+    window_id: windowId,
+    direct: true,
+    focused: !!w.focused,
+    tabs: tabsOut,
+    job_target: active && active.id != null
+      ? { tab_id: active.id, tab_index: tabsOut.findIndex((t) => t.id === active.id) + 1, reason: "active_in_window" }
+      : { tab_id: null, tab_index: null, reason: "no_active_tab" },
+  };
+}
+
 function isAnotherDebuggerAttachedError(err) {
   const msg = String(err && err.message ? err.message : err || "");
   return /another debugger is already attached/i.test(msg);
@@ -2695,6 +3739,11 @@ function anotherDebuggerAttachedHint(tabId) {
     tabId +
     ". Close DevTools on that tab, or reload the Browser Agent extension, then retry."
   );
+}
+
+function isDebuggerNotAttachedError(err) {
+  const msg = String((err && err.message) || err || "");
+  return /debugger is not attached to the tab/i.test(msg);
 }
 
 /** List tab ids this extension currently owns via chrome.debugger (survives SW restart). */
@@ -2725,7 +3774,9 @@ async function adoptDebuggerTargetsFromChrome(reason) {
   for (const t of targets) {
     if (!t || !t.attached || t.tabId == null) continue;
     if (!attachedTabs.has(t.tabId)) {
-      attachedTabs.set(t.tabId, true);
+      // "adopted" is unverified: getTargets.attached does not prove this
+      // extension can still sendCommand after an MV3 worker restart.
+      attachedTabs.set(t.tabId, "adopted");
       adopted += 1;
     }
   }
@@ -2770,7 +3821,7 @@ function detachDebugger(tabId, force) {
  * blocked (e.g. DevTools), fail with an actionable hint.
  */
 function attachDebugger(tabId) {
-  if (attachedTabs.has(tabId)) {
+  if (attachedTabs.get(tabId) === "verified") {
     baLog("log", "attachDebugger reuse", { tab_id: tabId, already_attached: true });
     return Promise.resolve(true);
   }
@@ -2798,6 +3849,11 @@ function attachDebugger(tabId) {
           chrome.runtime.lastError && chrome.runtime.lastError.message
             ? chrome.runtime.lastError.message
             : "";
+        // Page events (javascriptDialogOpening) ride the same attach; a
+        // failure only costs dialog awareness, never the attach itself.
+        chrome.debugger.sendCommand({ tabId: tabId }, "Page.enable", {}, () => {
+          void chrome.runtime.lastError;
+        });
         baLog("log", "attachDebugger done", {
           tab_id: tabId,
           attach_ms: Math.round(baNow() - t0),
@@ -2805,8 +3861,10 @@ function attachDebugger(tabId) {
           total_ms: totalMs,
           runtime_enable_error: enableErr || null,
         });
-        // Still resolve so a non-fatal Runtime.enable glitch does not strand attachLock.
-        resolve(true);
+        // Resolve the error instead of rejecting so a non-fatal Runtime.enable
+        // glitch does not strand attachLock. Callers retry only when the target
+        // is genuinely not attached to this worker.
+        resolve(enableErr ? { ok: false, error: enableErr } : { ok: true });
       });
     });
 
@@ -2830,8 +3888,17 @@ function attachDebugger(tabId) {
           reject(new Error(chrome.runtime.lastError.message || "chrome.debugger.attach failed"));
           return;
         }
-        attachedTabs.set(tabId, true);
-        enableRuntime().then(resolve, reject);
+        attachedTabs.set(tabId, "verified");
+        enableRuntime().then((enabled) => {
+          if (enabled && !enabled.ok && isDebuggerNotAttachedError(enabled.error)) {
+            // Attach succeeded but Chrome cannot route commands: drop the
+            // bookkeeping so a later attempt performs a real attach.
+            attachedTabs.delete(tabId);
+            reject(new Error(enabled.error));
+            return;
+          }
+          resolve(true);
+        }, reject);
       });
     });
 
@@ -2841,7 +3908,27 @@ function attachDebugger(tabId) {
     if (cancelled) return true;
     if (attachedTabs.has(tabId)) {
       baLog("log", "attachDebugger reuse after adopt", { tab_id: tabId });
-      await enableRuntime();
+      const enabled = await enableRuntime();
+      if (enabled && !enabled.ok && isDebuggerNotAttachedError(enabled.error)) {
+        // getTargets said attached, but sendCommand says otherwise (stale
+        // target or a worker that no longer owns the debugger session).
+        baLog("warn", "attachDebugger adopted target stale; reattach", {
+          tab_id: tabId,
+          error: enabled.error,
+        });
+        attachedTabs.delete(tabId);
+        await detachDebugger(tabId, true);
+        try {
+          await tryAttachOnce();
+        } catch (err) {
+          if (isAnotherDebuggerAttachedError(err)) {
+            throw new Error(anotherDebuggerAttachedHint(tabId));
+          }
+          throw err;
+        }
+        return true;
+      }
+      if (enabled && enabled.ok) attachedTabs.set(tabId, "verified");
       return true;
     }
     try {
@@ -2855,8 +3942,12 @@ function attachDebugger(tabId) {
       await adoptDebuggerTargetsFromChrome("reclaim");
       if (attachedTabs.has(tabId)) {
         baLog("log", "attachDebugger reclaim via getTargets", { tab_id: tabId });
-        await enableRuntime();
-        return true;
+        const enabled = await enableRuntime();
+        if (!enabled || enabled.ok || !isDebuggerNotAttachedError(enabled.error)) {
+          attachedTabs.set(tabId, "verified");
+          return true;
+        }
+        attachedTabs.delete(tabId);
       }
 
       // Best-effort detach + one retry (stale attach we can release).
@@ -2971,13 +4062,39 @@ function maybeEagerAttach(sessionId, tabId, url, windowId) {
     });
 }
 
+/** Direct variant: warm the debugger on a created tab; no session checks. */
+function maybeEagerAttachDirect(tabId, url, windowId) {
+  if (tabId == null) return Promise.resolve();
+  if (typeof url === "string" && url.length > 0 && !isCapturableTabURL(url)) {
+    return Promise.resolve();
+  }
+  if (attachedTabs.has(tabId)) {
+    const state = sessionAttachState.get(DIRECT_SESSION_KEY);
+    if (state && state.attachedTabIds) state.attachedTabIds.add(tabId);
+    touchDebuggerActivity();
+    return Promise.resolve();
+  }
+  if (eagerAttachInFlight.has(tabId)) {
+    return Promise.resolve();
+  }
+  eagerAttachInFlight.add(tabId);
+  touchDebuggerActivity();
+  return attachDebuggerForSession(DIRECT_SESSION_KEY, tabId, { direct: true })
+    .catch(() => {})
+    .finally(() => {
+      eagerAttachInFlight.delete(tabId);
+      touchDebuggerActivity();
+    });
+}
+
 /**
  * Session-scoped attach: gate on open /go?session= in the target tab's window,
  * then add tabId to the multi-tab attach set (policy B — keep peer attaches).
  * Chrome's "debugging this browser" banner can still appear outside that window;
  * only tabs in the session attach set receive sendCommand / eval / screenshot.
  */
-async function attachDebuggerForSession(sessionId, tabId) {
+async function attachDebuggerForSession(sessionId, tabId, opts) {
+  const direct = !!(opts && opts.direct);
   let state = sessionAttachState.get(sessionId);
   if (!state) {
     state = { attachedTabIds: new Set(), attachLock: Promise.resolve() };
@@ -2990,6 +4107,7 @@ async function attachDebuggerForSession(sessionId, tabId) {
   baLog("log", "attachDebuggerForSession enqueue", {
     session_id: sessionId,
     tab_id: tabId,
+    direct: direct,
     attach_set_size: state.attachedTabIds.size,
     will_wait_lock: true,
     timeout_ms: ATTACH_TIMEOUT_MS,
@@ -2999,6 +4117,8 @@ async function attachDebuggerForSession(sessionId, tabId) {
     // Cap lock-hold work so a stuck attach cannot block the session forever.
     const work = async () => {
       // Attach gate: require ≥1 open /go?session=<id> control tab in the same window.
+      // Direct jobs skip the gate: they were explicitly addressed by window/tab id
+      // and the popup toggle plus capturable-URL checks provide the consent model.
       let windowId = null;
       let tabUrl = "";
       try {
@@ -3008,26 +4128,28 @@ async function attachDebuggerForSession(sessionId, tabId) {
       } catch (e) {
         /* tab may be gone */
       }
-      if (windowId == null) {
-        const entry = sessions.get(sessionId);
-        if (entry && entry.windowId != null) windowId = entry.windowId;
-      }
-      if (windowId == null || !(await hasOpenSessionPage(sessionId, windowId))) {
-        // Drop all leftover attaches so jobs cannot reuse orphaned debuggers.
-        const leftover = Array.from(state.attachedTabIds);
-        state.attachedTabIds.clear();
-        for (const id of leftover) {
-          await detachDebugger(id);
+      if (!direct) {
+        if (windowId == null) {
+          const entry = sessions.get(sessionId);
+          if (entry && entry.windowId != null) windowId = entry.windowId;
         }
-        baLog("error", "attachDebuggerForSession gate fail", {
-          session_id: sessionId,
-          tab_id: tabId,
-          lock_wait_ms: lockWaitMs,
-          window_id: windowId,
-        });
-        throw new Error(
-          "no open session page for attach; session control tab required in the same window",
-        );
+        if (windowId == null || !(await hasOpenSessionPage(sessionId, windowId))) {
+          // Drop all leftover attaches so jobs cannot reuse orphaned debuggers.
+          const leftover = Array.from(state.attachedTabIds);
+          state.attachedTabIds.clear();
+          for (const id of leftover) {
+            await detachDebugger(id);
+          }
+          baLog("error", "attachDebuggerForSession gate fail", {
+            session_id: sessionId,
+            tab_id: tabId,
+            lock_wait_ms: lockWaitMs,
+            window_id: windowId,
+          });
+          throw new Error(
+            "no open session page for attach; session control tab required in the same window",
+          );
+        }
       }
 
       // Policy B: keep peer tabs attached; only attach/add the requested tabId.
@@ -3228,13 +4350,32 @@ async function withDebuggerForSession(sessionId, fn, opts) {
       },
     });
   }
-  await attachDebuggerForSession(sessionId, tabId);
+  // Direct jobs bypass the /go-page attach gate but keep the same attach lock,
+  // timeout cleanup, and idle-detach bookkeeping (stored under DIRECT_SESSION_KEY).
+  const attach = opts && opts.direct
+    ? (sid, tid) => attachDebuggerForSession(sid, tid, { direct: true })
+    : attachDebuggerForSession;
+  await attach(sessionId, tabId);
   touchDebuggerActivity();
   try {
     try {
       // Race CDP work against tab nav/close/detach so agents fail in ms, not at --timeout.
       return await runWithTabTargetWatch(tabId, fn);
     } catch (err) {
+      if (isDebuggerNotAttachedError(err)) {
+        // A stale adopted target can fail on the first command even though
+        // attachDebugger reported success. Force a real attach and retry once.
+        baLog("warn", "debugger not attached; force reattach and retry once", {
+          session_id: sessionId,
+          tab_id: tabId,
+          error: err && err.message ? err.message : String(err),
+        });
+        clearDebuggerAttachBookkeeping(sessionId, tabId);
+        await detachDebugger(tabId, true);
+        await attach(sessionId, tabId);
+        touchDebuggerActivity();
+        return await runWithTabTargetWatch(tabId, fn);
+      }
       // Eval/run that does location.href / form submit kills the CDP target.
       // Fail fast (above), then wait for load, re-attach, retry the job once.
       if (!isTargetNavigatedOrClosedError(err)) throw err;
@@ -3266,6 +4407,22 @@ try {
     if (source && source.tabId != null && typeof method === "string" && method.startsWith("Network.")) {
       const routed = harTabs.get(source.tabId);
       if (routed && routed.routing) routed.state.recorder.handle(method, params || {});
+    }
+    if (method === "Page.javascriptDialogOpening" && params) {
+      const dialogTabId = source && source.tabId != null ? source.tabId : null;
+      if (dialogTabId != null) {
+        tabDialogs.set(dialogTabId, {
+          type: params.type || "alert",
+          message: params.message || "",
+          default_prompt: params.defaultPrompt || "",
+          url: params.url || "",
+          opened_at: Date.now(),
+        });
+      }
+    }
+    if (method === "Page.javascriptDialogClosed" && params) {
+      const closedTabId = source && source.tabId != null ? source.tabId : null;
+      if (closedTabId != null) tabDialogs.delete(closedTabId);
     }
     if (method === "Runtime.consoleAPICalled" && params) {
       const entry = {
@@ -3304,6 +4461,7 @@ try {
       }
       if (routed) harTabs.delete(source.tabId);
       attachedTabs.delete(source.tabId);
+      tabDialogs.delete(source.tabId);
       for (const state of sessionAttachState.values()) {
         if (state && state.attachedTabIds) {
           state.attachedTabIds.delete(source.tabId);

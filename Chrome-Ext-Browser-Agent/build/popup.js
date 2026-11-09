@@ -28,7 +28,62 @@
   var sessionEl = document.getElementById("status-session");
   var debuggerEl = document.getElementById("status-debugger");
   var hintEl = document.getElementById("conn-hint");
+  var directStateEl = document.getElementById("direct-state");
+  var directToggleEl = document.getElementById("direct-toggle");
+  var directStatusEl = document.getElementById("status-direct");
   if (!statusEl) return;
+
+  // Direct window control toggle (default off; explicit user consent).
+  var DIRECT_ENABLED_KEY = "directWindowControlEnabled";
+  if (directToggleEl) {
+    try {
+      chrome.storage.local.get([DIRECT_ENABLED_KEY], function (items) {
+        // Mirror the background default: absent means ON; only an explicit
+        // false (or a storage failure, which the background also treats as ON)
+        // renders off.
+        var enabled = !(items && items[DIRECT_ENABLED_KEY] === false);
+        directToggleEl.checked = enabled;
+        if (directStateEl) {
+          directStateEl.textContent = enabled ? "on" : "off";
+          directStateEl.className = enabled ? "ok" : "muted";
+        }
+      });
+    } catch (e) {
+      /* storage optional */
+    }
+    directToggleEl.addEventListener("change", function () {
+      var enabled = !!directToggleEl.checked;
+      var update = {};
+      update[DIRECT_ENABLED_KEY] = enabled;
+      try {
+        chrome.storage.local.set(update, function () {
+          // Nudge the service worker so the direct channel opens/closes promptly.
+          try {
+            chrome.runtime.sendMessage({ type: "direct_mode_changed", enabled: enabled });
+          } catch (e) {
+            /* SW may be asleep; alarm will reconcile */
+          }
+        });
+      } catch (e) {
+        /* storage optional */
+      }
+      if (directStateEl) {
+        directStateEl.textContent = enabled ? "on" : "off";
+        directStateEl.className = enabled ? "ok" : "muted";
+      }
+    });
+  }
+  try {
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (msg && msg.type === "direct_channel_status" && directStatusEl) {
+        var state = String(msg.state || "unknown");
+        setPhase(directStatusEl, state, state === "connected" ? "ok" : state === "connecting" ? "warn" : "muted");
+      }
+      return false;
+    });
+  } catch (e) {
+    /* runtime optional */
+  }
 
   function setPhase(el, text, kind) {
     if (!el) return;
@@ -122,6 +177,20 @@
           dLabel,
           dLabel === "armed" || dLabel.indexOf("attached") >= 0 ? "ok" : "muted",
         );
+      }
+    }
+
+    // Direct channel (window_id/tab_id rail; opt-in via the toggle above)
+    if (directStatusEl) {
+      var directLabel = String(payload.direct || "none");
+      if (directLabel === "connected") {
+        setPhase(directStatusEl, "connected", "ok");
+      } else if (directLabel === "connecting") {
+        setPhase(directStatusEl, "connecting…", "warn");
+      } else if (payload.directSupported === true) {
+        setPhase(directStatusEl, "supported (not connected)", "muted");
+      } else {
+        setPhase(directStatusEl, "none", "muted");
       }
     }
 

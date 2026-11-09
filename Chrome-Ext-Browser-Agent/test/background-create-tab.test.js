@@ -76,7 +76,7 @@ function loadBackground(overrides = {}) {
   vm.runInContext(
     source +
       ";globalThis.__backgroundTest = {" +
-      "createTabInSession, waitForCapturableTabURL, isCapturableTabURL, sessions, pickTargetTabIdForSession" +
+      "createTabInSession, handleCreateTabJob, waitForCapturableTabURL, isCapturableTabURL, sessions, pickTargetTabIdForSession, validateRemoteCloseTab" +
       "};",
     context,
   );
@@ -86,6 +86,19 @@ function loadBackground(overrides = {}) {
 function arm(api) {
   api.sessions.set("sess-1", { windowId: 5 });
 }
+
+test("remote close checks the window, never the page type", async () => {
+  let target = { id: 7, windowId: 6, url: "https://example.com" };
+  const api = loadBackground({ tabs: { get: async () => target } });
+  arm(api);
+  await assert.rejects(api.validateRemoteCloseTab("sess-1", 7), /not in the session window/);
+  // The control page closes like any tab: closing it ends the session, which
+  // the user confirms in the client, not something the extension refuses.
+  target = { id: 7, windowId: 5, url: "http://127.0.0.1:43761/go?session=sess-1" };
+  await api.validateRemoteCloseTab("sess-1", 7);
+  target = { id: 7, windowId: 5, url: "https://example.com" };
+  await api.validateRemoteCloseTab("sess-1", 7);
+});
 
 test("createTabInSession waits until the committed URL is capturable", async () => {
   let gets = 0;
@@ -260,4 +273,53 @@ test("pickTargetTabIdForSession still rejects an explicit tab whose URL is not c
       /tab_id 12 is not capturable/,
     );
   }
+});
+
+test("createTabInSession targets an explicit window and returns it", async () => {
+  let created = null;
+  const api = loadBackground({
+    tabs: {
+      create(props, cb) {
+        created = props;
+        cb({ id: 13, windowId: 9, url: "" });
+      },
+    },
+  });
+  arm(api);
+  const result = await api.createTabInSession("sess-1", { window_id: 9 });
+  assert.equal(created.windowId, 9);
+  assert.equal(result.tab_id, 13);
+  assert.equal(result.window_id, 9);
+});
+
+test("handleCreateTabJob forwards window_id over the session window", async () => {
+  let created = null;
+  const api = loadBackground({
+    tabs: {
+      create(props, cb) {
+        created = props;
+        cb({ id: 14, windowId: 9, url: "" });
+      },
+    },
+  });
+  arm(api);
+  const result = await api.handleCreateTabJob({ window_id: 9 }, "sess-1");
+  assert.equal(created.windowId, 9);
+  assert.equal(result.window_id, 9);
+});
+
+test("createTabInSession ignores an invalid window override", async () => {
+  let created = null;
+  const api = loadBackground({
+    tabs: {
+      create(props, cb) {
+        created = props;
+        cb({ id: 15, windowId: 5, url: "" });
+      },
+    },
+  });
+  arm(api);
+  const result = await api.createTabInSession("sess-1", { window_id: "not-a-number" });
+  assert.equal(created.windowId, 5);
+  assert.equal(result.window_id, 5);
 });

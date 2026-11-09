@@ -57,6 +57,12 @@ func (s *controlServer) resolveWSSession(r *http.Request) (*session, bool) {
 }
 
 func (s *controlServer) handleWS(w http.ResponseWriter, r *http.Request) {
+	// Instance links (?instance=) are a separate rail: they never resolve to a
+	// session, so a stray query parameter cannot hijack a session connection.
+	if instanceID := strings.TrimSpace(r.URL.Query().Get("instance")); instanceID != "" {
+		s.handleWSInstance(w, r, instanceID)
+		return
+	}
 	sess, ok := s.resolveWSSession(r)
 	if !ok {
 		if strings.TrimSpace(r.URL.Query().Get("session")) == "" {

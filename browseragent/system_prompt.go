@@ -49,6 +49,8 @@ Optional escape hatch:
 - To open a new tab in the session window, prefer **session create-tab** (returns **tab_id**).
 - If the user's content is in a **background** tab, use --tab-id from session info —
   do **not** navigate the session control page away from /go?session= (disconnects extension).
+- The control page (Role=session_page) **can** be closed via Target.closeTarget; the
+  tab closes like any tab and the session ends with it, so confirm intent first.
 
 ## session cdp + Target.* polyfill
 

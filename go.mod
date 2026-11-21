@@ -20,4 +20,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.171
+require github.com/xhd2015/dot-pkgs/go-pkgs v0.0.205
